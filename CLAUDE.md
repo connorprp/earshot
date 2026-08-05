@@ -81,7 +81,18 @@ compressed context; transcript history is never in the prompt. See
 ## Hosted mode (coworker on a MacBook)
 
 Split rule: audio capture MUST run on the user's machine; everything else
-(hub + dashboard + Mongo + LLM) runs per-user on Connor's server.
+(hub + dashboard + Mongo + LLM) runs on Connor's server.
+
+**Multi-tenant (2026-08-05):** ONE hub instance serves all users. Google
+sign-in decides identity; a Tenant object (server/index.js) owns each user's
+entire state — board, transcript, recording, echo suppression, sessions,
+out/<email-slug>/ artifacts — and every Mongo doc carries userId. Capture
+keys are per-user ("email:key,..." in EARSHOT_CAPTURE_KEYS) and route audio
+to that user's tenant. Per-user Claude billing via EARSHOT_CLAUDE_TOKENS
+("email:token,..."), falling back to CLAUDE_CODE_OAUTH_TOKEN. Local mode =
+single "local" tenant, identical to old behavior; old docs were migrated to
+userId "local" automatically on first start. Isolation is covered by
+server/ci_test.mjs (state, ws fan-out, capture routing, /files).
 
 - Auth: Google Sign-In (server/auth.js). Dashboard posts a Google ID token,
   hub verifies via google-auth-library + EARSHOT_ALLOWED_EMAILS, mints a

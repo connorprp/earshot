@@ -1,5 +1,9 @@
-// Earshot hub: websocket fan-in (capture) / fan-out (dashboards), the distill
-// scheduler, the action API, and (hosted mode) the dashboard itself + auth.
+// Earshot hub, multi-tenant: websocket fan-in (capture) / fan-out (dashboards),
+// per-user distill scheduling, the action API, and (hosted mode) the dashboard
+// itself + auth. Every signed-in Google account (or capture key) maps to a
+// Tenant that owns ALL of its own state — board, transcript, recording flag,
+// echo suppression, sessions, artifact files — so users never see each other's
+// data. Local mode (no EARSHOT_GOOGLE_CLIENT_ID) runs a single "local" tenant.
 import http from "node:http";
 import fs from "node:fs";
 import path from "node:path";
@@ -10,14 +14,16 @@ import { executeAction } from "./actions.js";
 import { closeoutSession } from "./closeout.js";
 import {
   authEnabled,
+  allowedEmails,
   publicConfig,
   verifyGoogleCredential,
   sessionCookie,
-  browserAuthed,
-  captureAuthed,
+  browserUser,
+  captureUser,
 } from "./auth.js";
 import {
   initDb,
+  resumeSession,
   startSession,
   endSession,
   persistTranscript,
@@ -37,33 +43,295 @@ const DISTILL_MIN_LINES = 1;     // ...when at least this many new lines exist
 const DISTILL_EAGER_LINES = 6;   // distill immediately at this many lines
 const RESTORE_WINDOW_MS = 45 * 60 * 1000; // Record this soon after a Stop -> restore bubbles provisionally
 const RESTORE_MAX_DISTILLS = 4;  // restored bubbles untouched after this many distills get dropped
-// echo suppression backstop: on open speakers the mic re-hears loopback audio,
-// producing "me" lines that are garbled fragments of "them" lines. The primary
-// defense is capture's timing gate (echo_gate.py); these constants were tuned
-// against a real captured echo set (2026-08-04: exact-match 0.8/8s caught 19%,
-// fuzzy 0.62/15s caught 59% — mic-path ASR garbles echoes, hence fuzzy tokens)
+// echo suppression backstop (layer 2; capture's timing gate is layer 1).
+// Constants tuned against a real captured echo set — see CLAUDE.md.
 const ECHO_WINDOW_MS = 15_000;   // a "them" line this recent can claim a "me" line as its echo
 const ECHO_HOLD_MS = 6_000;      // "me" lines wait this long in case their "them" twin arrives late
 const ECHO_OVERLAP = 0.62;       // fraction of "me" tokens fuzzy-found in one "them" line = echo
 
-const state = { bubbles: [], speakers: {}, rev: 0 }; // speakers: voice tag -> inferred name
-const transcript = [];      // full log (kept in memory for the PoC)
-let pending = [];           // lines not yet distilled
-let distilling = false;
-let lastDistill = 0;
-let recording = false;      // capture lines are dropped unless recording
-let speakerProfiles = [];   // latest voice-cluster snapshot from capture
-let activeSpeakers = new Set(); // speaker ids heard in the current session
-let sessionStartedAt = null;
-let distillNote = "";       // context prepended to distills while restored bubbles are unconfirmed
-let restoreState = null;    // { distills } while provisionally-restored bubbles await confirmation
-let recentThem = [];        // [{ tokens:Set, at }] for echo matching
-const heldMe = new Set();   // { ev, tokens, timer } "me" lines waiting out ECHO_HOLD_MS
+// per-user Claude subscription tokens: "email:sk-ant-oat...,email:..." —
+// distills for that tenant bill that user; others fall back to the process env
+const CLAUDE_TOKENS = new Map(
+  (process.env.EARSHOT_CLAUDE_TOKENS || "")
+    .split(",")
+    .map((pair) => pair.trim().split(/:(.+)/s))
+    .filter(([email, token]) => email && token)
+    .map(([email, token]) => [email.toLowerCase(), token])
+);
 
-// ---------- static dashboard + artifact downloads ----------
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
 const DIST_DIR = path.join(ROOT, "..", "dashboard", "dist");
-const OUT_DIR = path.join(ROOT, "..", "out");
+const OUT_ROOT = path.join(ROOT, "..", "out");
+
+// ---------- tenant ----------
+class Tenant {
+  constructor(userId) {
+    this.userId = userId;
+    this.state = { bubbles: [], speakers: {}, rev: 0 };
+    this.transcript = [];       // full session log, in memory
+    this.pending = [];          // lines not yet distilled
+    this.distilling = false;
+    this.lastDistill = 0;
+    this.recording = false;     // capture lines are dropped unless recording
+    this.speakerProfiles = []; // latest voice-cluster snapshot from capture
+    this.activeSpeakers = new Set();
+    this.sessionId = null;
+    this.sessionStartedAt = null;
+    this.distillNote = "";      // context prepended to distills while restored bubbles are unconfirmed
+    this.restoreState = null;   // { distills } while provisionally-restored bubbles await confirmation
+    this.recentThem = [];       // [{ set, list, at }] for echo matching
+    this.heldMe = new Set();    // { ev, tokens, timer } "me" lines waiting out ECHO_HOLD_MS
+    this.dashboards = new Set();
+    this.outDir = path.join(OUT_ROOT, userId === "local" ? "local" : userId.replace(/[^a-z0-9]+/gi, "-"));
+    fs.mkdirSync(this.outDir, { recursive: true });
+    this.claudeEnv = CLAUDE_TOKENS.has(userId)
+      ? { ...process.env, CLAUDE_CODE_OAUTH_TOKEN: CLAUDE_TOKENS.get(userId) }
+      : null;
+  }
+
+  log(msg) {
+    console.log(`[hub:${this.userId}] ${msg}`);
+  }
+
+  broadcast(obj) {
+    const msg = JSON.stringify(obj);
+    for (const ws of this.dashboards) if (ws.readyState === 1) ws.send(msg);
+  }
+
+  bumpAndBroadcast() {
+    this.state.rev++;
+    this.broadcast({ type: "state", state: this.state });
+  }
+
+  async resume() {
+    const r = await resumeSession(this.userId);
+    if (!r) return;
+    // hub died mid-recording (< 30 min ago): pick up where it left off
+    this.recording = true;
+    this.sessionId = r.sessionId;
+    this.sessionStartedAt = r.startedAt ? new Date(r.startedAt).getTime() : Date.now();
+    this.state.bubbles = r.bubbles;
+    this.state.speakers = r.speakerNames || {};
+    this.state.rev++;
+  }
+
+  // ---- capture ingest ----
+  handleCaptureEvent(ev) {
+    if (!this.recording) return; // not recording: nothing is shown or saved
+    if (ev.type === "speakers" && Array.isArray(ev.speakers)) {
+      this.speakerProfiles = ev.speakers;
+      persistSpeakers(this.sessionId, this.speakerProfiles, [...this.activeSpeakers]);
+      return;
+    }
+    if (ev.type !== "transcript" || !ev.text) return;
+    if (ev.source === "them") {
+      if (ev.speaker) this.activeSpeakers.add(ev.speaker);
+      const now = Date.now();
+      const tok = tokenize(ev.text);
+      const entry = { set: new Set(tok), list: tok, at: now };
+      this.recentThem = this.recentThem.filter((t) => now - t.at < ECHO_WINDOW_MS).concat(entry);
+      // a mic echo can flush BEFORE its loopback twin: reclaim held "me" lines
+      for (const h of [...this.heldMe]) {
+        if (echoOverlap(h.tokens, entry) >= ECHO_OVERLAP) {
+          clearTimeout(h.timer);
+          this.heldMe.delete(h);
+          this.log(`echo dropped: "${h.ev.text}"`);
+        }
+      }
+      this.acceptLine(ev);
+    } else {
+      const mt = tokenize(ev.text);
+      const now = Date.now();
+      if (this.recentThem.some((t) => now - t.at < ECHO_WINDOW_MS && echoOverlap(mt, t) >= ECHO_OVERLAP)) {
+        this.log(`echo dropped: "${ev.text}"`);
+        return;
+      }
+      const h = { ev, tokens: mt };
+      h.timer = setTimeout(() => {
+        this.heldMe.delete(h);
+        if (this.recording) this.acceptLine(ev);
+      }, ECHO_HOLD_MS);
+      this.heldMe.add(h);
+    }
+  }
+
+  acceptLine(ev) {
+    this.transcript.push(ev);
+    this.pending.push(ev);
+    persistTranscript(this.userId, this.sessionId, ev);
+    this.broadcast(ev); // live ticker, before any distill
+  }
+
+  // ---- distill ----
+  distillDue() {
+    return (
+      this.recording &&
+      (this.pending.length >= DISTILL_EAGER_LINES ||
+        (this.pending.length >= DISTILL_MIN_LINES && Date.now() - this.lastDistill >= DISTILL_EVERY_MS))
+    );
+  }
+
+  async runDistill() {
+    if (this.distilling || this.pending.length === 0) return;
+    const lines = this.pending;
+    this.pending = [];
+    this.distilling = true;
+    this.broadcast({ type: "distilling", value: true });
+    try {
+      const ops = await distill(this.state, lines, this.distillNote, this.claudeEnv);
+      this.log(`distill: ${lines.length} lines -> ${ops.length} ops`);
+      let changed = applyOps(this.state, ops);
+      if (changed) {
+        persistOps(this.userId, this.sessionId, ops);
+        for (const b of this.state.bubbles) persistBubble(this.userId, this.sessionId, b);
+        for (const op of ops) if (op.op === "remove" && op.id) persistRemoval(this.sessionId, op.id, "distill");
+      }
+      if (ops.some((o) => o.op === "speakers")) persistSpeakerNames(this.sessionId, this.state.speakers);
+      // restored bubbles must earn their place: an update clears the flag (in
+      // applyOps); whatever is still flagged after a few distills gets dropped
+      if (this.restoreState) {
+        this.restoreState.distills++;
+        const unconfirmed = this.state.bubbles.filter((b) => b.restored);
+        if (!unconfirmed.length) {
+          this.restoreState = null;
+          this.distillNote = "";
+        } else if (this.restoreState.distills >= RESTORE_MAX_DISTILLS) {
+          this.state.bubbles = this.state.bubbles.filter((b) => !b.restored);
+          for (const b of unconfirmed) persistRemoval(this.sessionId, b.id, "stale-restore");
+          this.log(`archived ${unconfirmed.length} unconfirmed restored bubble(s)`);
+          this.restoreState = null;
+          this.distillNote = "";
+          changed = true;
+        }
+      }
+      if (changed) this.bumpAndBroadcast();
+    } catch (e) {
+      console.error(`[distill:${this.userId}] error:`, e.message);
+      this.pending = lines.concat(this.pending); // retry these lines next round
+    } finally {
+      this.lastDistill = Date.now();
+      this.distilling = false;
+      this.broadcast({ type: "distilling", value: false });
+    }
+  }
+
+  // ---- record lifecycle ----
+  async recordStart() {
+    if (this.recording) return;
+    this.state.bubbles = [];
+    this.state.speakers = {}; // voice tags persist per capture process, but names re-earn their place
+    this.transcript.length = 0;
+    this.pending = [];
+    this.activeSpeakers = new Set();
+    this.sessionStartedAt = Date.now();
+    this.distillNote = "";
+    this.restoreState = null;
+    this.recentThem = [];
+    for (const h of [...this.heldMe]) clearTimeout(h.timer);
+    this.heldMe.clear();
+    this.sessionId = await startSession(this.userId);
+    // provisional restore: recording again shortly after a stop is often the
+    // same conversation resuming — bring the board back and let the distiller
+    // keep or drop the bubbles once it sees what's actually being said
+    const prev = await getPreviousSession(this.userId).catch(() => null);
+    const gapMs = prev?.session.endedAt ? Date.now() - new Date(prev.session.endedAt).getTime() : Infinity;
+    if (gapMs < RESTORE_WINDOW_MS && prev.bubbles.length) {
+      const agoMin = Math.max(1, Math.round(gapMs / 60000));
+      this.state.bubbles = prev.bubbles;
+      for (const b of this.state.bubbles) {
+        b.restored = true; // cleared the moment a distill updates the bubble
+        persistBubble(this.userId, this.sessionId, b);
+      }
+      this.restoreState = { distills: 0 };
+      this.distillNote =
+        `NOTE: bubbles marked "restored": true were provisionally carried over from the previous ` +
+        `session ("${prev.session.report?.title || "untitled"}", ended ${agoMin} min ago) in case ` +
+        `this is the same conversation resuming after a recording pause. If the new lines continue ` +
+        `that conversation, UPDATE those bubbles (even a small update confirms them). If this is a ` +
+        `different conversation, REMOVE the ones that don't apply — do not leave stale bubbles. ` +
+        `Restored bubbles you never touch will be auto-archived shortly.`;
+      this.log(`provisionally restored ${this.state.bubbles.length} bubbles (previous session ended ${agoMin} min ago)`);
+    }
+    this.recording = true;
+    this.broadcast({ type: "recording", value: true });
+    this.bumpAndBroadcast();
+    this.log("recording started");
+  }
+
+  async recordStop() {
+    if (!this.recording) return;
+    this.recording = false;
+    this.broadcast({ type: "recording", value: false });
+    // release "me" lines still waiting out the echo hold — they're real speech
+    for (const h of [...this.heldMe]) {
+      clearTimeout(h.timer);
+      this.heldMe.delete(h);
+      this.acceptLine(h.ev);
+    }
+    // flush: distill whatever arrived since the last pass so the session's
+    // final lines still land on the board and in Mongo before it closes
+    while (this.distilling) await new Promise((r) => setTimeout(r, 200));
+    if (this.pending.length) await this.runDistill();
+    this.pending = []; // lines are persisted verbatim regardless; don't leak into the next session
+    if (this.speakerProfiles.length) persistSpeakers(this.sessionId, this.speakerProfiles, [...this.activeSpeakers]);
+    const endedId = await endSession(this.sessionId);
+    this.sessionId = null;
+    this.log("recording stopped");
+    if (endedId && (this.transcript.length || this.state.bubbles.length)) {
+      this.runCloseout(endedId); // after the response; don't hold up the Stop button
+    }
+  }
+
+  async runCloseout(endedSessionId) {
+    this.broadcast({ type: "closeout", value: true });
+    try {
+      const { report } = await closeoutSession(endedSessionId, {
+        userId: this.userId,
+        outDir: this.outDir,
+        env: this.claudeEnv,
+        bubbles: this.state.bubbles,
+        speakerNames: this.state.speakers,
+        tailLines: this.transcript.slice(-60),
+        startedAt: this.sessionStartedAt || Date.now(),
+        lineCount: this.transcript.length,
+        speakers: this.speakerProfiles,
+        activeSpeakers: [...this.activeSpeakers],
+      });
+      this.broadcast({ type: "report", report });
+    } catch (e) {
+      console.error(`[closeout:${this.userId}] error:`, e.message);
+    } finally {
+      this.broadcast({ type: "closeout", value: false });
+    }
+  }
+}
+
+const tenants = new Map();
+function tenantFor(userId) {
+  if (!tenants.has(userId)) tenants.set(userId, new Tenant(userId));
+  return tenants.get(userId);
+}
+
+// ---------- shared helpers ----------
+function tokenize(text) {
+  return text.toLowerCase().replace(/[^a-z0-9' ]+/g, " ").split(/\s+/).filter(Boolean);
+}
+
+// fraction of meTokens found in one "them" line; short lines can't be judged.
+// Fuzzy: exact hit, or shared 4-char prefix — the mic path garbles word tails
+function echoOverlap(meTokens, them) {
+  if (meTokens.length < 2) return 0;
+  let hit = 0;
+  for (const w of meTokens) {
+    if (them.set.has(w)) hit++;
+    else if (w.length >= 4) {
+      const p = w.slice(0, 4);
+      if (them.list.some((v) => v.length >= 4 && (v.startsWith(p) || w.startsWith(v.slice(0, 4))))) hit++;
+    }
+  }
+  return hit / meTokens.length;
+}
+
 const MIME = {
   ".html": "text/html", ".js": "text/javascript", ".css": "text/css",
   ".svg": "image/svg+xml", ".png": "image/png", ".ico": "image/x-icon",
@@ -120,16 +388,18 @@ const server = http.createServer(async (req, res) => {
     }
   }
 
-  // everything below requires a signed-in browser (hosted mode)
-  if (!browserAuthed(req)) {
+  // everything below belongs to exactly one signed-in tenant
+  const userId = browserUser(req);
+  if (!userId) {
     res.statusCode = 401;
     res.setHeader("content-type", "application/json");
     return res.end(JSON.stringify({ ok: false, message: "sign in required" }));
   }
+  const t = tenantFor(userId);
 
   if (req.method === "GET" && urlPath.startsWith("/files/")) {
     const name = path.basename(decodeURIComponent(urlPath.slice("/files/".length)));
-    const file = path.join(OUT_DIR, name);
+    const file = path.join(t.outDir, name);
     if (!name || !fs.existsSync(file)) {
       res.statusCode = 404;
       return res.end("not found");
@@ -139,85 +409,28 @@ const server = http.createServer(async (req, res) => {
 
   if (req.method === "GET" && req.url === "/state") {
     res.setHeader("content-type", "application/json");
-    return res.end(JSON.stringify({ ...state, recording }));
+    return res.end(JSON.stringify({ ...t.state, recording: t.recording }));
   }
 
   if (req.method === "POST" && req.url === "/record/start") {
     res.setHeader("content-type", "application/json");
-    if (!recording) {
-      state.bubbles = [];
-      state.speakers = {}; // voice tags persist per capture process, but names re-earn their place
-      transcript.length = 0;
-      pending = [];
-      activeSpeakers = new Set();
-      sessionStartedAt = Date.now();
-      distillNote = "";
-      restoreState = null;
-      recentThem = [];
-      for (const h of [...heldMe]) clearTimeout(h.timer);
-      heldMe.clear();
-      await startSession();
-      // provisional restore: recording again shortly after a stop is often the
-      // same conversation resuming — bring the board back and let the distiller
-      // keep or drop the bubbles once it sees what's actually being said
-      const prev = await getPreviousSession().catch(() => null);
-      const gapMs = prev?.session.endedAt ? Date.now() - new Date(prev.session.endedAt).getTime() : Infinity;
-      if (gapMs < RESTORE_WINDOW_MS && prev.bubbles.length) {
-        const agoMin = Math.max(1, Math.round(gapMs / 60000));
-        state.bubbles = prev.bubbles;
-        for (const b of state.bubbles) {
-          b.restored = true; // cleared the moment a distill updates the bubble
-          persistBubble(b);
-        }
-        restoreState = { distills: 0 };
-        distillNote =
-          `NOTE: bubbles marked "restored": true were provisionally carried over from the previous ` +
-          `session ("${prev.session.report?.title || "untitled"}", ended ${agoMin} min ago) in case ` +
-          `this is the same conversation resuming after a recording pause. If the new lines continue ` +
-          `that conversation, UPDATE those bubbles (even a small update confirms them). If this is a ` +
-          `different conversation, REMOVE the ones that don't apply — do not leave stale bubbles. ` +
-          `Restored bubbles you never touch will be auto-archived shortly.`;
-        console.log(`[hub] provisionally restored ${state.bubbles.length} bubbles (previous session ended ${agoMin} min ago)`);
-      }
-      recording = true;
-      broadcast({ type: "recording", value: true });
-      bumpAndBroadcast();
-      console.log("[hub] recording started");
-    }
+    await t.recordStart();
     return res.end(JSON.stringify({ ok: true, recording: true }));
   }
 
   if (req.method === "POST" && req.url === "/record/stop") {
     res.setHeader("content-type", "application/json");
-    if (recording) {
-      recording = false;
-      broadcast({ type: "recording", value: false });
-      // release "me" lines still waiting out the echo hold — they're real speech
-      for (const h of [...heldMe]) {
-        clearTimeout(h.timer);
-        heldMe.delete(h);
-        acceptLine(h.ev);
-      }
-      // flush: distill whatever arrived since the last pass so the session's
-      // final lines still land on the board and in Mongo before it closes
-      while (distilling) await new Promise((r) => setTimeout(r, 200));
-      if (pending.length) await runDistill();
-      pending = []; // lines are persisted verbatim regardless; don't leak into the next session
-      if (speakerProfiles.length) await persistSpeakers(speakerProfiles, [...activeSpeakers]);
-      const endedId = await endSession();
-      console.log("[hub] recording stopped");
-      if (transcript.length || state.bubbles.length) runCloseout(endedId); // after the response; don't hold up the Stop button
-    }
+    await t.recordStop();
     return res.end(JSON.stringify({ ok: true, recording: false }));
   }
 
   if (req.method === "GET" && req.url === "/sessions") {
     res.setHeader("content-type", "application/json");
-    return res.end(JSON.stringify(await listSessions()));
+    return res.end(JSON.stringify(await listSessions(userId)));
   }
 
   if (req.method === "GET" && req.url?.startsWith("/sessions/")) {
-    const data = await getSession(req.url.split("/")[2]).catch(() => null);
+    const data = await getSession(userId, req.url.split("/")[2]).catch(() => null);
     res.setHeader("content-type", "application/json");
     if (!data) {
       res.statusCode = 404;
@@ -230,13 +443,13 @@ const server = http.createServer(async (req, res) => {
     let body = "";
     for await (const chunk of req) body += chunk;
     const { bubbleId, actionId } = JSON.parse(body || "{}");
-    const bubble = state.bubbles.find((b) => b.id === bubbleId);
+    const bubble = t.state.bubbles.find((b) => b.id === bubbleId);
     res.setHeader("content-type", "application/json");
 
     if (req.url === "/dismiss") {
-      state.bubbles = state.bubbles.filter((b) => b.id !== bubbleId);
-      persistRemoval(bubbleId, "dismissed");
-      bumpAndBroadcast();
+      t.state.bubbles = t.state.bubbles.filter((b) => b.id !== bubbleId);
+      persistRemoval(t.sessionId, bubbleId, "dismissed");
+      t.bumpAndBroadcast();
       return res.end(JSON.stringify({ ok: true }));
     }
 
@@ -247,13 +460,13 @@ const server = http.createServer(async (req, res) => {
     }
     let result;
     try {
-      result = executeAction(action, bubble);
+      result = executeAction(action, bubble, t.outDir);
     } catch (e) {
       result = { ok: false, message: String(e.message || e) };
     }
     action.status = result.ok ? "done" : "error";
-    persistBubble(bubble);
-    bumpAndBroadcast();
+    persistBubble(userId, t.sessionId, bubble);
+    t.bumpAndBroadcast();
     return res.end(JSON.stringify(result));
   }
 
@@ -263,15 +476,16 @@ const server = http.createServer(async (req, res) => {
 
 // ---------- websockets ----------
 const wss = new WebSocketServer({ server });
-const dashboards = new Set();
 
 wss.on("connection", (ws, req) => {
   if (req.url?.startsWith("/ingest")) {
-    if (!captureAuthed(req.url)) {
+    const userId = captureUser(req.url);
+    if (!userId) {
       console.log("[hub] capture REJECTED (bad or missing key)");
       return ws.close(4401, "capture key required");
     }
-    console.log("[hub] capture connected");
+    const t = tenantFor(userId);
+    t.log("capture connected");
     ws.on("message", (data) => {
       let ev;
       try {
@@ -279,172 +493,33 @@ wss.on("connection", (ws, req) => {
       } catch {
         return;
       }
-      if (!recording) return; // not recording: nothing is shown or saved
-      if (ev.type === "speakers" && Array.isArray(ev.speakers)) {
-        speakerProfiles = ev.speakers;
-        persistSpeakers(speakerProfiles, [...activeSpeakers]);
-        return;
-      }
-      if (ev.type !== "transcript" || !ev.text) return;
-      if (ev.source === "them") {
-        if (ev.speaker) activeSpeakers.add(ev.speaker);
-        const now = Date.now();
-        const tok = tokenize(ev.text);
-        const entry = { set: new Set(tok), list: tok, at: now };
-        recentThem = recentThem.filter((t) => now - t.at < ECHO_WINDOW_MS).concat(entry);
-        // a mic echo can flush BEFORE its loopback twin: reclaim held "me" lines
-        for (const h of [...heldMe]) {
-          if (echoOverlap(h.tokens, entry) >= ECHO_OVERLAP) {
-            clearTimeout(h.timer);
-            heldMe.delete(h);
-            console.log(`[hub] echo dropped: "${h.ev.text}"`);
-          }
-        }
-        acceptLine(ev);
-      } else {
-        const mt = tokenize(ev.text);
-        const now = Date.now();
-        if (recentThem.some((t) => now - t.at < ECHO_WINDOW_MS && echoOverlap(mt, t) >= ECHO_OVERLAP)) {
-          console.log(`[hub] echo dropped: "${ev.text}"`);
-          return;
-        }
-        const h = { ev, tokens: mt };
-        h.timer = setTimeout(() => {
-          heldMe.delete(h);
-          if (recording) acceptLine(ev);
-        }, ECHO_HOLD_MS);
-        heldMe.add(h);
-      }
+      t.handleCaptureEvent(ev);
     });
   } else {
-    if (!browserAuthed(req)) return ws.close(4401, "sign in required");
-    console.log("[hub] dashboard connected");
-    dashboards.add(ws);
-    ws.send(JSON.stringify({ type: "state", state }));
-    ws.send(JSON.stringify({ type: "recording", value: recording }));
-    for (const line of transcript.slice(-30)) ws.send(JSON.stringify(line));
-    ws.on("close", () => dashboards.delete(ws));
+    const userId = browserUser(req);
+    if (!userId) return ws.close(4401, "sign in required");
+    const t = tenantFor(userId);
+    t.log("dashboard connected");
+    t.dashboards.add(ws);
+    ws.send(JSON.stringify({ type: "state", state: t.state }));
+    ws.send(JSON.stringify({ type: "recording", value: t.recording }));
+    for (const line of t.transcript.slice(-30)) ws.send(JSON.stringify(line));
+    ws.on("close", () => t.dashboards.delete(ws));
   }
 });
 
-function acceptLine(ev) {
-  transcript.push(ev);
-  pending.push(ev);
-  persistTranscript(ev);
-  broadcast(ev); // live ticker, before any distill
-}
-
-function tokenize(text) {
-  return text.toLowerCase().replace(/[^a-z0-9' ]+/g, " ").split(/\s+/).filter(Boolean);
-}
-
-// fraction of meTokens found in one "them" line; short lines can't be judged.
-// Fuzzy: exact hit, or shared 4-char prefix — the mic path garbles word tails
-function echoOverlap(meTokens, them) {
-  if (meTokens.length < 2) return 0;
-  let hit = 0;
-  for (const w of meTokens) {
-    if (them.set.has(w)) hit++;
-    else if (w.length >= 4) {
-      const p = w.slice(0, 4);
-      if (them.list.some((v) => v.length >= 4 && (v.startsWith(p) || w.startsWith(v.slice(0, 4))))) hit++;
-    }
-  }
-  return hit / meTokens.length;
-}
-
-function broadcast(obj) {
-  const msg = JSON.stringify(obj);
-  for (const ws of dashboards) if (ws.readyState === 1) ws.send(msg);
-}
-
-function bumpAndBroadcast() {
-  state.rev++;
-  broadcast({ type: "state", state });
-}
-
-// ---------- closeout (runs in the background after Stop) ----------
-async function runCloseout(endedSessionId) {
-  broadcast({ type: "closeout", value: true });
-  try {
-    const { report } = await closeoutSession(endedSessionId, {
-      bubbles: state.bubbles,
-      speakerNames: state.speakers,
-      tailLines: transcript.slice(-60),
-      startedAt: sessionStartedAt || Date.now(),
-      lineCount: transcript.length,
-      speakers: speakerProfiles,
-      activeSpeakers: [...activeSpeakers],
-    });
-    broadcast({ type: "report", report });
-  } catch (e) {
-    console.error("[closeout] error:", e.message);
-  } finally {
-    broadcast({ type: "closeout", value: false });
-  }
-}
-
 // ---------- distill scheduler ----------
-async function runDistill() {
-  if (distilling || pending.length === 0) return;
-  const lines = pending;
-  pending = [];
-  distilling = true;
-  broadcast({ type: "distilling", value: true });
-  try {
-    const ops = await distill(state, lines, distillNote);
-    console.log(`[distill] ${lines.length} lines -> ${ops.length} ops`);
-    let changed = applyOps(state, ops);
-    if (changed) {
-      persistOps(ops);
-      for (const b of state.bubbles) persistBubble(b);
-      for (const op of ops) if (op.op === "remove" && op.id) persistRemoval(op.id, "distill");
-    }
-    if (ops.some((o) => o.op === "speakers")) persistSpeakerNames(state.speakers);
-    // restored bubbles must earn their place: an update clears the flag (in
-    // applyOps); whatever is still flagged after a few distills gets dropped
-    if (restoreState) {
-      restoreState.distills++;
-      const unconfirmed = state.bubbles.filter((b) => b.restored);
-      if (!unconfirmed.length) {
-        restoreState = null;
-        distillNote = "";
-      } else if (restoreState.distills >= RESTORE_MAX_DISTILLS) {
-        state.bubbles = state.bubbles.filter((b) => !b.restored);
-        for (const b of unconfirmed) persistRemoval(b.id, "stale-restore");
-        console.log(`[hub] archived ${unconfirmed.length} unconfirmed restored bubble(s)`);
-        restoreState = null;
-        distillNote = "";
-        changed = true;
-      }
-    }
-    if (changed) bumpAndBroadcast();
-  } catch (e) {
-    console.error("[distill] error:", e.message);
-    pending = lines.concat(pending); // retry these lines next round
-  } finally {
-    lastDistill = Date.now();
-    distilling = false;
-    broadcast({ type: "distilling", value: false });
-  }
-}
-
 setInterval(() => {
-  const due =
-    recording &&
-    (pending.length >= DISTILL_EAGER_LINES ||
-      (pending.length >= DISTILL_MIN_LINES && Date.now() - lastDistill >= DISTILL_EVERY_MS));
-  if (due) runDistill();
+  for (const t of tenants.values()) if (t.distillDue()) t.runDistill();
 }, 3_000);
 
-const restored = await initDb();
-if (restored.sessionId) {
-  // hub died mid-recording (< 30 min ago): pick up where it left off
-  recording = true;
-  sessionStartedAt = restored.startedAt ? new Date(restored.startedAt).getTime() : Date.now();
-  state.bubbles = restored.bubbles;
-  state.speakers = restored.speakerNames || {};
-  state.rev++;
+// ---------- startup ----------
+await initDb();
+const roster = authEnabled ? allowedEmails() : ["local"];
+for (const userId of roster) {
+  await tenantFor(userId).resume(); // restores any session that was mid-recording
 }
 
-server.listen(PORT, () => console.log(`[hub] listening on :${PORT} (ws /ingest for capture, ws for dashboards)`));
+server.listen(PORT, () =>
+  console.log(`[hub] listening on :${PORT} (${authEnabled ? `tenants: ${roster.join(", ")}` : "local mode"})`)
+);

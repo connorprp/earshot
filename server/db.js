@@ -1,4 +1,6 @@
-// MongoDB persistence. Everything is written as it happens:
+// MongoDB persistence, multi-tenant. Every document carries a userId (the
+// signed-in Google email, or "local" when auth is off) so tenants never see
+// each other's data:
 //   sessions    one doc per recording session (Record starts, Stop sets endedAt;
 //               an unfinished session with activity < 30 min ago is resumed)
 //   transcripts every transcript line, verbatim
@@ -6,20 +8,18 @@
 //               bubbles stay as docs with a flag (nothing is ever deleted)
 //   ops         audit trail of every distill patch batch
 // If Mongo is unreachable at startup the hub still runs; writes become no-ops.
-import { MongoClient } from "mongodb";
+// Callers (Tenant instances) pass their userId and sessionId explicitly —
+// this module keeps no per-session state.
+import { MongoClient, ObjectId } from "mongodb";
 
 const URI = process.env.EARSHOT_MONGO || "mongodb://127.0.0.1:27017";
 const DB_NAME = process.env.EARSHOT_DB || "earshot";
 const RESUME_WINDOW_MS = 30 * 60 * 1000;
 
 let db = null;
-let sessionId = null;
 
-function guard(fn) {
-  return (...args) => {
-    if (!db || !sessionId) return Promise.resolve();
-    return fn(...args).catch((e) => console.error("[db] write failed:", e.message));
-  };
+function guarded(promise) {
+  return promise.catch((e) => console.error("[db] write failed:", e.message));
 }
 
 export async function initDb() {
@@ -28,150 +28,159 @@ export async function initDb() {
     await client.connect();
     db = client.db(DB_NAME);
     await Promise.all([
-      db.collection("transcripts").createIndex({ sessionId: 1, ts: 1 }),
+      db.collection("transcripts").createIndex({ userId: 1, sessionId: 1, ts: 1 }),
       db.collection("bubbles").createIndex({ sessionId: 1, bubbleId: 1 }, { unique: true }),
-      db.collection("sessions").createIndex({ lastActivityAt: -1 }),
+      db.collection("sessions").createIndex({ userId: 1, lastActivityAt: -1 }),
       db.collection("ops").createIndex({ sessionId: 1, at: 1 }),
     ]);
+    // one-time migration: docs written before multi-tenancy belong to "local"
+    for (const c of ["sessions", "transcripts", "bubbles", "ops"]) {
+      const r = await db.collection(c).updateMany({ userId: { $exists: false } }, { $set: { userId: "local" } });
+      if (r.modifiedCount) console.log(`[db] migrated ${r.modifiedCount} ${c} docs -> userId "local"`);
+    }
+    console.log(`[db] connected (${DB_NAME})`);
+    return true;
   } catch (e) {
     console.error(`[db] UNAVAILABLE (${e.message}) — running memory-only, nothing will persist`);
     db = null;
-    return { sessionId: null, bubbles: [] };
+    return false;
   }
+}
 
-  // resume a recent unfinished session (crash/restart mid-recording); otherwise
-  // stay idle — sessions now start only via startSession() (the Record button)
+// resume a recent unfinished session for this user (hub died mid-recording)
+export async function resumeSession(userId) {
+  if (!db) return null;
   const recent = await db.collection("sessions").findOne(
-    { lastActivityAt: { $gt: new Date(Date.now() - RESUME_WINDOW_MS) }, endedAt: null },
+    { userId, lastActivityAt: { $gt: new Date(Date.now() - RESUME_WINDOW_MS) }, endedAt: null },
     { sort: { lastActivityAt: -1 } }
   );
-  let bubbles = [];
-  if (recent) {
-    sessionId = recent._id;
-    bubbles = await db
-      .collection("bubbles")
-      .find({ sessionId, removed: { $ne: true } }, { projection: { _id: 0, sessionId: 0, bubbleId: 0, removed: 0, restored: 0 } })
-      .toArray();
-    console.log(`[db] resumed session ${sessionId} (${bubbles.length} live bubbles restored)`);
-  } else {
-    console.log("[db] idle — press Record to start a session");
-  }
+  if (!recent) return null;
+  const bubbles = await liveBubbles(recent._id);
+  console.log(`[db] ${userId}: resumed session ${recent._id} (${bubbles.length} live bubbles restored)`);
   return {
-    sessionId,
+    sessionId: recent._id,
     bubbles,
-    startedAt: recent?.startedAt || null,
-    speakerNames: recent?.speakerNames || {},
+    startedAt: recent.startedAt,
+    speakerNames: recent.speakerNames || {},
   };
 }
 
-export async function startSession() {
+async function liveBubbles(sessionId) {
+  return db
+    .collection("bubbles")
+    .find(
+      { sessionId, removed: { $ne: true } },
+      { projection: { _id: 0, sessionId: 0, bubbleId: 0, removed: 0, restored: 0, userId: 0 } }
+    )
+    .toArray();
+}
+
+export async function startSession(userId) {
   if (!db) return null;
   try {
     const res = await db.collection("sessions").insertOne({
+      userId,
       startedAt: new Date(),
       lastActivityAt: new Date(),
       endedAt: null,
     });
-    sessionId = res.insertedId;
-    console.log(`[db] new session ${sessionId}`);
+    console.log(`[db] ${userId}: new session ${res.insertedId}`);
+    return res.insertedId;
   } catch (e) {
     console.error("[db] startSession failed:", e.message);
-    sessionId = null;
+    return null;
+  }
+}
+
+export async function endSession(sessionId) {
+  if (!db || !sessionId) return null;
+  try {
+    await db
+      .collection("sessions")
+      .updateOne({ _id: sessionId }, { $set: { endedAt: new Date(), lastActivityAt: new Date() } });
+    console.log(`[db] ended session ${sessionId}`);
+  } catch (e) {
+    console.error("[db] endSession failed:", e.message);
   }
   return sessionId;
 }
 
-export async function endSession() {
-  if (!db || !sessionId) return null;
-  const id = sessionId;
-  sessionId = null; // stop further writes attributing to this session
-  try {
-    await db
-      .collection("sessions")
-      .updateOne({ _id: id }, { $set: { endedAt: new Date(), lastActivityAt: new Date() } });
-    console.log(`[db] ended session ${id}`);
-  } catch (e) {
-    console.error("[db] endSession failed:", e.message);
-  }
-  return id;
+export function persistTranscript(userId, sessionId, ev) {
+  if (!db || !sessionId) return;
+  guarded(db.collection("transcripts").insertOne({ userId, sessionId, ...ev, at: new Date() }));
+  guarded(db.collection("sessions").updateOne({ _id: sessionId }, { $set: { lastActivityAt: new Date() } }));
 }
 
-// most recent ENDED session other than excludeId, with its live bubbles —
-// feeds the closeout relatedness check and the provisional restore on Record
-export async function getPreviousSession(excludeId) {
+export function persistOps(userId, sessionId, ops) {
+  if (!db || !sessionId) return;
+  guarded(db.collection("ops").insertOne({ userId, sessionId, at: new Date(), ops }));
+}
+
+export function persistBubble(userId, sessionId, bubble) {
+  if (!db || !sessionId) return;
+  guarded(
+    db.collection("bubbles").updateOne(
+      { sessionId, bubbleId: bubble.id },
+      { $set: { ...bubble, userId, sessionId, bubbleId: bubble.id, removed: false } },
+      { upsert: true }
+    )
+  );
+}
+
+export function persistRemoval(sessionId, bubbleId, reason) {
+  if (!db || !sessionId) return;
+  guarded(
+    db.collection("bubbles").updateOne(
+      { sessionId, bubbleId },
+      { $set: { removed: true, removedReason: reason, removedAt: new Date() } }
+    )
+  );
+}
+
+// voice profiles: capture-process cluster snapshot + which ids spoke this session
+export function persistSpeakers(sessionId, speakers, activeIds) {
+  if (!db || !sessionId) return;
+  guarded(
+    db.collection("sessions").updateOne({ _id: sessionId }, { $set: { speakers, activeSpeakers: activeIds } })
+  );
+}
+
+// voice tag -> inferred display name (distill "speakers" ops), for the ticker
+export function persistSpeakerNames(sessionId, speakerNames) {
+  if (!db || !sessionId) return;
+  guarded(db.collection("sessions").updateOne({ _id: sessionId }, { $set: { speakerNames } }));
+}
+
+// most recent ENDED session for this user other than excludeId, with its live
+// bubbles — feeds the closeout relatedness check and provisional restore
+export async function getPreviousSession(userId, excludeId) {
   if (!db) return null;
-  const query = { endedAt: { $ne: null } };
+  const query = { userId, endedAt: { $ne: null } };
   if (excludeId) query._id = { $ne: excludeId };
   const session = await db.collection("sessions").findOne(query, { sort: { endedAt: -1 } });
   if (!session) return null;
-  const bubbles = await db
-    .collection("bubbles")
-    .find(
-      { sessionId: session._id, removed: { $ne: true } },
-      { projection: { _id: 0, sessionId: 0, bubbleId: 0, removed: 0, restored: 0 } }
-    )
-    .toArray();
-  return { session, bubbles };
+  return { session, bubbles: await liveBubbles(session._id) };
 }
 
-export async function saveSessionReport(id, fields) {
-  if (!db || !id) return;
+export async function saveSessionReport(sessionId, fields) {
+  if (!db || !sessionId) return;
   await db
     .collection("sessions")
-    .updateOne({ _id: id }, { $set: fields })
+    .updateOne({ _id: sessionId }, { $set: fields })
     .catch((e) => console.error("[db] saveSessionReport failed:", e.message));
 }
 
-export const persistTranscript = guard(async (ev) => {
-  await db.collection("transcripts").insertOne({ sessionId, ...ev, at: new Date() });
-  await db.collection("sessions").updateOne({ _id: sessionId }, { $set: { lastActivityAt: new Date() } });
-});
-
-export const persistOps = guard((ops) =>
-  db.collection("ops").insertOne({ sessionId, at: new Date(), ops })
-);
-
-// voice profiles: full capture-process cluster snapshot + which ids actually
-// spoke in THIS session (closeout uses these for cross-session voice matching)
-export const persistSpeakers = guard((speakers, activeIds) =>
-  db.collection("sessions").updateOne(
-    { _id: sessionId },
-    { $set: { speakers, activeSpeakers: activeIds } }
-  )
-);
-
-// voice tag -> inferred display name (distill "speakers" ops), for the ticker
-export const persistSpeakerNames = guard((speakerNames) =>
-  db.collection("sessions").updateOne({ _id: sessionId }, { $set: { speakerNames } })
-);
-
-export const persistBubble = guard((bubble) =>
-  db.collection("bubbles").updateOne(
-    { sessionId, bubbleId: bubble.id },
-    { $set: { ...bubble, sessionId, bubbleId: bubble.id, removed: false } },
-    { upsert: true }
-  )
-);
-
-export const persistRemoval = guard((bubbleId, reason) =>
-  db.collection("bubbles").updateOne(
-    { sessionId, bubbleId },
-    { $set: { removed: true, removedReason: reason, removedAt: new Date() } }
-  )
-);
-
-// ---- read side (session browsing/export) ----
-export async function listSessions(limit = 20) {
+// ---- read side (session browsing/export), always scoped to one user ----
+export async function listSessions(userId, limit = 20) {
   if (!db) return [];
-  return db.collection("sessions").find({}, { sort: { startedAt: -1 }, limit }).toArray();
+  return db.collection("sessions").find({ userId }, { sort: { startedAt: -1 }, limit }).toArray();
 }
 
-export async function getSession(id) {
+export async function getSession(userId, id) {
   if (!db) return null;
-  const { ObjectId } = await import("mongodb");
   const _id = new ObjectId(id);
   const [session, transcript, bubbles] = await Promise.all([
-    db.collection("sessions").findOne({ _id }),
+    db.collection("sessions").findOne({ _id, userId }),
     db.collection("transcripts").find({ sessionId: _id }, { sort: { ts: 1 } }).toArray(),
     db.collection("bubbles").find({ sessionId: _id }).toArray(),
   ]);

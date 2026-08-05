@@ -13,7 +13,8 @@ Object.assign(process.env, {
   EARSHOT_HOSTED: "1",
   EARSHOT_SECRET: "ci-secret",
   EARSHOT_GOOGLE_CLIENT_ID: "ci-fake.apps.googleusercontent.com",
-  EARSHOT_CAPTURE_KEY: "ci-capture-key",
+  EARSHOT_ALLOWED_EMAILS: "alice@example.com,bob@example.com",
+  EARSHOT_CAPTURE_KEYS: "alice@example.com:key-alice,bob@example.com:key-bob",
   EARSHOT_MONGO: "mongodb://127.0.0.1:1/?serverSelectionTimeoutMS=500&connectTimeoutMS=500",
 });
 const env = { ...process.env };
@@ -54,12 +55,52 @@ try {
   })).status === 401);
 
   const { sessionCookie } = await import("./auth.js"); // same EARSHOT_SECRET via env
-  const cookie = sessionCookie("ci@example.com", false).split(";")[0];
-  check("valid cookie accepted", (await fetch(`${BASE}/state`, { headers: { cookie } })).status === 200);
+  const alice = sessionCookie("alice@example.com", false).split(";")[0];
+  const bob = sessionCookie("bob@example.com", false).split(";")[0];
+  check("valid cookie accepted", (await fetch(`${BASE}/state`, { headers: { cookie: alice } })).status === 200);
 
   check("dashboard ws rejected without cookie", (await wsClose(`ws://127.0.0.1:${PORT}`)) === 4401);
   check("capture ws rejected without key", (await wsClose(`ws://127.0.0.1:${PORT}/ingest`)) === 4401);
-  check("capture ws accepted with key", (await wsClose(`ws://127.0.0.1:${PORT}/ingest?key=ci-capture-key`)) === "open");
+  check("capture ws rejected with wrong key", (await wsClose(`ws://127.0.0.1:${PORT}/ingest?key=nope`)) === 4401);
+  check("capture ws accepted with alice's key", (await wsClose(`ws://127.0.0.1:${PORT}/ingest?key=key-alice`)) === "open");
+
+  // ---- tenant isolation ----
+  await fetch(`${BASE}/record/start`, { method: "POST", headers: { cookie: alice } });
+  const aliceState = await (await fetch(`${BASE}/state`, { headers: { cookie: alice } })).json();
+  const bobState = await (await fetch(`${BASE}/state`, { headers: { cookie: bob } })).json();
+  check("alice records", aliceState.recording === true);
+  check("bob unaffected by alice's recording", bobState.recording === false);
+
+  // alice's capture feed must reach only alice's dashboard
+  const gotLine = { alice: false, bob: false };
+  const dash = (cookie, who) =>
+    new Promise((resolve) => {
+      const ws = new WebSocket(`ws://127.0.0.1:${PORT}`, { headers: { cookie } });
+      ws.on("message", (d) => {
+        const m = JSON.parse(d);
+        if (m.type === "transcript") gotLine[who] = true;
+      });
+      ws.on("open", () => resolve(ws));
+    });
+  const aliceDash = await dash(alice, "alice");
+  const bobDash = await dash(bob, "bob");
+  const cap = new WebSocket(`ws://127.0.0.1:${PORT}/ingest?key=key-alice`);
+  await new Promise((r) => cap.on("open", r));
+  cap.send(JSON.stringify({ type: "transcript", source: "them", speaker: "them-1", text: "isolation test line", ts: Date.now() / 1000 }));
+  await sleep(800);
+  check("alice's dashboard received her line", gotLine.alice === true);
+  check("bob's dashboard did NOT receive alice's line", gotLine.bob === false);
+  aliceDash.terminate(); bobDash.terminate(); cap.terminate();
+  await fetch(`${BASE}/record/stop`, { method: "POST", headers: { cookie: alice } });
+
+  // files are per-tenant: a file in alice's out dir is invisible to bob
+  const fs = await import("node:fs");
+  const path = await import("node:path");
+  const aliceOut = path.join(import.meta.dirname, "..", "out", "alice-example-com");
+  fs.mkdirSync(aliceOut, { recursive: true });
+  fs.writeFileSync(path.join(aliceOut, "ci-secret.md"), "alice's eyes only");
+  check("alice can download her file", (await fetch(`${BASE}/files/ci-secret.md`, { headers: { cookie: alice } })).status === 200);
+  check("bob cannot see alice's file", (await fetch(`${BASE}/files/ci-secret.md`, { headers: { cookie: bob } })).status === 404);
 } finally {
   hub.kill();
 }

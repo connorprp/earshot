@@ -46,7 +46,8 @@ function icsDate(iso) {
   return `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}T${pad(d.getHours())}${pad(d.getMinutes())}00`;
 }
 
-export function executeAction(action, bubble) {
+export function executeAction(action, bubble, outDir = OUT_DIR) {
+  fs.mkdirSync(outDir, { recursive: true });
   const p = action.payload || {};
   switch (action.type) {
     case "calendar": {
@@ -67,7 +68,7 @@ export function executeAction(action, bubble) {
         "END:VEVENT",
         "END:VCALENDAR",
       ].join("\r\n");
-      const file = path.join(OUT_DIR, `${safeName(p.title || bubble.title)}.ics`);
+      const file = path.join(outDir, `${safeName(p.title || bubble.title)}.ics`);
       fs.writeFileSync(file, ics);
       return deliver(file, `Calendar event ready: ${p.title || bubble.title}`);
     }
@@ -80,7 +81,7 @@ export function executeAction(action, bubble) {
         "",
         p.body || "",
       ].join("\r\n");
-      const file = path.join(OUT_DIR, `${safeName(p.subject || bubble.title)}.eml`);
+      const file = path.join(outDir, `${safeName(p.subject || bubble.title)}.eml`);
       fs.writeFileSync(file, eml);
       return deliver(file, "Email draft ready.");
     }
@@ -91,17 +92,17 @@ export function executeAction(action, bubble) {
       };
       const rows = [p.columns || [], ...(p.rows || [])];
       const csv = rows.map((r) => r.map(esc).join(",")).join("\r\n");
-      const file = path.join(OUT_DIR, `${safeName(p.name || bubble.title)}.csv`);
+      const file = path.join(outDir, `${safeName(p.name || bubble.title)}.csv`);
       fs.writeFileSync(file, csv);
       return deliver(file, `Spreadsheet ready: ${path.basename(file)}`);
     }
     case "claude_code": {
-      const file = path.join(OUT_DIR, `${safeName(p.title || bubble.title)}-brief.md`);
+      const file = path.join(outDir, `${safeName(p.title || bubble.title)}-brief.md`);
       fs.writeFileSync(file, `# ${p.title || bubble.title}\n\n${p.brief || bubble.summary}\n`);
       return deliver(file, `Brief written. Run: claude "Read '${file}' and do what it describes"`);
     }
     case "note": {
-      const file = path.join(OUT_DIR, "notes.md");
+      const file = path.join(outDir, "notes.md");
       const stamp = new Date().toLocaleString();
       fs.appendFileSync(file, `\n## ${p.title || bubble.title} — ${stamp}\n\n${p.markdown || bubble.summary}\n`);
       return deliver(file, "Saved to notes.md.");

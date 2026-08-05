@@ -115,7 +115,9 @@ function parseOps(text) {
   return JSON.parse(body.slice(start, end + 1));
 }
 
-export async function distill(state, lines, note = "") {
+// env: optional full environment for the spawned Claude process — used to run
+// each tenant's distills under their own CLAUDE_CODE_OAUTH_TOKEN
+export async function distill(state, lines, note = "", env = null) {
   const prompt = buildPrompt(state, lines, note);
   let text = "";
   const q = query({
@@ -125,6 +127,7 @@ export async function distill(state, lines, note = "") {
       systemPrompt: SYSTEM,
       allowedTools: [],
       maxTurns: 1,
+      ...(env ? { env } : {}),
     },
   });
   for await (const msg of q) {

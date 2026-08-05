@@ -12,7 +12,6 @@ import { getPreviousSession, saveSessionReport } from "./db.js";
 import { safeName } from "./actions.js";
 
 const LLM_MODEL = process.env.EARSHOT_LLM || "sonnet";
-const OUT_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "out");
 const VOICE_MATCH_THRESHOLD = 0.5;
 
 const SYSTEM = `You are the closeout engine of "Earshot", an ambient conversation dashboard.
@@ -104,7 +103,7 @@ function parseObject(text) {
   return JSON.parse(body.slice(start, end + 1));
 }
 
-function writeReportFile(report, meta) {
+function writeReportFile(outDir, report, meta) {
   const lines = [
     `# ${report.title}`,
     ``,
@@ -118,24 +117,31 @@ function writeReportFile(report, meta) {
   section("Participants", report.participants);
   section("Decisions", report.decisions);
   section("Open items", report.openItems);
-  const file = path.join(OUT_DIR, `${safeName(report.title)}-session.md`);
+  const file = path.join(outDir, `${safeName(report.title)}-session.md`);
   fs.writeFileSync(file, lines.join("\n") + "\n");
   return file;
 }
 
 /**
- * sessionData: { bubbles, tailLines, startedAt, lineCount, speakers, activeSpeakers }
+ * sessionData: { userId, outDir, env?, bubbles, speakerNames, tailLines,
+ *                startedAt, lineCount, speakers, activeSpeakers }
  * Returns { report, continuesPrevious, file } — persists to Mongo when available.
  */
 export async function closeoutSession(sessionDocId, sessionData) {
-  const prev = await getPreviousSession(sessionDocId).catch(() => null);
+  const prev = await getPreviousSession(sessionData.userId, sessionDocId).catch(() => null);
   const voices = prev ? voiceMatch(sessionData, prev.session) : null;
   const prompt = buildPrompt(sessionData, prev, voices);
 
   let text = "";
   const q = query({
     prompt,
-    options: { model: LLM_MODEL, systemPrompt: SYSTEM, allowedTools: [], maxTurns: 1 },
+    options: {
+      model: LLM_MODEL,
+      systemPrompt: SYSTEM,
+      allowedTools: [],
+      maxTurns: 1,
+      ...(sessionData.env ? { env: sessionData.env } : {}),
+    },
   });
   for await (const msg of q) {
     if (msg.type === "result") {
@@ -157,7 +163,7 @@ export async function closeoutSession(sessionDocId, sessionData) {
   }
   await saveSessionReport(sessionDocId, fields);
 
-  const file = writeReportFile(report, {
+  const file = writeReportFile(sessionData.outDir, report, {
     startedAt: sessionData.startedAt,
     lineCount: sessionData.lineCount,
     continuesTitle: continues ? prev.session.report?.title || `session ${prev.session._id}` : null,
