@@ -1,5 +1,9 @@
 # Earshot
 
+> Returning to this project? Read **HANDOFF.md** for current state, the
+> pick-up list, and the operational crib sheet. This file is architecture +
+> decisions.
+
 Ambient conversation dashboard: always-on listener that captures mic + system
 audio, transcribes locally on the GPU, distills the conversation into
 live-morphing "concept bubbles," and attaches **hedged action buttons**
