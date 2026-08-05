@@ -233,6 +233,18 @@ real Gmail DRAFT (never auto-send, hedged); artifact fallback on any failure.
   connectors (Google Calendar, Gmail) through the Agent SDK.
 - The python venv was moved with the project — fine for `python.exe` runs;
   pip console scripts have stale shebangs, use `python -m pip` if needed.
+- **Windowed PyInstaller apps have sys.stdout/stderr = None** — prints
+  vanish and stderr-writing libs can kill threads. tray.py redirects both to
+  `<app-data>/Earshot/capture.log` (read that file FIRST when the exe
+  misbehaves). And faster-whisper's `vad_filter=True` loads
+  `faster_whisper/assets/silero_vad_v6.onnx` at TRANSCRIBE time — the bundle
+  needs `--collect-all faster_whisper` or every segment errors NO_SUCHFILE
+  while the app looks perfectly connected (2026-08-05: shipped exe captured
+  nothing for exactly this reason; CI smoke now asserts the asset exists).
+- **Audio interfaces can idle above SPEECH_RMS** (Focusrite floor ~0.0135 vs
+  0.010 threshold) → segmenter saw never-ending speech. Segmenter now tracks
+  a per-stream noise floor (fast fall, slow rise) and requires
+  `max(SPEECH_RMS, floor * FLOOR_MARGIN)`.
 
 ## Product decisions (Connor's calls, don't relitigate)
 

@@ -67,7 +67,9 @@ if CAPTURE_KEY:
     HUB_URL += ("&" if "?" in HUB_URL else "?") + "key=" + CAPTURE_KEY
 
 TARGET_RATE = 16000
-SPEECH_RMS = 0.010       # rms above this counts as speech
+SPEECH_RMS = 0.010       # rms above this counts as speech (minimum threshold)
+FLOOR_MARGIN = 2.5       # speech must also exceed the tracked noise floor by this
+FLOOR_RISE = 0.05        # EMA rate for the floor creeping up (fast fall, slow rise)
 SILENCE_END_S = 0.8      # this much trailing silence closes a segment
 MIN_SPEECH_S = 0.35      # segments shorter than this are dropped
 MAX_SEGMENT_S = 15.0     # force-flush long segments
@@ -88,13 +90,24 @@ class Segmenter:
         self.speaking = False
         self.silence_run = 0.0
         self.start_ts = 0.0
+        self.floor = 0.0  # tracked noise floor; audio interfaces can idle above SPEECH_RMS
 
     def feed(self, chunk: np.ndarray):
         dur = len(chunk) / TARGET_RATE
         rms = float(np.sqrt(np.mean(chunk**2))) if len(chunk) else 0.0
 
+        # Speech must clear both the absolute minimum and the stream's own
+        # noise floor (the Focusrite idles at ~0.0135 rms — above SPEECH_RMS —
+        # which otherwise reads as speech that never ends). Floor falls
+        # instantly, rises slowly, so voice can't drag it up.
+        threshold = max(SPEECH_RMS, self.floor * FLOOR_MARGIN)
+        if rms > 0.0 and (self.floor == 0.0 or rms < self.floor):
+            self.floor = rms
+        elif rms < threshold:
+            self.floor += FLOOR_RISE * (rms - self.floor)
+
         if not self.speaking:
-            if rms >= SPEECH_RMS:
+            if rms >= threshold:
                 self.speaking = True
                 self.silence_run = 0.0
                 self.start_ts = time.time() - dur - len(self.pre) / TARGET_RATE
@@ -108,7 +121,7 @@ class Segmenter:
             return
 
         self.buf = np.concatenate([self.buf, chunk])
-        self.silence_run = self.silence_run + dur if rms < SPEECH_RMS else 0.0
+        self.silence_run = self.silence_run + dur if rms < threshold else 0.0
 
         if self.silence_run >= SILENCE_END_S or len(self.buf) / TARGET_RATE >= MAX_SEGMENT_S:
             self._flush()

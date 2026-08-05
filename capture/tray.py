@@ -42,6 +42,24 @@ def app_dir():
 
 
 CONFIG_PATH = os.path.join(app_dir(), "config.json")
+LOG_PATH = os.path.join(app_dir(), "capture.log")
+
+
+def setup_logging():
+    """A --windowed PyInstaller app has sys.stdout/stderr = None: every print
+    vanishes and libraries that write to stderr (tqdm progress bars during
+    model downloads) crash their thread. Route both to a log file instead."""
+    if not (getattr(sys, "frozen", False) or sys.stdout is None):
+        return  # dev run in a terminal — leave prints alone
+    os.makedirs(app_dir(), exist_ok=True)
+    try:
+        if os.path.getsize(LOG_PATH) > 512 * 1024:
+            os.replace(LOG_PATH, LOG_PATH + ".1")
+    except OSError:
+        pass
+    log = open(LOG_PATH, "a", buffering=1, encoding="utf-8", errors="replace")
+    sys.stdout = sys.stderr = log
+    print(f"[app] --- started {time.strftime('%Y-%m-%d %H:%M:%S')} pid={os.getpid()} frozen={getattr(sys, 'frozen', False)} ---")
 
 
 def load_config():
@@ -167,6 +185,9 @@ def smoke():
     import numpy  # noqa: F401
     import sherpa_onnx  # noqa: F401
     from faster_whisper import WhisperModel  # noqa: F401
+    import faster_whisper.assets
+    vad = os.path.join(os.path.dirname(faster_whisper.assets.__file__), "silero_vad_v6.onnx")
+    assert os.path.exists(vad), f"VAD model missing from bundle: {vad}"
     if sys.platform == "darwin":
         import sounddevice  # noqa: F401
         import mac_audio  # noqa: F401
@@ -182,11 +203,17 @@ if __name__ == "__main__":
     if os.environ.get("EARSHOT_SMOKE") == "1":
         smoke()
         sys.exit(0)
-    cfg = load_config()
-    if not cfg or not cfg.get("captureKey"):
-        print("[app] first run — pairing with the dashboard...")
-        cfg = pair()
-        save_config(cfg)
-        print("[app] paired.")
-    main_mod = start_pipeline(cfg)
+    setup_logging()
+    try:
+        cfg = load_config()
+        if not cfg or not cfg.get("captureKey"):
+            print("[app] first run — pairing with the dashboard...")
+            cfg = pair()
+            save_config(cfg)
+            print("[app] paired.")
+        main_mod = start_pipeline(cfg)
+    except Exception:
+        import traceback
+        traceback.print_exc()
+        raise
     run_tray(main_mod, cfg)

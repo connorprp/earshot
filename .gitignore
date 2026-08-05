@@ -10,3 +10,7 @@ deploy/out-*/
 deploy/downloads/
 capture/cloud.env
 *.log
+.build-venv/
+build/
+dist/
+*.spec
