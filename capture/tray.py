@@ -86,6 +86,32 @@ def http_json(url, payload=None):
         return json.loads(r.read())
 
 
+def already_running():
+    """Single-instance guard: an earshot:// click while the app is already
+    capturing must not spawn a second pipeline fighting over the devices."""
+    if sys.platform != "win32":
+        return False
+    import ctypes
+    ctypes.windll.kernel32.CreateMutexW(None, False, "EarshotCaptureSingleton")
+    return ctypes.windll.kernel32.GetLastError() == 183  # ERROR_ALREADY_EXISTS
+
+
+def register_protocol():
+    """Register earshot:// (HKCU, no admin) pointing at this binary so the
+    dashboard's "Start the Earshot app" button can launch it from the browser."""
+    if sys.platform != "win32" or not getattr(sys, "frozen", False):
+        return
+    try:
+        import winreg
+        with winreg.CreateKey(winreg.HKEY_CURRENT_USER, r"Software\Classes\earshot") as k:
+            winreg.SetValueEx(k, None, 0, winreg.REG_SZ, "URL:Earshot Capture")
+            winreg.SetValueEx(k, "URL Protocol", 0, winreg.REG_SZ, "")
+        with winreg.CreateKey(winreg.HKEY_CURRENT_USER, r"Software\Classes\earshot\shell\open\command") as k:
+            winreg.SetValueEx(k, None, 0, winreg.REG_SZ, f'"{sys.executable}" "%1"')
+    except OSError as e:
+        print(f"[app] earshot:// registration failed: {e}")
+
+
 def pair():
     """Device pairing: returns {wsUrl, captureKey} once the user approves."""
     code = "".join(secrets.choice(string.ascii_uppercase + string.digits) for _ in range(8))
@@ -204,6 +230,10 @@ if __name__ == "__main__":
         smoke()
         sys.exit(0)
     setup_logging()
+    if already_running():
+        print("[app] already running — exiting second instance")
+        sys.exit(0)
+    register_protocol()
     try:
         cfg = load_config()
         if not cfg or not cfg.get("captureKey"):

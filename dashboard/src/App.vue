@@ -196,9 +196,16 @@ function connect() {
     else if (msg.type === "distilling") distilling.value = msg.value;
     else if (msg.type === "recording") recording.value = msg.value;
     else if (msg.type === "status") {
+      const hadAgent = captureConnected.value;
       captureConnected.value = msg.captureConnected;
       claudeConnected.value = msg.claudeConnected;
       googleConnected.value = msg.googleConnected;
+      // agent we were waiting on just connected -> begin recording seamlessly
+      if (!hadAgent && msg.captureConnected && showStartAgent.value) {
+        closeStartAgent();
+        showToast("Capture agent connected — recording started.");
+        setRecording("start");
+      }
     } else if (msg.type === "closeout") closingOut.value = msg.value;
     else if (msg.type === "report") showToast(`Session report saved: ${msg.report?.title || "untitled"}`);
     else if (msg.type === "transcript") {
@@ -210,8 +217,7 @@ function connect() {
   };
 }
 
-async function toggleRecording() {
-  const target = recording.value ? "stop" : "start";
+async function setRecording(target) {
   recPending.value = true;
   try {
     if (target === "start") lines.value = []; // fresh ticker for a fresh session
@@ -223,6 +229,42 @@ async function toggleRecording() {
   } finally {
     recPending.value = false;
   }
+}
+
+async function toggleRecording() {
+  const target = recording.value ? "stop" : "start";
+  // a recording with no capture agent stays empty — offer to start the app first
+  if (target === "start" && !captureConnected.value) {
+    showStartAgent.value = true;
+    return;
+  }
+  await setRecording(target);
+}
+
+// ---- "start the capture agent" modal (Record pressed with no agent) ----
+const showStartAgent = ref(false);
+const agentWait = ref(false);
+let agentWaitTimer;
+
+function launchAgent() {
+  // earshot:// is registered (HKCU) by the app on first run; if it has never
+  // run on this computer the navigation is a silent no-op and the modal's
+  // download links take over after the wait message.
+  agentWait.value = true;
+  location.href = "earshot://record";
+  clearTimeout(agentWaitTimer);
+  agentWaitTimer = setTimeout(() => (agentWait.value = false), 45000);
+}
+
+function recordAnyway() {
+  showStartAgent.value = false;
+  setRecording("start");
+}
+
+function closeStartAgent() {
+  showStartAgent.value = false;
+  agentWait.value = false;
+  clearTimeout(agentWaitTimer);
 }
 
 async function runAction(bubble, action) {
@@ -365,6 +407,36 @@ onMounted(async () => {
           <button class="mini dl" @click="approvePair">Allow this computer</button>
           <button class="mini" @click="dismissPair">cancel</button>
         </div>
+      </template>
+    </div>
+  </div>
+
+  <div v-if="showStartAgent" class="signin-overlay" @click.self="closeStartAgent">
+    <div class="signin-card">
+      <h2>No capture agent</h2>
+      <template v-if="agentWait">
+        <p>⏳ Starting the Earshot app — recording will begin automatically once it connects…</p>
+        <p>Nothing happening after a few seconds? It may not be installed on this computer yet:</p>
+        <div class="keyrow">
+          <a class="mini dl" :href="`${HTTP_BASE}/installer/app/windows`">⬇ Earshot for Windows</a>
+          <a class="mini dl" :href="`${HTTP_BASE}/installer/app/mac`">⬇ Earshot for Mac</a>
+        </div>
+        <button class="mini" @click="closeStartAgent">cancel</button>
+      </template>
+      <template v-else>
+        <p>
+          Nothing is listening on this computer, so a recording would stay empty.
+          Start the Earshot app and recording will begin on its own.
+        </p>
+        <div class="keyrow">
+          <button class="mini dl" @click="launchAgent">▶ Start the Earshot app</button>
+          <button class="mini" @click="recordAnyway">record anyway</button>
+          <button class="mini" @click="closeStartAgent">cancel</button>
+        </div>
+        <p>
+          "Start" works once the app has run on this computer before (Windows).
+          On a Mac, open <b>Earshot Capture</b> from Applications.
+        </p>
       </template>
     </div>
   </div>
