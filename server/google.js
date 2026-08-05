@@ -120,7 +120,12 @@ export async function createCalendarEvent(user, { title, start, durationMinutes,
       attendees: (attendees || []).map((email) => ({ email })),
     }
   );
-  return ev?.htmlLink || null;
+  if (!ev?.htmlLink) return null;
+  // htmlLink carries no authuser, so a multi-account browser opens it under
+  // whatever Google account is default and shows "Could not find the requested
+  // event". Pin it to the account that owns the event (the connected account).
+  const owner = ev.organizer?.email || ev.creator?.email;
+  return owner ? `${ev.htmlLink}&authuser=${encodeURIComponent(owner)}` : ev.htmlLink;
 }
 
 // a real Gmail draft (never auto-sent — hedged, reviewable)
