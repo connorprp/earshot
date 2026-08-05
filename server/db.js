@@ -10,7 +10,9 @@
 // If Mongo is unreachable at startup the hub still runs; writes become no-ops.
 // Callers (Tenant instances) pass their userId and sessionId explicitly —
 // this module keeps no per-session state.
+import crypto from "node:crypto";
 import { MongoClient, ObjectId } from "mongodb";
+import { keysEqual } from "./auth.js";
 
 const URI = process.env.EARSHOT_MONGO || "mongodb://127.0.0.1:27017";
 const DB_NAME = process.env.EARSHOT_DB || "earshot";
@@ -45,6 +47,77 @@ export async function initDb() {
     db = null;
     return false;
   }
+}
+
+// ---- users (self-serve provisioning) ----
+// users collection: { _id: email, captureKey, claudeTokenEnc, createdAt }.
+// keyCache maps captureKey -> email for the /ingest websocket; env-configured
+// keys are seeded in too. Memory-only mode gets ephemeral in-memory users.
+const keyCache = new Map();
+const memUsers = new Map();
+
+export function seedCaptureKeys(pairs) {
+  for (const [key, email] of pairs) keyCache.set(key, email);
+}
+
+export async function loadUsers() {
+  if (!db) return;
+  for (const u of await db.collection("users").find().toArray()) {
+    if (u.captureKey) keyCache.set(u.captureKey, u._id);
+  }
+}
+
+export async function getOrCreateUser(email) {
+  if (!db) {
+    if (!memUsers.has(email)) {
+      const captureKey = crypto.randomBytes(24).toString("hex");
+      memUsers.set(email, { _id: email, captureKey, claudeTokenEnc: null });
+      keyCache.set(captureKey, email);
+    }
+    return memUsers.get(email);
+  }
+  let user = await db.collection("users").findOne({ _id: email });
+  if (!user) {
+    user = { _id: email, captureKey: crypto.randomBytes(24).toString("hex"), claudeTokenEnc: null, createdAt: new Date() };
+    await db.collection("users").insertOne(user).catch(() => {});
+    user = (await db.collection("users").findOne({ _id: email })) || user;
+    console.log(`[db] provisioned user ${email}`);
+  }
+  if (user.captureKey) keyCache.set(user.captureKey, email);
+  return user;
+}
+
+export async function rotateCaptureKey(email) {
+  const captureKey = crypto.randomBytes(24).toString("hex");
+  const user = await getOrCreateUser(email);
+  if (user.captureKey) keyCache.delete(user.captureKey);
+  user.captureKey = captureKey;
+  keyCache.set(captureKey, email);
+  if (db) await db.collection("users").updateOne({ _id: email }, { $set: { captureKey } }).catch(() => {});
+  return captureKey;
+}
+
+export async function setClaudeToken(email, claudeTokenEnc) {
+  const user = await getOrCreateUser(email);
+  user.claudeTokenEnc = claudeTokenEnc;
+  if (db) await db.collection("users").updateOne({ _id: email }, { $set: { claudeTokenEnc } }).catch(() => {});
+}
+
+export function userByCaptureKey(key) {
+  if (!key) return null;
+  for (const [k, email] of keyCache) if (keysEqual(k, key)) return email;
+  return null;
+}
+
+// users whose last session never ended (hub restart mid-recording): the hub
+// resumes their tenants at boot without needing a static roster
+export async function usersWithOpenSessions() {
+  if (!db) return [];
+  const rows = await db
+    .collection("sessions")
+    .find({ endedAt: null, lastActivityAt: { $gt: new Date(Date.now() - RESUME_WINDOW_MS) } })
+    .toArray();
+  return [...new Set(rows.map((r) => r.userId))];
 }
 
 // resume a recent unfinished session for this user (hub died mid-recording)

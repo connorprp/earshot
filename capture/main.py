@@ -29,6 +29,24 @@ import queue
 import threading
 import time
 
+
+def _load_env_file():
+    """--env-file <path>: load KEY=VALUE lines (existing env wins). Lets one
+    install target different hubs: `main.py --env-file cloud.env` points this
+    capture agent at the hosted hub without touching the local-dev defaults."""
+    if "--env-file" not in sys.argv:
+        return
+    path = sys.argv[sys.argv.index("--env-file") + 1]
+    with open(path) as f:
+        for line in f:
+            line = line.strip()
+            if line and not line.startswith("#") and "=" in line:
+                k, v = line.split("=", 1)
+                os.environ.setdefault(k.strip(), v.strip())
+
+
+_load_env_file()
+
 import numpy as np
 import soxr
 from faster_whisper import WhisperModel

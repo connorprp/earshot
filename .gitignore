@@ -7,4 +7,5 @@ capture/models/
 dashboard/dist/
 deploy/.env
 deploy/out-*/
+capture/cloud.env
 *.log

@@ -93,6 +93,25 @@ try {
   aliceDash.terminate(); bobDash.terminate(); cap.terminate();
   await fetch(`${BASE}/record/stop`, { method: "POST", headers: { cookie: alice } });
 
+  // ---- self-serve settings ----
+  const meRes = await fetch(`${BASE}/me`, { headers: { cookie: alice } });
+  const meData = await meRes.json();
+  check("/me returns identity + capture key", meRes.status === 200 && meData.email === "alice@example.com" && !!meData.captureKey);
+  check("/me wsUrl points at ingest", meData.wsUrl.endsWith("/ingest"));
+  check("provisioned capture key works", (await wsClose(`ws://127.0.0.1:${PORT}/ingest?key=${meData.captureKey}`)) === "open");
+  check("bad claude token rejected", (await fetch(`${BASE}/me/claude-token`, {
+    method: "POST", headers: { cookie: alice, "content-type": "application/json" },
+    body: JSON.stringify({ token: "not-a-token" }),
+  })).status === 400);
+  const tok = await (await fetch(`${BASE}/me/claude-token`, {
+    method: "POST", headers: { cookie: alice, "content-type": "application/json" },
+    body: JSON.stringify({ token: "sk-ant-oat-ci-test" }),
+  })).json();
+  check("claude token accepted and connects", tok.ok === true && tok.claudeConnected === true);
+  const rot = await (await fetch(`${BASE}/me/capture-key/rotate`, { method: "POST", headers: { cookie: alice } })).json();
+  check("rotated key connects", (await wsClose(`ws://127.0.0.1:${PORT}/ingest?key=${rot.captureKey}`)) === "open");
+  check("settings are cookie-gated", (await fetch(`${BASE}/me`)).status === 401);
+
   // files are per-tenant: a file in alice's out dir is invisible to bob
   const fs = await import("node:fs");
   const path = await import("node:path");

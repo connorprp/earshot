@@ -14,15 +14,23 @@ import { executeAction } from "./actions.js";
 import { closeoutSession } from "./closeout.js";
 import {
   authEnabled,
-  allowedEmails,
   publicConfig,
   verifyGoogleCredential,
   sessionCookie,
   browserUser,
-  captureUser,
+  envCaptureKeyPairs,
+  encryptSecret,
+  decryptSecret,
 } from "./auth.js";
 import {
   initDb,
+  seedCaptureKeys,
+  loadUsers,
+  getOrCreateUser,
+  rotateCaptureKey,
+  setClaudeToken,
+  userByCaptureKey,
+  usersWithOpenSessions,
   resumeSession,
   startSession,
   endSession,
@@ -82,11 +90,37 @@ class Tenant {
     this.recentThem = [];       // [{ set, list, at }] for echo matching
     this.heldMe = new Set();    // { ev, tokens, timer } "me" lines waiting out ECHO_HOLD_MS
     this.dashboards = new Set();
+    this.captureSockets = new Set();
+    this.claudeToken = CLAUDE_TOKENS.get(userId) || null; // may be replaced from the user's stored token
     this.outDir = path.join(OUT_ROOT, userId === "local" ? "local" : userId.replace(/[^a-z0-9]+/gi, "-"));
     fs.mkdirSync(this.outDir, { recursive: true });
-    this.claudeEnv = CLAUDE_TOKENS.has(userId)
-      ? { ...process.env, CLAUDE_CODE_OAUTH_TOKEN: CLAUDE_TOKENS.get(userId) }
-      : null;
+  }
+
+  get claudeEnv() {
+    return this.claudeToken ? { ...process.env, CLAUDE_CODE_OAUTH_TOKEN: this.claudeToken } : null;
+  }
+
+  // local mode rides the machine's own Claude login; hosted needs a token
+  get claudeConnected() {
+    return !authEnabled || Boolean(this.claudeToken || process.env.CLAUDE_CODE_OAUTH_TOKEN);
+  }
+
+  status() {
+    return {
+      type: "status",
+      captureConnected: this.captureSockets.size > 0,
+      claudeConnected: this.claudeConnected,
+    };
+  }
+
+  async loadStoredToken() {
+    if (!authEnabled || this.userId === "local") return;
+    const user = await getOrCreateUser(this.userId);
+    if (user.claudeTokenEnc) {
+      const token = decryptSecret(user.claudeTokenEnc);
+      if (token) this.claudeToken = token;
+      else console.error(`[hub:${this.userId}] stored Claude token undecryptable (EARSHOT_SECRET changed?)`);
+    }
   }
 
   log(msg) {
@@ -308,7 +342,11 @@ class Tenant {
 
 const tenants = new Map();
 function tenantFor(userId) {
-  if (!tenants.has(userId)) tenants.set(userId, new Tenant(userId));
+  if (!tenants.has(userId)) {
+    const t = new Tenant(userId);
+    tenants.set(userId, t);
+    t.loadStoredToken(); // async; lands well before the first distill
+  }
   return tenants.get(userId);
 }
 
@@ -372,6 +410,7 @@ const server = http.createServer(async (req, res) => {
       }
       const secure = (req.headers["x-forwarded-proto"] || "") === "https";
       res.setHeader("set-cookie", sessionCookie(email, secure));
+      await getOrCreateUser(email); // provision tenant resources on first sign-in
       console.log(`[auth] ${email} signed in`);
       return res.end(JSON.stringify({ ok: true, email }));
     } catch {
@@ -396,6 +435,41 @@ const server = http.createServer(async (req, res) => {
     return res.end(JSON.stringify({ ok: false, message: "sign in required" }));
   }
   const t = tenantFor(userId);
+
+  // ---- self-serve settings ----
+  if (req.method === "GET" && req.url === "/me") {
+    const user = await getOrCreateUser(userId);
+    const proto = (req.headers["x-forwarded-proto"] || "") === "https" ? "wss" : "ws";
+    res.setHeader("content-type", "application/json");
+    return res.end(
+      JSON.stringify({
+        email: userId,
+        captureKey: user.captureKey || null,
+        wsUrl: `${proto}://${req.headers.host}/ingest`,
+        captureConnected: t.captureSockets.size > 0,
+        claudeConnected: t.claudeConnected,
+      })
+    );
+  }
+  if (req.method === "POST" && req.url === "/me/claude-token") {
+    let body = "";
+    for await (const chunk of req) body += chunk;
+    const token = (JSON.parse(body || "{}").token || "").trim();
+    res.setHeader("content-type", "application/json");
+    if (token && !token.startsWith("sk-ant-")) {
+      res.statusCode = 400;
+      return res.end(JSON.stringify({ ok: false, message: "That doesn't look like a Claude token (expected sk-ant-…)." }));
+    }
+    t.claudeToken = token || null;
+    await setClaudeToken(userId, token ? encryptSecret(token) : null);
+    t.broadcast(t.status());
+    return res.end(JSON.stringify({ ok: true, claudeConnected: t.claudeConnected }));
+  }
+  if (req.method === "POST" && req.url === "/me/capture-key/rotate") {
+    const captureKey = await rotateCaptureKey(userId);
+    res.setHeader("content-type", "application/json");
+    return res.end(JSON.stringify({ ok: true, captureKey }));
+  }
 
   if (req.method === "GET" && urlPath.startsWith("/files/")) {
     const name = path.basename(decodeURIComponent(urlPath.slice("/files/".length)));
@@ -479,13 +553,16 @@ const wss = new WebSocketServer({ server });
 
 wss.on("connection", (ws, req) => {
   if (req.url?.startsWith("/ingest")) {
-    const userId = captureUser(req.url);
+    const key = new URL(req.url, "http://x").searchParams.get("key") || "";
+    const userId = authEnabled ? userByCaptureKey(key) : "local";
     if (!userId) {
       console.log("[hub] capture REJECTED (bad or missing key)");
       return ws.close(4401, "capture key required");
     }
     const t = tenantFor(userId);
+    t.captureSockets.add(ws);
     t.log("capture connected");
+    t.broadcast(t.status());
     ws.on("message", (data) => {
       let ev;
       try {
@@ -495,6 +572,10 @@ wss.on("connection", (ws, req) => {
       }
       t.handleCaptureEvent(ev);
     });
+    ws.on("close", () => {
+      t.captureSockets.delete(ws);
+      t.broadcast(t.status());
+    });
   } else {
     const userId = browserUser(req);
     if (!userId) return ws.close(4401, "sign in required");
@@ -503,6 +584,7 @@ wss.on("connection", (ws, req) => {
     t.dashboards.add(ws);
     ws.send(JSON.stringify({ type: "state", state: t.state }));
     ws.send(JSON.stringify({ type: "recording", value: t.recording }));
+    ws.send(JSON.stringify(t.status()));
     for (const line of t.transcript.slice(-30)) ws.send(JSON.stringify(line));
     ws.on("close", () => t.dashboards.delete(ws));
   }
@@ -515,11 +597,15 @@ setInterval(() => {
 
 // ---------- startup ----------
 await initDb();
-const roster = authEnabled ? allowedEmails() : ["local"];
-for (const userId of roster) {
-  await tenantFor(userId).resume(); // restores any session that was mid-recording
+seedCaptureKeys(envCaptureKeyPairs()); // env-configured keys keep working
+await loadUsers();                     // Mongo-provisioned keys into the cache
+// tenants are created lazily on sign-in / capture connect; at boot we only
+// need tenants whose recording was cut off mid-session
+const openUsers = authEnabled ? await usersWithOpenSessions() : ["local"];
+for (const userId of openUsers) {
+  await tenantFor(userId).resume();
 }
 
 server.listen(PORT, () =>
-  console.log(`[hub] listening on :${PORT} (${authEnabled ? `tenants: ${roster.join(", ")}` : "local mode"})`)
+  console.log(`[hub] listening on :${PORT} (${authEnabled ? "hosted, self-serve sign-in" : "local mode"})`)
 );

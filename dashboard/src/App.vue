@@ -14,6 +14,50 @@ const needSignIn = ref(false);
 const signInError = ref("");
 const gsiButton = ref(null);
 
+const showSettings = ref(false);
+const me = ref(null);            // /me payload when the settings panel is open
+const captureConnected = ref(true); // optimistic until a status message says otherwise
+const claudeConnected = ref(true);
+const tokenInput = ref("");
+const tokenSaving = ref(false);
+
+async function openSettings() {
+  showSettings.value = true;
+  me.value = await (await fetch(`${HTTP_BASE}/me`)).json();
+}
+
+async function copyKey() {
+  await navigator.clipboard.writeText(me.value.captureKey);
+  showToast("Capture key copied.");
+}
+
+async function rotateKey() {
+  const r = await (await fetch(`${HTTP_BASE}/me/capture-key/rotate`, { method: "POST" })).json();
+  me.value.captureKey = r.captureKey;
+  showToast("New capture key generated — update your capture agent.");
+}
+
+async function saveToken() {
+  tokenSaving.value = true;
+  try {
+    const res = await fetch(`${HTTP_BASE}/me/claude-token`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ token: tokenInput.value }),
+    });
+    const r = await res.json();
+    if (r.ok) {
+      claudeConnected.value = r.claudeConnected;
+      tokenInput.value = "";
+      showToast(r.claudeConnected ? "Claude connected — distilling is live." : "Claude token cleared.");
+    } else {
+      showToast(r.message);
+    }
+  } finally {
+    tokenSaving.value = false;
+  }
+}
+
 const connected = ref(false);
 const distilling = ref(false);
 const closingOut = ref(false);
@@ -114,7 +158,10 @@ function connect() {
     if (msg.type === "state") applyState(msg.state);
     else if (msg.type === "distilling") distilling.value = msg.value;
     else if (msg.type === "recording") recording.value = msg.value;
-    else if (msg.type === "closeout") closingOut.value = msg.value;
+    else if (msg.type === "status") {
+      captureConnected.value = msg.captureConnected;
+      claudeConnected.value = msg.claudeConnected;
+    } else if (msg.type === "closeout") closingOut.value = msg.value;
     else if (msg.type === "report") showToast(`Session report saved: ${msg.report?.title || "untitled"}`);
     else if (msg.type === "transcript") {
       lines.value.push(msg);
@@ -191,6 +238,22 @@ onMounted(async () => {
       }}</span>
     </div>
     <button
+      v-if="connected && !claudeConnected"
+      class="warn-chip"
+      @click="openSettings"
+      title="Distilling is paused until a Claude token is connected"
+    >
+      ⚠ connect Claude
+    </button>
+    <button
+      v-if="connected && !captureConnected"
+      class="warn-chip"
+      @click="openSettings"
+      title="No capture agent is streaming audio for your account"
+    >
+      ⚠ no capture agent
+    </button>
+    <button
       class="rec-btn"
       :class="{ on: recording }"
       :disabled="!connected || recPending"
@@ -198,6 +261,7 @@ onMounted(async () => {
     >
       <span class="rec-icon"></span>{{ recording ? "Stop" : "Record" }}
     </button>
+    <button class="gear" @click="openSettings" title="Settings">⚙</button>
   </div>
 
   <TransitionGroup tag="div" name="bubbles" class="grid">
@@ -234,6 +298,45 @@ onMounted(async () => {
       <p>Sign in with your Google account to open your dashboard.</p>
       <div ref="gsiButton"></div>
       <p v-if="signInError" class="signin-error">{{ signInError }}</p>
+    </div>
+  </div>
+
+  <div v-if="showSettings" class="signin-overlay" @click.self="showSettings = false">
+    <div class="signin-card settings-card">
+      <h2>Settings</h2>
+      <p v-if="me" class="settings-email">{{ me.email }}</p>
+
+      <div v-if="me" class="settings-block">
+        <h3>1 · Capture agent <span :class="captureConnected ? 'ok' : 'bad'">{{ captureConnected ? "connected" : "not connected" }}</span></h3>
+        <p>
+          Audio is captured by a small agent on your computer (best quality, hears your calls).
+          Install it once — Mac: <b>Install Earshot.command</b>, Windows: <b>Install Earshot.ps1</b>
+          (ask Connor for the installer folder) — and give it these when asked:
+        </p>
+        <label>Server address</label>
+        <code>{{ me.wsUrl.replace("/ingest", "").replace(/^wss?:\/\//, "") }}</code>
+        <label>Your capture key</label>
+        <div class="keyrow">
+          <code>{{ me.captureKey }}</code>
+          <button class="mini" @click="copyKey">copy</button>
+          <button class="mini" @click="rotateKey">new key</button>
+        </div>
+      </div>
+
+      <div class="settings-block">
+        <h3>2 · Claude <span :class="claudeConnected ? 'ok' : 'bad'">{{ claudeConnected ? "connected" : "not connected" }}</span></h3>
+        <p>
+          Distilling runs on your own Claude subscription. In a terminal run
+          <code>npx @anthropic-ai/claude-code setup-token</code>, approve in the browser,
+          then paste the token here:
+        </p>
+        <div class="keyrow">
+          <input v-model="tokenInput" type="password" placeholder="sk-ant-oat…" />
+          <button class="mini" :disabled="tokenSaving" @click="saveToken">save</button>
+        </div>
+      </div>
+
+      <button class="mini close" @click="showSettings = false">close</button>
     </div>
   </div>
 </template>

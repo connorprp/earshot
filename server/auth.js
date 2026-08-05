@@ -21,6 +21,12 @@ const ALLOWED = (process.env.EARSHOT_ALLOWED_EMAILS || "")
   .split(",")
   .map((s) => s.trim().toLowerCase())
   .filter(Boolean);
+// whole domains that may sign in (e.g. "<company-domain>") — any
+// verified Google account under them gets a tenant automatically
+const ALLOWED_DOMAINS = (process.env.EARSHOT_ALLOWED_DOMAINS || "")
+  .split(",")
+  .map((s) => s.trim().toLowerCase())
+  .filter(Boolean);
 const SECRET = process.env.EARSHOT_SECRET || crypto.randomBytes(32).toString("hex");
 // "email:key,email:key" -> Map<key, email>
 const CAPTURE_KEYS = new Map(
@@ -40,18 +46,47 @@ export function publicConfig() {
   return { enabled: authEnabled, clientId: CLIENT_ID };
 }
 
-// the tenant roster in hosted mode (union of allowlist + capture-key owners)
-export function allowedEmails() {
-  return [...new Set([...ALLOWED, ...CAPTURE_KEYS.values()])];
+// env-configured capture keys (merged with Mongo-provisioned per-user keys)
+export function envCaptureKeyPairs() {
+  return [...CAPTURE_KEYS.entries()]; // [key, email]
 }
 
-// Google ID token -> allowlisted email, or null
+// ---- secret storage (Claude tokens at rest in Mongo) ----
+// AES-256-GCM keyed off EARSHOT_SECRET. If EARSHOT_SECRET is unset the key is
+// random per boot and stored tokens become undecryptable on restart — set it.
+const ENC_KEY = crypto.createHash("sha256").update(SECRET).digest();
+
+export function encryptSecret(plain) {
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv("aes-256-gcm", ENC_KEY, iv);
+  const enc = Buffer.concat([cipher.update(plain, "utf8"), cipher.final()]);
+  return [iv.toString("base64url"), enc.toString("base64url"), cipher.getAuthTag().toString("base64url")].join(".");
+}
+
+export function decryptSecret(stored) {
+  try {
+    const [iv, enc, tag] = stored.split(".").map((s) => Buffer.from(s, "base64url"));
+    const decipher = crypto.createDecipheriv("aes-256-gcm", ENC_KEY, iv);
+    decipher.setAuthTag(tag);
+    return Buffer.concat([decipher.update(enc), decipher.final()]).toString("utf8");
+  } catch {
+    return null;
+  }
+}
+
+export function emailAllowed(email) {
+  if (ALLOWED.includes(email)) return true;
+  const domain = email.split("@")[1] || "";
+  return ALLOWED_DOMAINS.includes(domain);
+}
+
+// Google ID token -> allowed email, or null
 export async function verifyGoogleCredential(credential) {
   const ticket = await oauth.verifyIdToken({ idToken: credential, audience: CLIENT_ID });
   const payload = ticket.getPayload() || {};
   const email = (payload.email || "").toLowerCase();
   if (!email || !payload.email_verified) return null;
-  if (ALLOWED.length && !ALLOWED.includes(email)) return null;
+  if (!emailAllowed(email)) return null;
   return email;
 }
 
@@ -88,14 +123,9 @@ export function browserUser(req) {
   return sessionEmail(req.headers.cookie);
 }
 
-// /ingest upgrade -> tenant userId owning this capture key, or null
-export function captureUser(reqUrl) {
-  if (!authEnabled) return "local";
-  const key = new URL(reqUrl, "http://x").searchParams.get("key") || "";
-  for (const [k, email] of CAPTURE_KEYS) {
-    const a = Buffer.from(k);
-    const b = Buffer.from(key);
-    if (a.length === b.length && crypto.timingSafeEqual(a, b)) return email;
-  }
-  return null;
+// timing-safe compare for capture keys (resolution lives in db.js's key cache)
+export function keysEqual(a, b) {
+  const ba = Buffer.from(a);
+  const bb = Buffer.from(b);
+  return ba.length === bb.length && crypto.timingSafeEqual(ba, bb);
 }

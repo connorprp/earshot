@@ -7,6 +7,7 @@
     "server": "node --env-file-if-exists=server/.env server/index.js",
     "dashboard": "npm run dev --prefix dashboard",
     "capture": "capture\\.venv\\Scripts\\python.exe capture\\main.py",
+    "capture:cloud": "capture\\.venv\\Scripts\\python.exe capture\\main.py --env-file capture\\cloud.env",
     "dev": "concurrently -n hub,ui,ear -c blue,magenta,yellow \"npm run server\" \"npm run dashboard\" \"npm run capture\"",
     "inject": "node scripts/inject.js"
   },

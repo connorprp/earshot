@@ -1,0 +1,8 @@
+# Windows capture agent WITHOUT a CUDA GPU (generic staff machines):
+# whisper runs on CPU (small.en default via the installer's config).
+faster-whisper
+pyaudiowpatch
+numpy
+websockets
+soxr
+sherpa-onnx

@@ -154,6 +154,42 @@ body {
 .ticker .who.me { color: var(--accent-data); }
 .ticker .who.them { color: var(--accent-scheduling); }
 
+/* settings + warning chips */
+.gear {
+  background: none; border: none; color: var(--dim); cursor: pointer;
+  font-size: 16px; padding: 4px 6px; border-radius: 6px;
+}
+.gear:hover { background: var(--border); color: var(--text); }
+.warn-chip {
+  font-size: 11px; font-weight: 600; color: #d29922;
+  background: var(--panel-2); border: 1px solid #d29922;
+  padding: 4px 10px; border-radius: 99px; cursor: pointer;
+}
+.settings-card { max-width: 480px; text-align: left; align-items: stretch; }
+.settings-card h3 { font-size: 13px; display: flex; justify-content: space-between; }
+.settings-card h3 .ok { color: #3fb950; font-weight: 400; font-size: 11px; }
+.settings-card h3 .bad { color: #f85149; font-weight: 400; font-size: 11px; }
+.settings-email { font-size: 12px; }
+.settings-block { display: flex; flex-direction: column; gap: 6px; }
+.settings-block p { max-width: none; }
+.settings-block label { font-size: 11px; color: var(--dim); }
+.settings-block code {
+  font-size: 11px; background: var(--bg); border: 1px solid var(--border);
+  padding: 4px 8px; border-radius: 6px; overflow-x: auto; white-space: nowrap;
+}
+.keyrow { display: flex; gap: 6px; align-items: center; }
+.keyrow code, .keyrow input { flex: 1; min-width: 0; }
+.keyrow input {
+  background: var(--bg); border: 1px solid var(--border); color: var(--text);
+  padding: 5px 8px; border-radius: 6px; font-size: 12px;
+}
+.mini {
+  font-size: 11px; background: var(--panel); color: var(--text);
+  border: 1px solid var(--border); padding: 4px 10px; border-radius: 6px; cursor: pointer;
+}
+.mini:hover { border-color: var(--accent-scheduling); }
+.mini.close { align-self: center; }
+
 /* sign-in overlay (hosted mode) */
 .signin-overlay {
   position: fixed; inset: 0; z-index: 20;

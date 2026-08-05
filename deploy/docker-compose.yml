@@ -10,12 +10,12 @@ services:
       EARSHOT_MONGO: ${EARSHOT_MONGO}
       EARSHOT_DB: earshot-cloud
       EARSHOT_GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID}
-      # who may sign in (comma-separated)
+      # self-serve sign-in: whole domains and/or specific emails
+      EARSHOT_ALLOWED_DOMAINS: ${ALLOWED_DOMAINS}
       EARSHOT_ALLOWED_EMAILS: ${ALLOWED_EMAILS}
-      # per-user capture-agent keys: "email:key,email:key"
+      # OPTIONAL legacy/pre-seeded values — capture keys and Claude tokens are
+      # normally self-serve (auto-provisioned key + token paste, in Settings)
       EARSHOT_CAPTURE_KEYS: ${CAPTURE_KEYS}
-      # per-user Claude subscription tokens: "email:sk-ant-oat...,email:..."
-      # (tenants without one fall back to CLAUDE_CODE_OAUTH_TOKEN below)
       EARSHOT_CLAUDE_TOKENS: ${CLAUDE_TOKENS}
       CLAUDE_CODE_OAUTH_TOKEN: ${CLAUDE_TOKEN_FALLBACK}
       EARSHOT_SECRET: ${SECRET}

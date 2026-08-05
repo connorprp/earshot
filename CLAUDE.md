@@ -86,13 +86,25 @@ Split rule: audio capture MUST run on the user's machine; everything else
 **Multi-tenant (2026-08-05):** ONE hub instance serves all users. Google
 sign-in decides identity; a Tenant object (server/index.js) owns each user's
 entire state — board, transcript, recording, echo suppression, sessions,
-out/<email-slug>/ artifacts — and every Mongo doc carries userId. Capture
-keys are per-user ("email:key,..." in EARSHOT_CAPTURE_KEYS) and route audio
-to that user's tenant. Per-user Claude billing via EARSHOT_CLAUDE_TOKENS
-("email:token,..."), falling back to CLAUDE_CODE_OAUTH_TOKEN. Local mode =
-single "local" tenant, identical to old behavior; old docs were migrated to
-userId "local" automatically on first start. Isolation is covered by
-server/ci_test.mjs (state, ws fan-out, capture routing, /files).
+out/<email-slug>/ artifacts — and every Mongo doc carries userId. Local mode
+= single "local" tenant, identical to old behavior; old docs were migrated
+to userId "local" automatically on first start. Isolation is covered by
+server/ci_test.mjs (state, ws fan-out, capture routing, /files, settings).
+
+**Self-serve onboarding (Connor's call: native capture agents only — no
+browser capture; rusty has no GPU and agents give the best quality):**
+anyone @<company-domain> signs in (EARSHOT_ALLOWED_DOMAINS; plus
+EARSHOT_ALLOWED_EMAILS extras). First sign-in auto-provisions a users doc
+{captureKey, claudeTokenEnc}. The dashboard ⚙ Settings panel shows the
+user's capture key + server address for the per-OS installers (mac/ and
+windows/), and a paste box for their `claude setup-token` token — stored
+AES-GCM-encrypted with EARSHOT_SECRET (changing that secret orphans stored
+tokens), distills run under it via options.env. Topbar warning chips show
+"no capture agent" / "connect Claude" live (per-tenant ws status messages).
+Browser capture (getDisplayMedia) was considered and declined; macOS
+browsers can only capture tab audio anyway. Capture agents connect to
+wss://earshot.rustycloud.dev/ingest?key=<theirs>; Connor's own Windows agent
+has capture/cloud.env (gitignored) + `npm run capture:cloud`.
 
 - Auth: Google Sign-In (server/auth.js). Dashboard posts a Google ID token,
   hub verifies via google-auth-library + EARSHOT_ALLOWED_EMAILS, mints a
