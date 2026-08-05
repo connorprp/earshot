@@ -1,0 +1,39 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  mac-capture:
+    # real Apple hardware: validates the macOS capture port (wheels, echo gate,
+    # speaker clustering, and actual Whisper ASR on Apple-TTS speech)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r capture/requirements-mac.txt
+      - name: Download speaker model
+        run: |
+          mkdir -p capture/models
+          curl -sL -o capture/models/nemo_en_titanet_small.onnx \
+            https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/nemo_en_titanet_small.onnx
+      - run: cd capture && python ci_test_mac.py
+
+  hub-auth:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22 }
+      - run: cd server && npm ci
+      - run: cd server && node ci_test.mjs
+
+  docker-image:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -f deploy/Dockerfile -t earshot-hub .

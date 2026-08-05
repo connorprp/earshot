@@ -1,0 +1,9 @@
+# TLS + routing: one subdomain per user. Caddy auto-provisions certificates.
+# Point DNS A records for both names at this server first.
+earshot.YOURDOMAIN.com {
+	reverse_proxy 127.0.0.1:7071
+}
+
+earshot-alex.YOURDOMAIN.com {
+	reverse_proxy 127.0.0.1:7072
+}

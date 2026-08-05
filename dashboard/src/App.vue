@@ -1,0 +1,239 @@
+<script setup>
+import { ref, computed, onMounted, nextTick } from "vue";
+import Bubble from "./components/Bubble.vue";
+
+// vite dev (:5173) talks to a local hub; a built dashboard is served BY the
+// hub, so everything is same-origin (and wss behind https)
+const DEV = location.port === "5173";
+const HTTP_BASE = DEV ? "http://127.0.0.1:7071" : "";
+const WS_URL = DEV
+  ? "ws://127.0.0.1:7071"
+  : `${location.protocol === "https:" ? "wss" : "ws"}://${location.host}`;
+
+const needSignIn = ref(false);
+const signInError = ref("");
+const gsiButton = ref(null);
+
+const connected = ref(false);
+const distilling = ref(false);
+const closingOut = ref(false);
+const recording = ref(false);
+const recPending = ref(false);
+const bubbles = ref([]);
+const stateSpeakers = ref({});
+const lines = ref([]);
+const toast = ref("");
+const flashIds = ref(new Set());
+const tickerEl = ref(null);
+
+// voice tag -> display name: primarily state.speakers (distill "speakers" ops),
+// plus any Participants-bubble map as fallback. Computed off live state, so
+// past ticker lines re-caption the moment the distiller figures out a voice.
+const speakerNames = computed(() => {
+  const names = {};
+  for (const b of bubbles.value) if (b.speakers) Object.assign(names, b.speakers);
+  return { ...names, ...stateSpeakers.value };
+});
+
+function whoLabel(line) {
+  if (line.source === "me") return "You";
+  if (!line.speaker) return "Them";
+  return speakerNames.value[line.speaker] || `Them ${line.speaker.replace("them-", "")}`;
+}
+
+let toastTimer;
+function showToast(msg) {
+  toast.value = msg;
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => (toast.value = ""), 5000);
+}
+
+function applyState(state) {
+  const prev = new Map(bubbles.value.map((b) => [b.id, b.updatedAt]));
+  const flashed = new Set();
+  for (const b of state.bubbles) {
+    if (!prev.has(b.id) || prev.get(b.id) !== b.updatedAt) flashed.add(b.id);
+  }
+  flashIds.value = flashed;
+  bubbles.value = state.bubbles;
+  stateSpeakers.value = state.speakers || {};
+  setTimeout(() => (flashIds.value = new Set()), 1300);
+}
+
+// ---- Google sign-in (hosted mode; Google handles identity, hub sets a cookie) ----
+async function ensureSignedIn() {
+  const cfg = await (await fetch(`${HTTP_BASE}/auth/config`)).json();
+  if (!cfg.enabled) return true;
+  const probe = await fetch(`${HTTP_BASE}/state`);
+  if (probe.ok) return true;
+
+  needSignIn.value = true;
+  await new Promise((resolve, reject) => {
+    const s = document.createElement("script");
+    s.src = "https://accounts.google.com/gsi/client";
+    s.onload = resolve;
+    s.onerror = reject;
+    document.head.appendChild(s);
+  });
+  await nextTick();
+  window.google.accounts.id.initialize({
+    client_id: cfg.clientId,
+    callback: async ({ credential }) => {
+      const res = await fetch(`${HTTP_BASE}/auth/google`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ credential }),
+      });
+      const result = await res.json();
+      if (result.ok) {
+        needSignIn.value = false;
+        connect();
+      } else {
+        signInError.value = result.message || "Sign-in failed.";
+      }
+    },
+  });
+  window.google.accounts.id.renderButton(gsiButton.value, { theme: "filled_black", size: "large" });
+  return false;
+}
+
+function connect() {
+  const ws = new WebSocket(WS_URL);
+  ws.onopen = () => (connected.value = true);
+  ws.onclose = (e) => {
+    connected.value = false;
+    if (e.code === 4401) {
+      needSignIn.value = true;
+      ensureSignedIn();
+      return; // no reconnect loop while signed out
+    }
+    setTimeout(connect, 2000);
+  };
+  ws.onmessage = async (e) => {
+    const msg = JSON.parse(e.data);
+    if (msg.type === "state") applyState(msg.state);
+    else if (msg.type === "distilling") distilling.value = msg.value;
+    else if (msg.type === "recording") recording.value = msg.value;
+    else if (msg.type === "closeout") closingOut.value = msg.value;
+    else if (msg.type === "report") showToast(`Session report saved: ${msg.report?.title || "untitled"}`);
+    else if (msg.type === "transcript") {
+      lines.value.push(msg);
+      if (lines.value.length > 200) lines.value.shift();
+      await nextTick();
+      tickerEl.value?.scrollTo({ top: tickerEl.value.scrollHeight });
+    }
+  };
+}
+
+async function toggleRecording() {
+  const target = recording.value ? "stop" : "start";
+  recPending.value = true;
+  try {
+    if (target === "start") lines.value = []; // fresh ticker for a fresh session
+    const res = await fetch(`${HTTP_BASE}/record/${target}`, { method: "POST" });
+    const result = await res.json();
+    recording.value = result.recording;
+  } catch (e) {
+    showToast(`Couldn't ${target} recording: ${e.message}`);
+  } finally {
+    recPending.value = false;
+  }
+}
+
+async function runAction(bubble, action) {
+  action.status = "busy";
+  try {
+    const res = await fetch(`${HTTP_BASE}/action`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ bubbleId: bubble.id, actionId: action.id }),
+    });
+    const result = await res.json();
+    action.status = result.ok ? "done" : "error";
+    showToast(result.message);
+    // hosted mode: the artifact downloads and this machine's default app opens it
+    if (result.downloadUrl) window.open(`${HTTP_BASE}${result.downloadUrl}`, "_blank");
+  } catch (e) {
+    action.status = "error";
+    showToast(`Action failed: ${e.message}`);
+  }
+}
+
+async function dismiss(bubble) {
+  await fetch(`${HTTP_BASE}/dismiss`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ bubbleId: bubble.id }),
+  });
+}
+
+onMounted(async () => {
+  if (await ensureSignedIn()) connect();
+});
+</script>
+
+<template>
+  <div class="topbar">
+    <div class="status-dot" :class="{ live: connected }"></div>
+    <h1>EARSHOT</h1>
+    <div class="pulse">
+      <div v-if="distilling || closingOut" class="thinking"></div>
+      <span>{{
+        !connected
+          ? "connecting…"
+          : distilling
+            ? "distilling…"
+            : closingOut
+              ? "writing session report…"
+              : recording
+                ? "recording"
+                : "idle"
+      }}</span>
+    </div>
+    <button
+      class="rec-btn"
+      :class="{ on: recording }"
+      :disabled="!connected || recPending"
+      @click="toggleRecording"
+    >
+      <span class="rec-icon"></span>{{ recording ? "Stop" : "Record" }}
+    </button>
+  </div>
+
+  <TransitionGroup tag="div" name="bubbles" class="grid">
+    <Bubble
+      v-for="b in bubbles"
+      :key="b.id"
+      :bubble="b"
+      :flash="flashIds.has(b.id)"
+      @action="runAction(b, $event)"
+      @dismiss="dismiss(b)"
+    />
+    <div v-if="bubbles.length === 0" key="__empty" class="empty">
+      {{
+        recording
+          ? "Nothing distilled yet — start talking (or play something) and concepts will appear here."
+          : "Not recording — press Record to start a session."
+      }}
+    </div>
+  </TransitionGroup>
+
+  <div class="ticker" ref="tickerEl">
+    <div v-for="(l, i) in lines" :key="i" class="line">
+      <span class="who" :class="l.source">{{ whoLabel(l) }}</span>{{ l.text }}
+    </div>
+  </div>
+
+  <Transition name="bubbles">
+    <div v-if="toast" class="toast">{{ toast }}</div>
+  </Transition>
+
+  <div v-if="needSignIn" class="signin-overlay">
+    <div class="signin-card">
+      <h2>EARSHOT</h2>
+      <p>Sign in with your Google account to open your dashboard.</p>
+      <div ref="gsiButton"></div>
+      <p v-if="signInError" class="signin-error">{{ signInError }}</p>
+    </div>
+  </div>
+</template>

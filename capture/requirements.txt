@@ -1,0 +1,9 @@
+faster-whisper
+pyaudiowpatch
+numpy
+websockets
+soxr
+nvidia-cublas-cu12
+nvidia-cudnn-cu12
+sherpa-onnx
+# speaker model (once): curl -sLo models/nemo_en_titanet_small.onnx https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/nemo_en_titanet_small.onnx

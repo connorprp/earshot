@@ -1,0 +1,33 @@
+# One hub per user — no multi-tenancy, just isolated instances sharing the
+# Atlas cluster with separate DB names. Copy the service block per person.
+# Secrets live in deploy/.env (see .env.example); never commit it.
+services:
+  earshot-connor:
+    build: { context: .., dockerfile: deploy/Dockerfile }
+    restart: unless-stopped
+    ports: ["7071:7071"]
+    environment:
+      EARSHOT_MONGO: ${EARSHOT_MONGO}
+      EARSHOT_DB: earshot
+      EARSHOT_GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID}
+      EARSHOT_ALLOWED_EMAILS: <user>@<company-domain>
+      EARSHOT_SECRET: ${SECRET_CONNOR}
+      EARSHOT_CAPTURE_KEY: ${CAPTURE_KEY_CONNOR}
+      CLAUDE_CODE_OAUTH_TOKEN: ${CLAUDE_TOKEN_CONNOR}
+    volumes: ["./out-connor:/app/out"]
+
+  earshot-alex:
+    build: { context: .., dockerfile: deploy/Dockerfile }
+    restart: unless-stopped
+    ports: ["7072:7071"]
+    environment:
+      EARSHOT_MONGO: ${EARSHOT_MONGO}
+      EARSHOT_DB: earshot-alex
+      EARSHOT_GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID}
+      EARSHOT_ALLOWED_EMAILS: ${ALEX_EMAIL}
+      EARSHOT_SECRET: ${SECRET_ALEX}
+      EARSHOT_CAPTURE_KEY: ${CAPTURE_KEY_ALEX}
+      # starts on Connor's token; swap for Alex's after the one-time
+      # "Connect Claude.command" moment
+      CLAUDE_CODE_OAUTH_TOKEN: ${CLAUDE_TOKEN_ALEX}
+    volumes: ["./out-alex:/app/out"]

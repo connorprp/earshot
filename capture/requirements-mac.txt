@@ -1,0 +1,7 @@
+faster-whisper
+sounddevice
+numpy
+websockets
+soxr
+sherpa-onnx
+# speaker model (installer downloads it): models/nemo_en_titanet_small.onnx

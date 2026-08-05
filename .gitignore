@@ -1,0 +1,10 @@
+node_modules/
+.env
+out/
+capture/.venv/
+__pycache__/
+capture/models/
+dashboard/dist/
+deploy/.env
+deploy/out-*/
+*.log
