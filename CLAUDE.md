@@ -106,6 +106,19 @@ browsers can only capture tab audio anyway. Capture agents connect to
 wss://earshot.rustycloud.dev/ingest?key=<theirs>; Connor's own Windows agent
 has capture/cloud.env (gitignored) + `npm run capture:cloud`.
 
+**One-click installers:** the hub serves PERSONALIZED installers (Settings ⚙
+→ download buttons): GET /installer/windows|mac templates
+windows/installer-template.bat / mac/installer-template.command with the
+user's server URL + capture key substituted — zero questions during install,
+auto-starts capture, Desktop launcher for next time. Code ships via public
+GET /installer/capture.tgz (pure-node ustar+gzip — platform tar is quirky:
+MSYS tar on Windows treats C:\ paths as remote hosts). Windows installer
+auto-installs Python via winget; mac one auto-downloads the BlackHole pkg
+from GitHub releases. Verified E2E on real Windows: generated bat → deps →
+config → agent connected+authed to the hub. Unsigned scripts = one
+SmartScreen/Gatekeeper "run anyway" click; signed native apps are the next
+tier if that's still too much friction.
+
 - Auth: Google Sign-In (server/auth.js). Dashboard posts a Google ID token,
   hub verifies via google-auth-library + EARSHOT_ALLOWED_EMAILS, mints a
   signed cookie (EARSHOT_SECRET). Headless capture uses EARSHOT_CAPTURE_KEY

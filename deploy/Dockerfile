@@ -16,6 +16,10 @@ RUN cd dashboard && npm ci
 
 COPY server server
 COPY dashboard dashboard
+# capture code + installer templates: the hub serves personalized installers
+COPY capture capture
+COPY mac mac
+COPY windows windows
 RUN cd dashboard && npx vite build
 
 RUN mkdir -p out

@@ -26,12 +26,13 @@ volume before, or switch output back when you're not using Earshot.)
 
 ## 3. Install Earshot
 
-1. In the folder Connor sent you, double-click **Install Earshot.command**.
-   - If macOS complains it's from an unidentified developer: right-click the
+1. Open the dashboard in your browser, sign in with Google, click the gear (⚙),
+   and download **your** Mac installer — it already knows your account.
+2. Double-click the downloaded `Install Earshot.command`.
+   - If macOS complains it is from an unidentified developer: right-click the
      file → **Open** → **Open**.
-2. Answer the dialogs (you'll paste in the dashboard address and capture key
-   Connor gave you). The install downloads speech models — give it a few
-   minutes.
+3. It installs everything with no questions (if the BlackHole step from part 1
+   was skipped, it downloads that installer for you and asks you to re-run).
 
 ## 4. Use it
 

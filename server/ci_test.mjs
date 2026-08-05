@@ -112,6 +112,16 @@ try {
   check("rotated key connects", (await wsClose(`ws://127.0.0.1:${PORT}/ingest?key=${rot.captureKey}`)) === "open");
   check("settings are cookie-gated", (await fetch(`${BASE}/me`)).status === 401);
 
+  // ---- personalized installers ----
+  check("capture bundle is public", (await fetch(`${BASE}/installer/capture.tgz`)).status === 200);
+  check("installer gated without cookie", (await fetch(`${BASE}/installer/windows`)).status === 401);
+  const inst = await (await fetch(`${BASE}/installer/windows`, { headers: { cookie: alice } })).text();
+  const meNow = await (await fetch(`${BASE}/me`, { headers: { cookie: alice } })).json();
+  check("installer has user's key baked in", inst.includes(meNow.captureKey));
+  check("installer has no unfilled placeholders", !inst.includes("{{"));
+  const instMac = await (await fetch(`${BASE}/installer/mac`, { headers: { cookie: alice } })).text();
+  check("mac installer personalized too", instMac.includes(meNow.captureKey) && !instMac.includes("{{"));
+
   // files are per-tenant: a file in alice's out dir is invisible to bob
   const fs = await import("node:fs");
   const path = await import("node:path");

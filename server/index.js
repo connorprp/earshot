@@ -7,6 +7,7 @@
 import http from "node:http";
 import fs from "node:fs";
 import path from "node:path";
+import zlib from "node:zlib";
 import { fileURLToPath } from "node:url";
 import { WebSocketServer } from "ws";
 import { distill, applyOps } from "./distill.js";
@@ -383,6 +384,57 @@ function serveFile(res, file, download) {
   res.end(fs.readFileSync(file));
 }
 
+// ---------- personalized installers ----------
+// The hub knows each user's server address and capture key, so the installer
+// it serves needs zero questions: download, double-click, done.
+const CAPTURE_FILES = [
+  "main.py", "speakers.py", "echo_gate.py", "cuda_paths.py", "mac_audio.py",
+  "list_devices.py", "requirements-mac.txt", "requirements-win-cpu.txt",
+];
+let captureBundle = null;
+function getCaptureBundle() {
+  if (!captureBundle) {
+    // minimal ustar writer (avoids platform tar quirks; extracts with any tar)
+    const blocks = [];
+    for (const name of CAPTURE_FILES) {
+      const data = fs.readFileSync(path.join(ROOT, "..", "capture", name));
+      const header = Buffer.alloc(512);
+      header.write(name, 0, 100);
+      header.write("0000644\0", 100); // mode
+      header.write("0000000\0", 108); // uid
+      header.write("0000000\0", 116); // gid
+      header.write(data.length.toString(8).padStart(11, "0") + "\0", 124);
+      header.write(Math.floor(Date.now() / 1000).toString(8).padStart(11, "0") + "\0", 136);
+      header.write("        ", 148); // checksum placeholder = spaces
+      header.write("0", 156); // regular file
+      header.write("ustar\0", 257);
+      header.write("00", 263);
+      let sum = 0;
+      for (const b of header) sum += b;
+      header.write(sum.toString(8).padStart(6, "0") + "\0 ", 148);
+      blocks.push(header, data, Buffer.alloc(512 - (data.length % 512 || 512)));
+    }
+    blocks.push(Buffer.alloc(1024)); // end-of-archive
+    captureBundle = zlib.gzipSync(Buffer.concat(blocks));
+  }
+  return captureBundle;
+}
+
+function personalizedInstaller(osName, req, captureKey) {
+  const template = fs.readFileSync(
+    osName === "windows"
+      ? path.join(ROOT, "..", "windows", "installer-template.bat")
+      : path.join(ROOT, "..", "mac", "installer-template.command"),
+    "utf8"
+  );
+  const https = (req.headers["x-forwarded-proto"] || "") === "https";
+  const host = req.headers.host;
+  return template
+    .replaceAll("{{HTTP_URL}}", `${https ? "https" : "http"}://${host}`)
+    .replaceAll("{{WS_URL}}", `${https ? "wss" : "ws"}://${host}/ingest`)
+    .replaceAll("{{CAPTURE_KEY}}", captureKey);
+}
+
 // ---------- http api ----------
 const server = http.createServer(async (req, res) => {
   if (!authEnabled) {
@@ -418,6 +470,13 @@ const server = http.createServer(async (req, res) => {
       return res.end(JSON.stringify({ ok: false, message: "Sign-in could not be verified." }));
     }
   }
+  if (req.method === "GET" && urlPath === "/installer/capture.tgz") {
+    // public: just the open-source capture code, no secrets — the installer
+    // scripts fetch it outside any browser session
+    res.setHeader("content-type", "application/gzip");
+    res.setHeader("content-disposition", 'attachment; filename="capture.tgz"');
+    return res.end(getCaptureBundle());
+  }
   if (req.method === "GET" && /^\/(assets\/[\w.-]+|[\w.-]*)$/.test(urlPath)) {
     const file = path.join(DIST_DIR, urlPath === "/" ? "index.html" : urlPath);
     if (fs.existsSync(file) && fs.statSync(file).isFile()) return serveFile(res, file, false);
@@ -435,6 +494,19 @@ const server = http.createServer(async (req, res) => {
     return res.end(JSON.stringify({ ok: false, message: "sign in required" }));
   }
   const t = tenantFor(userId);
+
+  // personalized installers (this user's server + capture key baked in)
+  if (req.method === "GET" && (urlPath === "/installer/windows" || urlPath === "/installer/mac")) {
+    const osName = urlPath.split("/")[2];
+    const user = await getOrCreateUser(userId);
+    const body = personalizedInstaller(osName, req, user.captureKey || "");
+    res.setHeader("content-type", "application/octet-stream");
+    res.setHeader(
+      "content-disposition",
+      `attachment; filename="${osName === "windows" ? "Install Earshot.bat" : "Install Earshot.command"}"`
+    );
+    return res.end(body);
+  }
 
   // ---- self-serve settings ----
   if (req.method === "GET" && req.url === "/me") {

@@ -189,6 +189,9 @@ body {
 }
 .mini:hover { border-color: var(--accent-scheduling); }
 .mini.close { align-self: center; }
+.mini.dl { text-decoration: none; padding: 8px 14px; font-weight: 600; }
+.advanced summary { font-size: 11px; color: var(--dim); cursor: pointer; }
+.advanced { display: flex; flex-direction: column; gap: 6px; }
 
 /* sign-in overlay (hosted mode) */
 .signin-overlay {

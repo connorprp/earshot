@@ -309,18 +309,25 @@ onMounted(async () => {
       <div v-if="me" class="settings-block">
         <h3>1 · Capture agent <span :class="captureConnected ? 'ok' : 'bad'">{{ captureConnected ? "connected" : "not connected" }}</span></h3>
         <p>
-          Audio is captured by a small agent on your computer (best quality, hears your calls).
-          Install it once — Mac: <b>Install Earshot.command</b>, Windows: <b>Install Earshot.ps1</b>
-          (ask Connor for the installer folder) — and give it these when asked:
+          Audio is captured by a small agent on your computer. Download your personal
+          installer — it already knows your account, no questions asked — then double-click it
+          (Mac first time: right-click → Open):
         </p>
-        <label>Server address</label>
-        <code>{{ me.wsUrl.replace("/ingest", "").replace(/^wss?:\/\//, "") }}</code>
-        <label>Your capture key</label>
         <div class="keyrow">
-          <code>{{ me.captureKey }}</code>
-          <button class="mini" @click="copyKey">copy</button>
-          <button class="mini" @click="rotateKey">new key</button>
+          <a class="mini dl" :href="`${HTTP_BASE}/installer/windows`">⬇ Windows installer</a>
+          <a class="mini dl" :href="`${HTTP_BASE}/installer/mac`">⬇ Mac installer</a>
         </div>
+        <details class="advanced">
+          <summary>advanced: manual setup values</summary>
+          <label>Server address</label>
+          <code>{{ me.wsUrl.replace("/ingest", "").replace(/^wss?:\/\//, "") }}</code>
+          <label>Your capture key</label>
+          <div class="keyrow">
+            <code>{{ me.captureKey }}</code>
+            <button class="mini" @click="copyKey">copy</button>
+            <button class="mini" @click="rotateKey">new key</button>
+          </div>
+        </details>
       </div>
 
       <div class="settings-block">
