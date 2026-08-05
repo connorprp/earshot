@@ -67,8 +67,14 @@ const ECHO_WINDOW_MS = 15_000;   // a "them" line this recent can claim a "me" l
 const ECHO_HOLD_MS = 6_000;      // "me" lines wait this long in case their "them" twin arrives late
 const ECHO_OVERLAP = 0.62;       // fraction of "me" tokens fuzzy-found in one "them" line = echo
 
+// Shared server-side API key (sk-ant-api03-…): when set, EVERY tenant's
+// distills run on it (billed to this API account, not any coworker's
+// subscription). This is the sanctioned third-party path — Anthropic does not
+// allow apps to mint subscription tokens via OAuth. See CLAUDE.md.
+const SHARED_ANTHROPIC_KEY = process.env.EARSHOT_ANTHROPIC_KEY || "";
+
 // per-user Claude subscription tokens: "email:sk-ant-oat...,email:..." —
-// distills for that tenant bill that user; others fall back to the process env
+// legacy fallback used only when SHARED_ANTHROPIC_KEY is unset.
 const CLAUDE_TOKENS = new Map(
   (process.env.EARSHOT_CLAUDE_TOKENS || "")
     .split(",")
@@ -109,12 +115,20 @@ class Tenant {
   }
 
   get claudeEnv() {
+    // Shared API key wins: pass it as ANTHROPIC_API_KEY and strip any OAuth
+    // token from the child env so Claude Code doesn't see two auth sources.
+    if (SHARED_ANTHROPIC_KEY) {
+      const env = { ...process.env, ANTHROPIC_API_KEY: SHARED_ANTHROPIC_KEY };
+      delete env.CLAUDE_CODE_OAUTH_TOKEN;
+      return env;
+    }
     return this.claudeToken ? { ...process.env, CLAUDE_CODE_OAUTH_TOKEN: this.claudeToken } : null;
   }
 
-  // local mode rides the machine's own Claude login; hosted needs a token
+  // local mode rides the machine's own Claude login; hosted needs the shared
+  // API key (or, legacy, a per-user token / process-env OAuth token)
   get claudeConnected() {
-    return !authEnabled || Boolean(this.claudeToken || process.env.CLAUDE_CODE_OAUTH_TOKEN);
+    return !authEnabled || Boolean(SHARED_ANTHROPIC_KEY || this.claudeToken || process.env.CLAUDE_CODE_OAUTH_TOKEN);
   }
 
   status() {

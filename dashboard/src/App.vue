@@ -55,8 +55,6 @@ const me = ref(null);            // /me payload when the settings panel is open
 const captureConnected = ref(true); // optimistic until a status message says otherwise
 const claudeConnected = ref(true);
 const googleConnected = ref(false);
-const tokenInput = ref("");
-const tokenSaving = ref(false);
 
 async function openSettings() {
   showSettings.value = true;
@@ -72,27 +70,6 @@ async function rotateKey() {
   const r = await (await fetch(`${HTTP_BASE}/me/capture-key/rotate`, { method: "POST" })).json();
   me.value.captureKey = r.captureKey;
   showToast("New capture key generated — update your capture agent.");
-}
-
-async function saveToken() {
-  tokenSaving.value = true;
-  try {
-    const res = await fetch(`${HTTP_BASE}/me/claude-token`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ token: tokenInput.value }),
-    });
-    const r = await res.json();
-    if (r.ok) {
-      claudeConnected.value = r.claudeConnected;
-      tokenInput.value = "";
-      showToast(r.claudeConnected ? "Claude connected — distilling is live." : "Claude token cleared.");
-    } else {
-      showToast(r.message);
-    }
-  } finally {
-    tokenSaving.value = false;
-  }
 }
 
 const connected = ref(false);
@@ -329,10 +306,9 @@ onMounted(async () => {
     <button
       v-if="connected && !claudeConnected"
       class="warn-chip"
-      @click="openSettings"
-      title="Distilling is paused until a Claude token is connected"
+      title="Distilling is offline — the server's EARSHOT_ANTHROPIC_KEY is not set (admin)"
     >
-      ⚠ connect Claude
+      ⚠ distilling offline
     </button>
     <button
       v-if="connected && !captureConnected"
@@ -478,21 +454,8 @@ onMounted(async () => {
         </details>
       </div>
 
-      <div class="settings-block">
-        <h3>2 · Claude <span :class="claudeConnected ? 'ok' : 'bad'">{{ claudeConnected ? "connected" : "not connected" }}</span></h3>
-        <p>
-          Distilling runs on your own Claude subscription. In a terminal run
-          <code>npx -y @anthropic-ai/claude-code setup-token</code>, approve in the browser,
-          then paste the token (sk-ant-oat…) here:
-        </p>
-        <div class="keyrow">
-          <input v-model="tokenInput" type="password" placeholder="sk-ant-oat…" />
-          <button class="mini" :disabled="tokenSaving" @click="saveToken">save</button>
-        </div>
-      </div>
-
       <div v-if="me?.googleConfigured" class="settings-block">
-        <h3>3 · Google <span :class="(me.googleConnected || googleConnected) ? 'ok' : 'bad'">{{ (me.googleConnected || googleConnected) ? "connected" : "not connected" }}</span></h3>
+        <h3>2 · Google <span :class="(me.googleConnected || googleConnected) ? 'ok' : 'bad'">{{ (me.googleConnected || googleConnected) ? "connected" : "not connected" }}</span></h3>
         <p>
           Connect your Google account so Earshot knows which meeting you're in
           (names, attendees, agenda) and can create real calendar events and Gmail

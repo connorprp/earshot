@@ -23,7 +23,9 @@ Env knobs: `EARSHOT_MODEL` (whisper model, default large-v3-turbo; use base.en
 for quick tests), `EARSHOT_DEVICE` (cuda|cpu), `EARSHOT_LLM` (distill model,
 default sonnet), `EARSHOT_PORT` (hub, default 7071), `EARSHOT_MONGO`
 (connection string — lives in `server/.env`, gitignored, NEVER copy it into
-this file or README), `EARSHOT_DB` (default "earshot").
+this file or README), `EARSHOT_DB` (default "earshot"),
+`EARSHOT_ANTHROPIC_KEY` (hosted: shared sk-ant-api03 key all distills bill to;
+unset in local mode, which rides the machine's Claude login).
 
 ## Architecture
 
@@ -101,10 +103,18 @@ anyone @<company-domain> signs in (EARSHOT_ALLOWED_DOMAINS; plus
 EARSHOT_ALLOWED_EMAILS extras). First sign-in auto-provisions a users doc
 {captureKey, claudeTokenEnc}. The dashboard ⚙ Settings panel shows the
 user's capture key + server address for the per-OS installers (mac/ and
-windows/), and a paste box for their `claude setup-token` token — stored
-AES-GCM-encrypted with EARSHOT_SECRET (changing that secret orphans stored
-tokens), distills run under it via options.env. Topbar warning chips show
-"no capture agent" / "connect Claude" live (per-tenant ws status messages).
+windows/). **Claude auth is NOT per-user anymore** (2026-08-05): distills run
+on ONE shared server key EARSHOT_ANTHROPIC_KEY (sk-ant-api03-…, billed to
+Connor/GBN, pay-per-use), passed to the Agent SDK as ANTHROPIC_API_KEY via
+options.env — coworkers connect nothing, the Settings "Connect Claude" step
+is gone. Why not an OAuth button: Anthropic bans third-party OAuth clients for
+claude.ai login / subscription tokens (see [[earshot-claude-auth-constraint]]
+in auto-memory), so subscription billing can't be wired up without the
+terminal `setup-token` paste — which is also being deprecated for third-party
+apps. Legacy per-user token path (claudeTokenEnc + /me/claude-token, AES-GCM
+w/ EARSHOT_SECRET) still exists in code as a fallback when EARSHOT_ANTHROPIC_KEY
+is unset, but has no UI. Topbar warning chips show "no capture agent" /
+"distilling offline" (key missing) live (per-tenant ws status messages).
 Browser capture (getDisplayMedia) was considered and declined; macOS
 browsers can only capture tab audio anyway. Capture agents connect to
 wss://earshot.rustycloud.dev/ingest?key=<theirs>; Connor's own Windows agent
@@ -150,10 +160,14 @@ tier if that's still too much friction.
   makes actions return /files/<name> download links instead of opening
   locally (browser downloads → user's default app opens it). openFile is
   now cross-platform (win/mac/linux) for local mode.
-- Per-user Claude: CLAUDE_CODE_OAUTH_TOKEN env (from `claude setup-token`)
-  — distills bill that user's subscription. deploy/ has Dockerfile (installs
-  claude-code CLI), docker-compose.yml (one service per user, separate
-  EARSHOT_DB + out/ volume), Caddyfile (TLS per subdomain), .env.example.
+- Claude billing: one shared EARSHOT_ANTHROPIC_KEY (sk-ant-api03-…) for all
+  tenants, billed to Connor/GBN pay-per-use (Connor's call — coworkers connect
+  nothing; the OAuth/subscription path isn't available to third parties). Set
+  it in the rusty env file. Legacy fallback: CLAUDE_CODE_OAUTH_TOKEN env or
+  per-user tokens when the shared key is unset. deploy/ has Dockerfile
+  (installs claude-code CLI), docker-compose.yml (one service per user,
+  separate EARSHOT_DB + out/ volume), Caddyfile (TLS per subdomain),
+  .env.example.
 - Mac capture: capture/mac_audio.py (sounddevice; system audio via BlackHole
   2ch + Multi-Output Device), platform switches in main.py (cpu/small.en
   defaults on darwin). mac/ has a click-only installer (`Install
@@ -222,8 +236,11 @@ real Gmail DRAFT (never auto-send, hedged); artifact fallback on any failure.
   silently misses calls. `capture/main.py` opens a loopback stream per render
   device; failures log `SKIP` and are non-fatal. `capture/list_devices.py`
   prints the device map for debugging.
-- **Distill auth**: uses `@anthropic-ai/claude-agent-sdk` → rides the local
-  Claude Code login. No ANTHROPIC_API_KEY anywhere.
+- **Distill auth**: uses `@anthropic-ai/claude-agent-sdk`. Local mode rides
+  the machine's own Claude Code login (no key). Hosted mode passes the shared
+  EARSHOT_ANTHROPIC_KEY as ANTHROPIC_API_KEY via options.env (Tenant.claudeEnv
+  strips CLAUDE_CODE_OAUTH_TOKEN from the child env so the SDK sees exactly one
+  auth source).
 - **LLM date math is unreliable**: the model resolved "next Thursday" to a
   Friday. The prompt includes an explicit 14-day weekday/date calendar
   (`upcomingDays()` in distill.js). Keep it.
