@@ -103,6 +103,24 @@ export async function setClaudeToken(email, claudeTokenEnc) {
   if (db) await db.collection("users").updateOne({ _id: email }, { $set: { claudeTokenEnc } }).catch(() => {});
 }
 
+export async function setUserField(email, fields) {
+  const user = await getOrCreateUser(email);
+  Object.assign(user, fields);
+  if (db) await db.collection("users").updateOne({ _id: email }, { $set: fields }).catch(() => {});
+}
+
+// Tier-1 context: everyone who has signed in, as "Name <email>" — tiny and
+// always in the distill prompt so voices/actions ground to real people
+export async function directory() {
+  if (!db) return [...memUsers.values()].map((u) => ({ email: u._id, name: u.name || "" }));
+  const rows = await db
+    .collection("users")
+    .find({}, { projection: { _id: 1, name: 1 } })
+    .toArray()
+    .catch(() => []);
+  return rows.map((u) => ({ email: u._id, name: u.name || "" }));
+}
+
 export function userByCaptureKey(key) {
   if (!key) return null;
   for (const [k, email] of keyCache) if (keysEqual(k, key)) return email;

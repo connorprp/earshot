@@ -54,6 +54,7 @@ function dismissPair() {
 const me = ref(null);            // /me payload when the settings panel is open
 const captureConnected = ref(true); // optimistic until a status message says otherwise
 const claudeConnected = ref(true);
+const googleConnected = ref(false);
 const tokenInput = ref("");
 const tokenSaving = ref(false);
 
@@ -197,6 +198,7 @@ function connect() {
     else if (msg.type === "status") {
       captureConnected.value = msg.captureConnected;
       claudeConnected.value = msg.claudeConnected;
+      googleConnected.value = msg.googleConnected;
     } else if (msg.type === "closeout") closingOut.value = msg.value;
     else if (msg.type === "report") showToast(`Session report saved: ${msg.report?.title || "untitled"}`);
     else if (msg.type === "transcript") {
@@ -236,6 +238,8 @@ async function runAction(bubble, action) {
     showToast(result.message);
     // hosted mode: the artifact downloads and this machine's default app opens it
     if (result.downloadUrl) window.open(`${HTTP_BASE}${result.downloadUrl}`, "_blank");
+    // real Google action: open the created event
+    if (result.link) window.open(result.link, "_blank");
   } catch (e) {
     action.status = "error";
     showToast(`Action failed: ${e.message}`);
@@ -254,6 +258,10 @@ onMounted(async () => {
   if (await ensureSignedIn()) {
     connect();
     loadPairInfo();
+    if (new URLSearchParams(location.search).get("google") === "connected") {
+      showToast("Google connected — calendar context and real actions are live.");
+      history.replaceState(null, "", location.pathname);
+    }
   }
 });
 </script>
@@ -408,6 +416,18 @@ onMounted(async () => {
         <div class="keyrow">
           <input v-model="tokenInput" type="password" placeholder="sk-ant-oat…" />
           <button class="mini" :disabled="tokenSaving" @click="saveToken">save</button>
+        </div>
+      </div>
+
+      <div v-if="me?.googleConfigured" class="settings-block">
+        <h3>3 · Google <span :class="(me.googleConnected || googleConnected) ? 'ok' : 'bad'">{{ (me.googleConnected || googleConnected) ? "connected" : "not connected" }}</span></h3>
+        <p>
+          Connect your Google account so Earshot knows which meeting you're in
+          (names, attendees, agenda) and can create real calendar events and Gmail
+          drafts from action buttons:
+        </p>
+        <div class="keyrow">
+          <a class="mini dl" :href="`${HTTP_BASE}/google/connect`">Connect Google</a>
         </div>
       </div>
 

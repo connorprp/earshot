@@ -61,10 +61,11 @@ function voiceMatch(cur, prev) {
   return { matches, of: curV.length };
 }
 
-function buildPrompt({ bubbles, tailLines, startedAt, lineCount, speakerNames }, prev, voices) {
+function buildPrompt({ bubbles, tailLines, startedAt, lineCount, speakerNames, context }, prev, voices) {
   const parts = [
     `Session started: ${new Date(startedAt).toString()}`,
     `Transcript lines this session: ${lineCount}`,
+    ...(context ? [``, `CONTEXT:`, context] : []),
     ``,
     `FINAL DASHBOARD BUBBLES:`,
     JSON.stringify(bubbles.map(({ actions, ...b }) => b), null, 1),

@@ -24,15 +24,24 @@ import {
   decryptSecret,
 } from "./auth.js";
 import {
+  googleConfigured,
+  buildAuthUrl,
+  handleCallback,
+  currentCalendarEvent,
+} from "./google.js";
+import {
   initDb,
   seedCaptureKeys,
   loadUsers,
   getOrCreateUser,
   rotateCaptureKey,
   setClaudeToken,
+  setUserField,
+  directory,
   userByCaptureKey,
   usersWithOpenSessions,
   resumeSession,
+  saveSessionReport,
   startSession,
   endSession,
   persistTranscript,
@@ -92,6 +101,8 @@ class Tenant {
     this.heldMe = new Set();    // { ev, tokens, timer } "me" lines waiting out ECHO_HOLD_MS
     this.dashboards = new Set();
     this.captureSockets = new Set();
+    this.sessionContext = ""; // Tier-1 context: directory + current calendar meeting
+    this.googleConnected = false;
     this.claudeToken = CLAUDE_TOKENS.get(userId) || null; // may be replaced from the user's stored token
     this.outDir = path.join(OUT_ROOT, userId === "local" ? "local" : userId.replace(/[^a-z0-9]+/gi, "-"));
     fs.mkdirSync(this.outDir, { recursive: true });
@@ -111,17 +122,56 @@ class Tenant {
       type: "status",
       captureConnected: this.captureSockets.size > 0,
       claudeConnected: this.claudeConnected,
+      googleConnected: this.googleConnected,
     };
   }
 
   async loadStoredToken() {
     if (!authEnabled || this.userId === "local") return;
     const user = await getOrCreateUser(this.userId);
+    this.googleConnected = Boolean(user.googleTokenEnc);
     if (user.claudeTokenEnc) {
       const token = decryptSecret(user.claudeTokenEnc);
       if (token) this.claudeToken = token;
       else console.error(`[hub:${this.userId}] stored Claude token undecryptable (EARSHOT_SECRET changed?)`);
     }
+  }
+
+  // Tier-1 session context: tiny and always in the distill prompt. Bigger
+  // sources (Asana, notes, changelogs) belong to the retrieval tier — indexed,
+  // pulled per new concept, never blanket-injected (token discipline).
+  async buildSessionContext() {
+    const parts = [];
+    try {
+      const people = await directory();
+      if (people.length) {
+        parts.push(
+          "Known people at this company: " +
+            people.map((p) => (p.name ? `${p.name} <${p.email}>` : p.email)).join("; ")
+        );
+      }
+      if (this.userId !== "local") parts.push(`The user ("me") is ${this.userId}.`);
+      if (this.googleConnected) {
+        const user = await getOrCreateUser(this.userId);
+        const ev = await currentCalendarEvent(user).catch((e) => {
+          console.error(`[google:${this.userId}] calendar context failed: ${e.message}`);
+          return null;
+        });
+        if (ev) {
+          const who = ev.attendees.map((a) => (a.name ? `${a.name} <${a.email}>` : a.email)).join(", ");
+          parts.push(
+            `This recording likely corresponds to the calendar meeting "${ev.title}"` +
+              `${ev.start ? ` (${ev.start})` : ""}. Attendees: ${who || "none listed"}.` +
+              (ev.description ? ` Agenda: ${ev.description}` : "")
+          );
+          saveSessionReport(this.sessionId, { calendarEvent: ev });
+          this.log(`calendar context: "${ev.title}" (${ev.attendees.length} attendees)`);
+        }
+      }
+    } catch (e) {
+      console.error(`[hub:${this.userId}] context build failed: ${e.message}`);
+    }
+    this.sessionContext = parts.join("\n");
   }
 
   log(msg) {
@@ -213,7 +263,7 @@ class Tenant {
     this.distilling = true;
     this.broadcast({ type: "distilling", value: true });
     try {
-      const ops = await distill(this.state, lines, this.distillNote, this.claudeEnv);
+      const ops = await distill(this.state, lines, this.distillNote, this.claudeEnv, this.sessionContext);
       this.log(`distill: ${lines.length} lines -> ${ops.length} ops`);
       let changed = applyOps(this.state, ops);
       if (changed) {
@@ -265,6 +315,7 @@ class Tenant {
     for (const h of [...this.heldMe]) clearTimeout(h.timer);
     this.heldMe.clear();
     this.sessionId = await startSession(this.userId);
+    await this.buildSessionContext();
     // provisional restore: recording again shortly after a stop is often the
     // same conversation resuming — bring the board back and let the distiller
     // keep or drop the bubbles once it sees what's actually being said
@@ -324,6 +375,7 @@ class Tenant {
         userId: this.userId,
         outDir: this.outDir,
         env: this.claudeEnv,
+        context: this.sessionContext,
         bubbles: this.state.bubbles,
         speakerNames: this.state.speakers,
         tailLines: this.transcript.slice(-60),
@@ -457,16 +509,17 @@ const server = http.createServer(async (req, res) => {
     for await (const chunk of req) body += chunk;
     res.setHeader("content-type", "application/json");
     try {
-      const email = await verifyGoogleCredential(JSON.parse(body || "{}").credential);
-      if (!email) {
+      const who = await verifyGoogleCredential(JSON.parse(body || "{}").credential);
+      if (!who) {
         res.statusCode = 403;
         return res.end(JSON.stringify({ ok: false, message: "This Google account isn't on the allowlist." }));
       }
       const secure = (req.headers["x-forwarded-proto"] || "") === "https";
-      res.setHeader("set-cookie", sessionCookie(email, secure));
-      await getOrCreateUser(email); // provision tenant resources on first sign-in
-      console.log(`[auth] ${email} signed in`);
-      return res.end(JSON.stringify({ ok: true, email }));
+      res.setHeader("set-cookie", sessionCookie(who.email, secure));
+      await getOrCreateUser(who.email); // provision tenant resources on first sign-in
+      if (who.name) await setUserField(who.email, { name: who.name }); // feeds the people directory
+      console.log(`[auth] ${who.email} signed in`);
+      return res.end(JSON.stringify({ ok: true, email: who.email }));
     } catch {
       res.statusCode = 401;
       return res.end(JSON.stringify({ ok: false, message: "Sign-in could not be verified." }));
@@ -514,6 +567,26 @@ const server = http.createServer(async (req, res) => {
         wsUrl: `${https ? "wss" : "ws"}://${req.headers.host}/ingest`,
       })
     );
+  }
+
+  // Google OAuth callback (public; the signed+expiring state carries the user)
+  if (req.method === "GET" && urlPath === "/google/callback") {
+    const q = new URL(req.url, "http://x").searchParams;
+    try {
+      const https = (req.headers["x-forwarded-proto"] || "") === "https";
+      const email = await handleCallback(q.get("code"), q.get("state"), `${https ? "https" : "http"}://${req.headers.host}/google/callback`);
+      const t = tenants.get(email);
+      if (t) {
+        t.googleConnected = true;
+        t.broadcast(t.status());
+      }
+      res.writeHead(302, { location: "/?google=connected" });
+      return res.end();
+    } catch (e) {
+      console.error("[google] callback failed:", e.message);
+      res.statusCode = 400;
+      return res.end("Google connection failed — close this tab and try again from Settings.");
+    }
   }
 
   if (req.method === "GET" && urlPath === "/installer/capture.tgz") {
@@ -606,8 +679,19 @@ const server = http.createServer(async (req, res) => {
         wsUrl: `${proto}://${req.headers.host}/ingest`,
         captureConnected: t.captureSockets.size > 0,
         claudeConnected: t.claudeConnected,
+        googleConfigured,
+        googleConnected: Boolean(user.googleTokenEnc),
       })
     );
+  }
+  if (req.method === "GET" && req.url === "/google/connect") {
+    if (!googleConfigured) {
+      res.statusCode = 503;
+      return res.end("Google integration not configured on this server (GOOGLE_CLIENT_SECRET missing).");
+    }
+    const https = (req.headers["x-forwarded-proto"] || "") === "https";
+    res.writeHead(302, { location: buildAuthUrl(userId, `${https ? "https" : "http"}://${req.headers.host}/google/callback`) });
+    return res.end();
   }
   if (req.method === "POST" && req.url === "/me/claude-token") {
     let body = "";
@@ -692,7 +776,9 @@ const server = http.createServer(async (req, res) => {
     }
     let result;
     try {
-      result = executeAction(action, bubble, t.outDir);
+      const user = await getOrCreateUser(userId);
+      const googleUser = googleConfigured && user.googleTokenEnc ? user : null;
+      result = await executeAction(action, bubble, t.outDir, googleUser);
     } catch (e) {
       result = { ok: false, message: String(e.message || e) };
     }

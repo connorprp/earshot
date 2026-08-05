@@ -80,14 +80,14 @@ export function emailAllowed(email) {
   return ALLOWED_DOMAINS.includes(domain);
 }
 
-// Google ID token -> allowed email, or null
+// Google ID token -> { email, name } for an allowed account, or null
 export async function verifyGoogleCredential(credential) {
   const ticket = await oauth.verifyIdToken({ idToken: credential, audience: CLIENT_ID });
   const payload = ticket.getPayload() || {};
   const email = (payload.email || "").toLowerCase();
   if (!email || !payload.email_verified) return null;
   if (!emailAllowed(email)) return null;
-  return email;
+  return { email, name: payload.name || "" };
 }
 
 function sign(v) {

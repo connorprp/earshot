@@ -42,7 +42,8 @@ Bubble shape:
   "details": ["short bullet", ...],           // max 6, only load-bearing facts
   "actions": [
     {"id":"slug","type":"calendar","label":"Add to calendar",
-     "payload":{"title":"...","start":"YYYY-MM-DDTHH:MM","durationMinutes":30,"notes":"..."}},
+     "payload":{"title":"...","start":"YYYY-MM-DDTHH:MM","durationMinutes":30,"notes":"...",
+                "attendees":["email@..."]}},   // only emails you're confident of
     {"id":"slug","type":"email","label":"Draft follow-up email",
      "payload":{"to":"","subject":"...","body":"..."}},
     {"id":"slug","type":"spreadsheet","label":"Make a spreadsheet",
@@ -72,6 +73,10 @@ Rules:
   ALREADY DONE as proposed/claimed ("posters proposed") unless other lines
   corroborate it actually happened.
 - Keep the dashboard tight: distill, condense, merge. Quality over quantity.
+- A CONTEXT block may list known company people and the calendar meeting this
+  recording belongs to. Ground identities in it: prefer its real names/emails
+  for participants, action payloads (attendees, to:), and the speakers op.
+  People in the meeting's attendee list are the most likely voices.
 - Output [] if the new lines change nothing.`;
 
 function upcomingDays(now, n = 14) {
@@ -84,7 +89,7 @@ function upcomingDays(now, n = 14) {
   return days.join("\n");
 }
 
-function buildPrompt(state, lines, note) {
+function buildPrompt(state, lines, note, context) {
   const now = new Date();
   const transcript = lines
     .map((l) => `[${l.source}${l.speaker ? `:${l.speaker}` : ""}] ${l.text}`)
@@ -94,6 +99,7 @@ function buildPrompt(state, lines, note) {
     ``,
     `Calendar for resolving relative dates (use these EXACT weekday/date pairs):`,
     upcomingDays(now),
+    ...(context ? [``, `CONTEXT:`, context] : []),
     ``,
     `CURRENT DASHBOARD STATE:`,
     JSON.stringify({ bubbles: state.bubbles, knownSpeakerNames: state.speakers || {} }, null, 1),
@@ -117,8 +123,9 @@ function parseOps(text) {
 
 // env: optional full environment for the spawned Claude process — used to run
 // each tenant's distills under their own CLAUDE_CODE_OAUTH_TOKEN
-export async function distill(state, lines, note = "", env = null) {
-  const prompt = buildPrompt(state, lines, note);
+// context: Tier-1 session context (people directory + current calendar event)
+export async function distill(state, lines, note = "", env = null, context = "") {
+  const prompt = buildPrompt(state, lines, note, context);
   let text = "";
   const q = query({
     prompt,

@@ -46,12 +46,31 @@ function icsDate(iso) {
   return `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}T${pad(d.getHours())}${pad(d.getMinutes())}00`;
 }
 
-export function executeAction(action, bubble, outDir = OUT_DIR) {
+// googleUser: the tenant's user doc when their Google account is connected —
+// calendar/email actions then do the REAL thing (event with invites, Gmail
+// draft) instead of producing an artifact. Everything else, and any Google
+// failure, falls back to the local-artifact path.
+export async function executeAction(action, bubble, outDir = OUT_DIR, googleUser = null) {
   fs.mkdirSync(outDir, { recursive: true });
   const p = action.payload || {};
   switch (action.type) {
     case "calendar": {
       if (!p.start) return { ok: false, message: "No start time captured — edit the bubble first." };
+      if (googleUser) {
+        try {
+          const { createCalendarEvent } = await import("./google.js");
+          const link = await createCalendarEvent(googleUser, p);
+          if (link) {
+            return {
+              ok: true,
+              message: `Event created on your Google Calendar${p.attendees?.length ? ` — invites sent to ${p.attendees.join(", ")}` : ""}.`,
+              link,
+            };
+          }
+        } catch (e) {
+          console.error("[actions] calendar API failed, falling back to .ics:", e.message);
+        }
+      }
       const start = new Date(p.start);
       const end = new Date(start.getTime() + (p.durationMinutes || 30) * 60000);
       const ics = [
@@ -73,6 +92,15 @@ export function executeAction(action, bubble, outDir = OUT_DIR) {
       return deliver(file, `Calendar event ready: ${p.title || bubble.title}`);
     }
     case "email": {
+      if (googleUser) {
+        try {
+          const { createGmailDraft } = await import("./google.js");
+          const id = await createGmailDraft(googleUser, p);
+          if (id) return { ok: true, message: "Draft created in your Gmail — review and send from there." };
+        } catch (e) {
+          console.error("[actions] gmail API failed, falling back to .eml:", e.message);
+        }
+      }
       const eml = [
         "X-Unsent: 1",
         `To: ${p.to || ""}`,

@@ -112,6 +112,13 @@ try {
   check("rotated key connects", (await wsClose(`ws://127.0.0.1:${PORT}/ingest?key=${rot.captureKey}`)) === "open");
   check("settings are cookie-gated", (await fetch(`${BASE}/me`)).status === 401);
 
+  // ---- google integration routes ----
+  check("google connect gated", (await fetch(`${BASE}/google/connect`)).status === 401);
+  check("google connect 503 when unconfigured", (await fetch(`${BASE}/google/connect`, { headers: { cookie: alice } })).status === 503);
+  check("google callback rejects forged state", (await fetch(`${BASE}/google/callback?code=x&state=forged`)).status === 400);
+  const meG = await (await fetch(`${BASE}/me`, { headers: { cookie: alice } })).json();
+  check("/me reports google availability", meG.googleConfigured === false && meG.googleConnected === false);
+
   // ---- device pairing ----
   await fetch(`${BASE}/pair/start`, { method: "POST", body: JSON.stringify({ code: "CITEST99", host: "ci-box" }) });
   const pending = await (await fetch(`${BASE}/pair/claim?code=CITEST99`)).json();

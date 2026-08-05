@@ -181,6 +181,32 @@ tier if that's still too much friction.
   mirror to GitHub from the box: `cd ~/earshot.git && git push --mirror
   git@github.com:connorprp/earshot.git`.
 
+## Context architecture (token discipline)
+
+Tiered, so cost never scales with corpus size or meeting length:
+- **Tier 1 — always in the distill prompt (~200-400 tok):** people directory
+  (auto-built from Google sign-in names via users collection; db.directory())
+  + the current calendar meeting (title/attendees/agenda, fetched at Record
+  start when the user connected Google). Built in Tenant.buildSessionContext,
+  stored on the session doc (calendarEvent), included in distill + closeout.
+- **Tier 2 — retrieval on trigger (designed, NOT built):** Asana / GBN notes /
+  wordpress-ops changelogs get indexed (keyword/embedding, no LLM cost);
+  top-K snippets attach only when a NEW bubble's terms match. Cost scales
+  with new concepts per meeting, not time.
+- **Tier 3 — closeout only:** deeper pulls are affordable once per session.
+
+Per-user Google (server/google.js): OAuth code flow, scopes calendar.events
++ gmail.compose, refresh token AES-encrypted on the user doc, routes
+/google/connect (authed 302) + /google/callback (public, signed expiring
+state). Requires GOOGLE_CLIENT_SECRET env + {origin}/google/callback as an
+authorized redirect URI on the existing OAuth client — feature is dormant
+(Settings hides the button) until the secret is set. ⚠ If the consent screen
+is in "Testing" mode, Google expires refresh tokens after 7 days — publish
+the app (Internal for Workspace) to avoid weekly re-connects.
+Actions upgrade: with Google connected, calendar → real event (sendUpdates=
+all, attendees from payload, model told to use directory emails) and email →
+real Gmail DRAFT (never auto-send, hedged); artifact fallback on any failure.
+
 ## Hard-won facts (don't re-derive)
 
 - **GPU/Blackwell**: faster-whisper works on the RTX 5080 via pip
