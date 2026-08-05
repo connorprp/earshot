@@ -106,6 +106,29 @@ Split rule: audio capture MUST run on the user's machine; everything else
   setup-token). ⚠ UNTESTED on real Mac hardware — verify once before
   distributing.
 
+## Live deployment (rusty)
+
+- **https://earshot.rustycloud.dev** — Connor's hosted instance on rusty,
+  deployed 2026-08-05. Manual-Traefik convention (like suitecrm/openproject):
+  `~/earshot/deploy/docker-compose.rusty.yml` on the box, container on the
+  `coolify` network, Let's Encrypt via coolify-proxy. DNS via the existing
+  `*.rustycloud.dev` wildcard A record (DDNS-maintained).
+- Env/secrets: `/home/<user>/earshot-connor.env` on rusty (chmod 600) —
+  includes EARSHOT_CAPTURE_KEY (needed by any capture agent pointing at the
+  hosted hub) and EARSHOT_DB=earshot-cloud (separate from local dev's
+  "earshot" db). Restart after env edits:
+  `cd ~/earshot/deploy && docker compose -f docker-compose.rusty.yml up -d`
+  (add `--build` after a `git pull`).
+- Currently FAIL-CLOSED pending two Connor-only credentials in that env file:
+  EARSHOT_GOOGLE_CLIENT_ID (real OAuth web client, authorized origin
+  https://earshot.rustycloud.dev) and CLAUDE_CODE_OAUTH_TOKEN (from
+  `claude setup-token`). ⚠ Never BLANK the client id — empty = auth disabled
+  entirely (local mode), not locked.
+- Git: GitHub **connorprp/earshot** (private; CI incl. macOS capture job) +
+  bare mirror `~/earshot.git` on rusty. Local remote "rusty" pushes there;
+  mirror to GitHub from the box: `cd ~/earshot.git && git push --mirror
+  git@github.com:connorprp/earshot.git`.
+
 ## Hard-won facts (don't re-derive)
 
 - **GPU/Blackwell**: faster-whisper works on the RTX 5080 via pip
