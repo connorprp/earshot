@@ -106,7 +106,23 @@ browsers can only capture tab audio anyway. Capture agents connect to
 wss://earshot.rustycloud.dev/ingest?key=<theirs>; Connor's own Windows agent
 has capture/cloud.env (gitignored) + `npm run capture:cloud`.
 
-**One-click installers:** the hub serves PERSONALIZED installers (Settings ⚙
+**Packaged desktop app (the real ship vehicle for non-technical users):**
+capture/tray.py — PyInstaller-frozen tray app (Windows onefile .exe ~105MB,
+Mac .app zip ~83MB), built by CI jobs app-windows/app-mac on every main push
+and synced onto rusty by ~/earshot/deploy/sync-apps.sh into deploy/downloads/
+(gitignored; mounted ro at /app/downloads), served at /installer/app/windows|mac
+(gated). First run does DEVICE PAIRING — app POSTs /pair/start with a code,
+opens {hub}/?pair=CODE, the signed-in user clicks "Allow this computer",
+app claims key via /pair/claim (single-use, 10-min TTL) — so one generic
+binary serves everyone, no keys typed. Tray menu: pause/resume (PAUSED event
+in main.py), open dashboard, quit. Models download on first run to the
+platform app-data dir. Verified E2E with the real CI-built exe: launch →
+pair → approve → key claim → capture connected. After changing capture code,
+CI rebuilds the apps; run sync-apps.sh on rusty to publish them. Unsigned:
+Windows = one SmartScreen click; macOS Sequoia = Privacy & Security "Open
+Anyway" (clean fix = Apple Developer ID $99/yr + notarize step in CI).
+
+**One-click installers (script tier, kept as fallback):** the hub serves PERSONALIZED installers (Settings ⚙
 → download buttons): GET /installer/windows|mac templates
 windows/installer-template.bat / mac/installer-template.command with the
 user's server URL + capture key substituted — zero questions during install,

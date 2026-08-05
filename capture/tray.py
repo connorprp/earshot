@@ -16,7 +16,7 @@ Env overrides: EARSHOT_HUB (hub base url), EARSHOT_SMOKE=1 (CI: init + exit).
 """
 import json
 import os
-import random
+import secrets
 import socket
 import string
 import sys
@@ -70,7 +70,7 @@ def http_json(url, payload=None):
 
 def pair():
     """Device pairing: returns {wsUrl, captureKey} once the user approves."""
-    code = "".join(random.choices(string.ascii_uppercase + string.digits, k=8))
+    code = "".join(secrets.choice(string.ascii_uppercase + string.digits) for _ in range(8))
     http_json(f"{DEFAULT_HUB}/pair/start", {"code": code, "host": socket.gethostname()})
     webbrowser.open(f"{DEFAULT_HUB}/?pair={code}")
     deadline = time.time() + 10 * 60
