@@ -402,8 +402,8 @@ onMounted(async () => {
         <h3>2 · Claude <span :class="claudeConnected ? 'ok' : 'bad'">{{ claudeConnected ? "connected" : "not connected" }}</span></h3>
         <p>
           Distilling runs on your own Claude subscription. In a terminal run
-          <code>npx @anthropic-ai/claude-code setup-token</code>, approve in the browser,
-          then paste the token here:
+          <code>npx -y @anthropic-ai/claude-code setup-token</code>, approve in the browser,
+          then paste the token (sk-ant-oat…) here:
         </p>
         <div class="keyrow">
           <input v-model="tokenInput" type="password" placeholder="sk-ant-oat…" />
