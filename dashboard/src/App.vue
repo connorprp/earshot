@@ -15,6 +15,42 @@ const signInError = ref("");
 const gsiButton = ref(null);
 
 const showSettings = ref(false);
+const pairCode = ref(new URLSearchParams(location.search).get("pair") || "");
+const pairHost = ref("");
+const pairDone = ref(false);
+const pairError = ref("");
+
+async function loadPairInfo() {
+  if (!pairCode.value) return;
+  const r = await fetch(`${HTTP_BASE}/pair/info?code=${encodeURIComponent(pairCode.value)}`);
+  if (r.ok) {
+    const info = await r.json();
+    pairHost.value = info.host;
+    if (info.approved) pairDone.value = true;
+  } else {
+    pairError.value = "This pairing code has expired — reopen the Earshot app to get a new one.";
+  }
+}
+
+async function approvePair() {
+  const r = await fetch(`${HTTP_BASE}/pair/approve`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ code: pairCode.value }),
+  });
+  const result = await r.json();
+  if (result.ok) {
+    pairDone.value = true;
+    history.replaceState(null, "", location.pathname); // drop ?pair from the URL
+  } else {
+    pairError.value = result.message || "Approval failed.";
+  }
+}
+
+function dismissPair() {
+  pairCode.value = "";
+  history.replaceState(null, "", location.pathname);
+}
 const me = ref(null);            // /me payload when the settings panel is open
 const captureConnected = ref(true); // optimistic until a status message says otherwise
 const claudeConnected = ref(true);
@@ -215,7 +251,10 @@ async function dismiss(bubble) {
 }
 
 onMounted(async () => {
-  if (await ensureSignedIn()) connect();
+  if (await ensureSignedIn()) {
+    connect();
+    loadPairInfo();
+  }
 });
 </script>
 
@@ -301,6 +340,27 @@ onMounted(async () => {
     </div>
   </div>
 
+  <div v-if="pairCode && !needSignIn" class="signin-overlay">
+    <div class="signin-card">
+      <h2>Pair this computer?</h2>
+      <template v-if="pairDone">
+        <p>✅ Done — <b>{{ pairHost }}</b> is connected. You can close this message; the Earshot app on that computer is now capturing for your account.</p>
+        <button class="mini" @click="dismissPair">close</button>
+      </template>
+      <template v-else-if="pairError">
+        <p class="signin-error">{{ pairError }}</p>
+        <button class="mini" @click="dismissPair">close</button>
+      </template>
+      <template v-else>
+        <p>The Earshot app on <b>{{ pairHost || "a computer" }}</b> wants to capture audio for your account. Only approve if you just opened the app yourself.</p>
+        <div class="keyrow">
+          <button class="mini dl" @click="approvePair">Allow this computer</button>
+          <button class="mini" @click="dismissPair">cancel</button>
+        </div>
+      </template>
+    </div>
+  </div>
+
   <div v-if="showSettings" class="signin-overlay" @click.self="showSettings = false">
     <div class="signin-card settings-card">
       <h2>Settings</h2>
@@ -309,16 +369,24 @@ onMounted(async () => {
       <div v-if="me" class="settings-block">
         <h3>1 · Capture agent <span :class="captureConnected ? 'ok' : 'bad'">{{ captureConnected ? "connected" : "not connected" }}</span></h3>
         <p>
-          Audio is captured by a small agent on your computer. Download your personal
-          installer — it already knows your account, no questions asked — then double-click it
-          (Mac first time: right-click → Open):
+          Audio is captured by the Earshot app on your computer. Download it, open it,
+          and click <b>Allow this computer</b> when this page asks — that's the whole setup.
         </p>
         <div class="keyrow">
-          <a class="mini dl" :href="`${HTTP_BASE}/installer/windows`">⬇ Windows installer</a>
-          <a class="mini dl" :href="`${HTTP_BASE}/installer/mac`">⬇ Mac installer</a>
+          <a class="mini dl" :href="`${HTTP_BASE}/installer/app/windows`">⬇ Earshot for Windows</a>
+          <a class="mini dl" :href="`${HTTP_BASE}/installer/app/mac`">⬇ Earshot for Mac</a>
         </div>
+        <p>
+          Mac only: also install the
+          <a href="https://existential.audio/blackhole/" target="_blank">BlackHole 2ch</a> audio
+          driver and route sound through it (the app walks you through it).
+        </p>
         <details class="advanced">
-          <summary>advanced: manual setup values</summary>
+          <summary>advanced: script installers + manual setup values</summary>
+          <div class="keyrow">
+            <a class="mini" :href="`${HTTP_BASE}/installer/windows`">script installer (Win)</a>
+            <a class="mini" :href="`${HTTP_BASE}/installer/mac`">script installer (Mac)</a>
+          </div>
           <label>Server address</label>
           <code>{{ me.wsUrl.replace("/ingest", "").replace(/^wss?:\/\//, "") }}</code>
           <label>Your capture key</label>

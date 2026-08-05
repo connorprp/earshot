@@ -112,6 +112,26 @@ try {
   check("rotated key connects", (await wsClose(`ws://127.0.0.1:${PORT}/ingest?key=${rot.captureKey}`)) === "open");
   check("settings are cookie-gated", (await fetch(`${BASE}/me`)).status === 401);
 
+  // ---- device pairing ----
+  await fetch(`${BASE}/pair/start`, { method: "POST", body: JSON.stringify({ code: "CITEST99", host: "ci-box" }) });
+  const pending = await (await fetch(`${BASE}/pair/claim?code=CITEST99`)).json();
+  check("pair pending before approval", pending.status === "pending");
+  check("pair approve requires sign-in", (await fetch(`${BASE}/pair/approve`, {
+    method: "POST", body: JSON.stringify({ code: "CITEST99" }),
+  })).status === 401);
+  const appr = await (await fetch(`${BASE}/pair/approve`, {
+    method: "POST", headers: { cookie: alice, "content-type": "application/json" },
+    body: JSON.stringify({ code: "CITEST99" }),
+  })).json();
+  check("pair approved by signed-in user", appr.ok === true && appr.host === "ci-box");
+  const claim = await (await fetch(`${BASE}/pair/claim?code=CITEST99`)).json();
+  check("claim hands over key + ws url", claim.status === "approved" && !!claim.captureKey && claim.wsUrl.endsWith("/ingest"));
+  check("claimed key actually authenticates", (await wsClose(`ws://127.0.0.1:${PORT}/ingest?key=${claim.captureKey}`)) === "open");
+  check("pair code is single-use", (await fetch(`${BASE}/pair/claim?code=CITEST99`)).status === 404);
+  check("bad pair codes rejected", (await fetch(`${BASE}/pair/start`, {
+    method: "POST", body: JSON.stringify({ code: "x", host: "h" }),
+  })).status === 400);
+
   // ---- personalized installers ----
   check("capture bundle is public", (await fetch(`${BASE}/installer/capture.tgz`)).status === 200);
   check("installer gated without cookie", (await fetch(`${BASE}/installer/windows`)).status === 401);

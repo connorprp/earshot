@@ -75,6 +75,7 @@ PRE_ROLL_S = 0.4         # audio kept before speech onset
 
 asr_queue: "queue.Queue[tuple[str, np.ndarray, float]]" = queue.Queue()
 out_queue: "queue.Queue[dict]" = queue.Queue()
+PAUSED = threading.Event()  # tray app toggles this; segments are dropped while set
 
 
 class Segmenter:
@@ -172,6 +173,8 @@ def asr_worker():
     last_snapshot = 0.0
     while True:
         source, audio, start_ts = asr_queue.get()
+        if PAUSED.is_set():
+            continue
         seg_end = start_ts + len(audio) / TARGET_RATE
         if source == "me":
             # timing gate: a mic segment buried in loopback speech is echo,

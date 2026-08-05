@@ -37,3 +37,54 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: docker build -f deploy/Dockerfile -t earshot-hub .
+
+  # ---- packaged desktop apps (tray + pairing; no terminal for end users) ----
+  app-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12", cache: pip }
+      - run: pip install -r capture/requirements-win-cpu.txt pystray pillow pyinstaller
+      - name: Build
+        run: >
+          pyinstaller --noconfirm --onefile --windowed --name EarshotCapture
+          --paths capture
+          --hidden-import main --hidden-import speakers --hidden-import echo_gate
+          --hidden-import cuda_paths --hidden-import pyaudiowpatch --hidden-import pystray._win32
+          --collect-all ctranslate2 --collect-all sherpa_onnx --collect-all tokenizers
+          capture/tray.py
+      - name: Smoke test
+        shell: pwsh
+        run: |
+          $env:EARSHOT_SMOKE = "1"
+          $p = Start-Process -FilePath "dist\EarshotCapture.exe" -Wait -PassThru -NoNewWindow
+          if ($p.ExitCode -ne 0) { throw "smoke failed: $($p.ExitCode)" }
+      - uses: actions/upload-artifact@v4
+        with:
+          name: EarshotCapture-windows
+          path: dist/EarshotCapture.exe
+
+  app-mac:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12", cache: pip }
+      - run: pip install -r capture/requirements-mac.txt pystray pillow pyinstaller
+      - name: Build
+        run: >
+          pyinstaller --noconfirm --windowed --name "Earshot Capture"
+          --paths capture
+          --hidden-import main --hidden-import speakers --hidden-import echo_gate
+          --hidden-import mac_audio --hidden-import pystray._darwin
+          --collect-all ctranslate2 --collect-all sherpa_onnx --collect-all tokenizers
+          capture/tray.py
+      - name: Smoke test
+        run: EARSHOT_SMOKE=1 "dist/Earshot Capture.app/Contents/MacOS/Earshot Capture"
+      - name: Zip app
+        run: ditto -c -k --keepParent "dist/Earshot Capture.app" EarshotCapture-mac.zip
+      - uses: actions/upload-artifact@v4
+        with:
+          name: EarshotCapture-mac
+          path: EarshotCapture-mac.zip

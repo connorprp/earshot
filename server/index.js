@@ -341,6 +341,8 @@ class Tenant {
   }
 }
 
+const pairings = new Map(); // code -> { host, userId (null until approved), expiresAt }
+
 const tenants = new Map();
 function tenantFor(userId) {
   if (!tenants.has(userId)) {
@@ -470,6 +472,50 @@ const server = http.createServer(async (req, res) => {
       return res.end(JSON.stringify({ ok: false, message: "Sign-in could not be verified." }));
     }
   }
+  // ---- device pairing (packaged app first run; no keys typed anywhere) ----
+  // app: POST /pair/start {code, host} -> opens browser to /?pair=CODE ->
+  // signed-in user approves (POST /pair/approve) -> app claims the key once
+  // (GET /pair/claim?code=). Codes are single-use and expire in 10 minutes.
+  if (req.method === "POST" && urlPath === "/pair/start") {
+    let body = "";
+    for await (const chunk of req) body += chunk;
+    const { code, host } = JSON.parse(body || "{}");
+    res.setHeader("content-type", "application/json");
+    if (!/^[A-Z0-9]{6,12}$/.test(code || "")) {
+      res.statusCode = 400;
+      return res.end(JSON.stringify({ ok: false, message: "bad code" }));
+    }
+    for (const [c, p] of pairings) if (Date.now() > p.expiresAt) pairings.delete(c);
+    if (pairings.size >= 50) {
+      res.statusCode = 429;
+      return res.end(JSON.stringify({ ok: false, message: "too many pending pairings" }));
+    }
+    pairings.set(code, { host: String(host || "computer").slice(0, 60), userId: null, expiresAt: Date.now() + 10 * 60_000 });
+    return res.end(JSON.stringify({ ok: true }));
+  }
+  if (req.method === "GET" && urlPath === "/pair/claim") {
+    const code = new URL(req.url, "http://x").searchParams.get("code") || "";
+    const p = pairings.get(code);
+    res.setHeader("content-type", "application/json");
+    if (!p || Date.now() > p.expiresAt) {
+      res.statusCode = 404;
+      return res.end(JSON.stringify({ ok: false, status: "unknown" }));
+    }
+    if (!p.userId) return res.end(JSON.stringify({ ok: true, status: "pending" }));
+    pairings.delete(code); // single-use handoff
+    const user = await getOrCreateUser(p.userId);
+    const https = (req.headers["x-forwarded-proto"] || "") === "https";
+    console.log(`[pair] "${p.host}" claimed key for ${p.userId}`);
+    return res.end(
+      JSON.stringify({
+        ok: true,
+        status: "approved",
+        captureKey: user.captureKey,
+        wsUrl: `${https ? "wss" : "ws"}://${req.headers.host}/ingest`,
+      })
+    );
+  }
+
   if (req.method === "GET" && urlPath === "/installer/capture.tgz") {
     // public: just the open-source capture code, no secrets — the installer
     // scripts fetch it outside any browser session
@@ -494,6 +540,46 @@ const server = http.createServer(async (req, res) => {
     return res.end(JSON.stringify({ ok: false, message: "sign in required" }));
   }
   const t = tenantFor(userId);
+
+  // approve a device pairing (browser side; requires signed-in user)
+  if (req.method === "POST" && urlPath === "/pair/approve") {
+    let body = "";
+    for await (const chunk of req) body += chunk;
+    const { code } = JSON.parse(body || "{}");
+    const p = pairings.get(code || "");
+    res.setHeader("content-type", "application/json");
+    if (!p || Date.now() > p.expiresAt) {
+      res.statusCode = 404;
+      return res.end(JSON.stringify({ ok: false, message: "Pairing code expired or unknown — restart the app and try again." }));
+    }
+    p.userId = userId;
+    console.log(`[pair] ${userId} approved "${p.host}"`);
+    return res.end(JSON.stringify({ ok: true, host: p.host }));
+  }
+  if (req.method === "GET" && urlPath === "/pair/info") {
+    const code = new URL(req.url, "http://x").searchParams.get("code") || "";
+    const p = pairings.get(code);
+    res.setHeader("content-type", "application/json");
+    if (!p || Date.now() > p.expiresAt) {
+      res.statusCode = 404;
+      return res.end(JSON.stringify({ ok: false }));
+    }
+    return res.end(JSON.stringify({ ok: true, host: p.host, approved: Boolean(p.userId) }));
+  }
+
+  // packaged desktop apps (CI-built binaries synced into downloads/ on the
+  // server; they pair on first run, so one generic binary serves everyone)
+  if (req.method === "GET" && (urlPath === "/installer/app/windows" || urlPath === "/installer/app/mac")) {
+    const file = path.join(
+      ROOT, "..", "downloads",
+      urlPath.endsWith("windows") ? "EarshotCapture.exe" : "EarshotCapture-mac.zip"
+    );
+    if (!fs.existsSync(file)) {
+      res.statusCode = 404;
+      return res.end("app build not synced yet — ask Connor");
+    }
+    return serveFile(res, file, true);
+  }
 
   // personalized installers (this user's server + capture key baked in)
   if (req.method === "GET" && (urlPath === "/installer/windows" || urlPath === "/installer/mac")) {

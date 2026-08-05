@@ -15,7 +15,10 @@ import os
 
 import numpy as np
 
-MODEL_PATH = os.path.join(os.path.dirname(__file__), "models", "nemo_en_titanet_small.onnx")
+MODEL_PATH = os.environ.get(
+    "EARSHOT_SPEAKER_MODEL",
+    os.path.join(os.path.dirname(__file__), "models", "nemo_en_titanet_small.onnx"),
+)
 SAMPLE_RATE = 16000
 # Tuned against a played-back YouTube meeting (2026-08): 0.50/1.0s over-segmented
 # 5 voices into 7 clusters — short interjections spawned duplicates. Compressed
