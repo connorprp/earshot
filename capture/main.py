@@ -16,6 +16,8 @@ Config via env:
     EARSHOT_DEVICE  cuda | cpu                (default: cuda)
     EARSHOT_WS      hub websocket url         (default: ws://127.0.0.1:7071/ingest)
 """
+from __future__ import annotations  # pyaudio exists only on Windows; keep its annotations lazy
+
 import sys
 
 if sys.platform == "win32":
