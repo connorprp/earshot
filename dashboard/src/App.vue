@@ -55,6 +55,25 @@ const me = ref(null);            // /me payload when the settings panel is open
 const captureConnected = ref(true); // optimistic until a status message says otherwise
 const claudeConnected = ref(true);
 const googleConnected = ref(false);
+const asrOk = ref(true); // false = groq mode selected but the server has no GROQ_API_KEY
+
+async function saveAsr(asrMode, asrModel) {
+  const body = { asrMode, asrModel: asrModel === undefined ? me.value.asrModel : asrModel };
+  const r = await (
+    await fetch(`${HTTP_BASE}/me/asr`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+    })
+  ).json();
+  if (r.ok) {
+    me.value.asrMode = r.asrMode;
+    me.value.asrModel = r.asrModel;
+    showToast(r.asrMode === "groq" ? "Transcription now runs in the cloud." : "Transcription now runs on your computer.");
+  } else {
+    showToast(r.message || "Couldn't update transcription settings.");
+  }
+}
 
 async function openSettings() {
   showSettings.value = true;
@@ -64,6 +83,20 @@ async function openSettings() {
 async function copyKey() {
   await navigator.clipboard.writeText(me.value.captureKey);
   showToast("Capture key copied.");
+}
+
+// one-liner that registers this Earshot account as an MCP server in the
+// user's own Claude Code — their Claude can then search their conversations
+const mcpCommand = computed(() =>
+  me.value
+    ? `claude mcp add --transport http earshot ${me.value.mcpUrl}` +
+      (me.value.captureKey ? ` --header "Authorization: Bearer ${me.value.captureKey}"` : "")
+    : ""
+);
+
+async function copyMcp() {
+  await navigator.clipboard.writeText(mcpCommand.value);
+  showToast("MCP command copied — paste it in any terminal.");
 }
 
 async function rotateKey() {
@@ -77,6 +110,8 @@ const distilling = ref(false);
 const closingOut = ref(false);
 const recording = ref(false);
 const recPending = ref(false);
+const tasks = ref([]);           // device-agent tasks (hub "tasks" broadcasts)
+const agentAvailable = ref(false); // a capture agent with Claude Code is connected
 const bubbles = ref([]);
 const stateSpeakers = ref({});
 const lines = ref([]);
@@ -92,6 +127,8 @@ const speakerNames = computed(() => {
   for (const b of bubbles.value) if (b.speakers) Object.assign(names, b.speakers);
   return { ...names, ...stateSpeakers.value };
 });
+
+const runningTasks = computed(() => tasks.value.filter((t) => t.status === "running"));
 
 function whoLabel(line) {
   if (line.source === "me") return "You";
@@ -177,6 +214,8 @@ function connect() {
       captureConnected.value = msg.captureConnected;
       claudeConnected.value = msg.claudeConnected;
       googleConnected.value = msg.googleConnected;
+      agentAvailable.value = Boolean(msg.agentAvailable);
+      if (typeof msg.asrOk === "boolean") asrOk.value = msg.asrOk;
       // agent we were waiting on just connected -> begin recording seamlessly
       if (!hadAgent && msg.captureConnected && showStartAgent.value) {
         closeStartAgent();
@@ -184,6 +223,13 @@ function connect() {
         setRecording("start");
       }
     } else if (msg.type === "closeout") closingOut.value = msg.value;
+    else if (msg.type === "tasks") tasks.value = msg.tasks;
+    else if (msg.type === "task_done")
+      showToast(
+        msg.ok
+          ? `✓ Your Claude finished: ${msg.title}${msg.files?.length ? ` (${msg.files.length} file${msg.files.length > 1 ? "s" : ""} on your device)` : ""}`
+          : `Your Claude couldn't finish "${msg.title}": ${(msg.summary || "").slice(0, 140)}`
+      );
     else if (msg.type === "report") showToast(`Session report saved: ${msg.report?.title || "untitled"}`);
     else if (msg.type === "transcript") {
       lines.value.push(msg);
@@ -253,7 +299,9 @@ async function runAction(bubble, action) {
       body: JSON.stringify({ bubbleId: bubble.id, actionId: action.id }),
     });
     const result = await res.json();
-    action.status = result.ok ? "done" : "error";
+    // agent actions come back "running": the device agent will flip them to
+    // done/error via a later state broadcast
+    action.status = result.ok ? result.status || "done" : "error";
     showToast(result.message);
     // hosted mode: the artifact downloads and this machine's default app opens it
     if (result.downloadUrl) window.open(`${HTTP_BASE}${result.downloadUrl}`, "_blank");
@@ -303,6 +351,16 @@ onMounted(async () => {
                 : "idle"
       }}</span>
     </div>
+    <div
+      v-if="runningTasks.length"
+      class="agent-chip"
+      :title="runningTasks.map((t) => t.title).join('\n')"
+    >
+      <span class="agent-spinner"></span>
+      <span class="agent-title">your Claude · {{ runningTasks[0].title }}</span>
+      <span class="agent-note">{{ runningTasks[0].note }}</span>
+      <span v-if="runningTasks.length > 1" class="agent-more">+{{ runningTasks.length - 1 }}</span>
+    </div>
     <button
       v-if="connected && !claudeConnected"
       class="warn-chip"
@@ -317,6 +375,14 @@ onMounted(async () => {
       title="No capture agent is streaming audio for your account"
     >
       ⚠ no capture agent
+    </button>
+    <button
+      v-if="connected && !asrOk"
+      class="warn-chip"
+      @click="openSettings"
+      title="Cloud transcription is selected but the server's GROQ_API_KEY is not set (admin)"
+    >
+      ⚠ transcription offline
     </button>
     <button
       class="rec-btn"
@@ -454,12 +520,65 @@ onMounted(async () => {
         </details>
       </div>
 
+      <div v-if="me" class="settings-block">
+        <h3>2 · Transcription</h3>
+        <p>Where your audio becomes text.</p>
+        <div class="keyrow">
+          <button
+            class="mini"
+            :class="{ sel: me.asrMode === 'groq' }"
+            :disabled="!me.groqConfigured"
+            :title="me.groqConfigured ? 'Segments are transcribed on the server — nothing to download, works on any machine' : 'Not available: the server has no GROQ_API_KEY'"
+            @click="saveAsr('groq')"
+          >
+            In the cloud
+          </button>
+          <button
+            class="mini"
+            :class="{ sel: me.asrMode === 'local' }"
+            title="Whisper runs on your computer — audio never leaves your machine"
+            @click="saveAsr('local')"
+          >
+            On this computer
+          </button>
+        </div>
+        <p v-if="me.asrMode === 'groq'">
+          Nothing to download — the capture app stays tiny and transcription is
+          the same quality on every machine.
+        </p>
+        <template v-else>
+          <label>Whisper model (bigger = better quality, larger first-time download)</label>
+          <div class="keyrow">
+            <select :value="me.asrModel || ''" @change="saveAsr('local', $event.target.value || null)">
+              <option value="">device default</option>
+              <option v-for="m in me.asrModels" :key="m" :value="m">{{ m }}</option>
+            </select>
+          </div>
+        </template>
+      </div>
+
+      <div v-if="me" class="settings-block">
+        <h3>3 · Your Claude <span :class="(me.agentAvailable || agentAvailable) ? 'ok' : 'bad'">{{ (me.agentAvailable || agentAvailable) ? "agent ready" : "no agent" }}</span></h3>
+        <p>
+          Bubble buttons marked as agent tasks (drafting a document, doing research)
+          run on <b>your own Claude</b>, on your computer — install
+          <a href="https://claude.com/claude-code" target="_blank">Claude Code</a>, sign in
+          once, and the Earshot app does the rest. Watch the topbar while a task runs.
+        </p>
+        <label>Let any Claude of yours search your Earshot conversations (paste in a terminal):</label>
+        <div class="keyrow">
+          <code>{{ mcpCommand }}</code>
+          <button class="mini" @click="copyMcp">copy</button>
+        </div>
+      </div>
+
       <div v-if="me?.googleConfigured" class="settings-block">
-        <h3>2 · Google <span :class="(me.googleConnected || googleConnected) ? 'ok' : 'bad'">{{ (me.googleConnected || googleConnected) ? "connected" : "not connected" }}</span></h3>
+        <h3>4 · Google <span :class="(me.googleConnected || googleConnected) ? 'ok' : 'bad'">{{ (me.googleConnected || googleConnected) ? "connected" : "not connected" }}</span></h3>
         <p>
           Connect your Google account so Earshot knows which meeting you're in
-          (names, attendees, agenda) and can create real calendar events and Gmail
-          drafts from action buttons:
+          (names, attendees, agenda). Calendar and email buttons prefer your own
+          Claude agent (using the apps already connected to your Claude); this is
+          the fallback when it isn't running:
         </p>
         <div class="keyrow">
           <a class="mini dl" :href="`${HTTP_BASE}/google/connect`">Connect Google</a>

@@ -25,7 +25,10 @@ default sonnet), `EARSHOT_PORT` (hub, default 7071), `EARSHOT_MONGO`
 (connection string — lives in `server/.env`, gitignored, NEVER copy it into
 this file or README), `EARSHOT_DB` (default "earshot"),
 `EARSHOT_ANTHROPIC_KEY` (hosted: shared sk-ant-api03 key all distills bill to;
-unset in local mode, which rides the machine's Claude login).
+unset in local mode, which rides the machine's Claude login), `GROQ_API_KEY`
+(enables cloud ASR — see "ASR modes" below; unset = local-whisper only),
+`EARSHOT_GROQ_MODEL` (default whisper-large-v3-turbo), `EARSHOT_GROQ_URL`
+(API base override, used by the CI stub).
 
 ## Architecture
 
@@ -83,6 +86,101 @@ lines and every ~18s (or eagerly at 6 lines) asks the model for **patch ops**
 (`add`/`update`/`remove` bubbles) against current state — the bubbles ARE the
 compressed context; transcript history is never in the prompt. See
 `server/distill.js` for the system prompt and bubble/action schema.
+
+## ASR modes (per-user, dashboard Settings → Transcription)
+
+Two modes, chosen per user; unset pref defaults to **groq when the server has
+GROQ_API_KEY, local otherwise** (so local dev never changes, and hosted test
+users get the zero-download path automatically — Connor flips his own account
+to local once to keep the 5080 doing his ASR):
+- **local** — today's behavior: faster-whisper on the capture machine; the
+  whisper model is also selectable in Settings (whitelist in server/asr.js).
+  main.py loads whisper LAZILY (first segment, `_get_model`) so a groq-mode
+  agent never downloads a model or pulls CUDA DLLs — that skipped ~1GB
+  first-run download is the point of the feature (Mac install ease).
+- **groq** — thin capture: main.py ships each finished segment as
+  `{type:"audio", source, ts, rate, format:"wav", data:<base64 int16 WAV>}`
+  (≤ ~700KB) up the same /ingest ws; the hub transcribes via Groq
+  (`server/asr.js`, whisper-large-v3-turbo, $0.04/audio-hr; Groq bills a 10s
+  minimum per request → a chatty hour ≈ $0.03 — do NOT bother batching) and
+  feeds the resulting transcript event through handleCaptureEvent, inheriting
+  layer-2 echo, persistence, ticker, distill. Calls are serialized per tenant
+  (groqChain) so lines land in order; failures drop the segment, never the
+  hub. Zero idle spend: audio is refused while not recording. Privacy note:
+  in groq mode raw call audio leaves the user's machine (to Groq) while
+  recording, same trust posture as transcripts leaving to the hub.
+
+**Hub→capture downlink (new):** the hub now SENDS on /ingest —
+`{type:"config", asrMode, asrModel}` on connect + on every Settings change
+(agents switch modes live; `asrModel:null` = agent's platform default), and
+in groq mode each produced `{type:"transcript"...}` is echoed down the
+originating socket PRE-echo-filter so capture's echo-gate text-evidence layer
+(auto-engagement) works exactly as it does with local ASR (`_handle_downlink`
+in main.py; mic-segment overlaps are remembered in `_me_overlap`). Old agents
+that never recv are fine: their local transcripts are accepted regardless of
+asrMode (a user picking cloud with an old agent silently stays local).
+Settings surface: GET /me (asrMode/asrModel/asrModels/groqConfigured),
+POST /me/asr, "⚠ transcription offline" chip when groq mode lacks a key.
+
+## User's-own-Claude integration (device agent tasks + MCP)
+
+Added 2026-08-05, both directions verified live. Heavy per-user work never
+bills the shared server key — it runs on the user's OWN Claude Code login on
+their machine, the only sanctioned path (the server can't hold subscription
+auth — see Claude auth notes).
+
+- **Device tasks (write side):** actions with real-world side effects route
+  by preference: **the user's own Claude on their device → hub Google (if
+  linked) → artifact file**. Routed types: "agent" (new distill action type,
+  {title, brief}, preferred over "note" for work products), "calendar", and
+  "email" — the last two use the user's ALREADY-CONNECTED claude.ai
+  connectors (Gmail/Calendar surface in their Claude Code as
+  mcp__claude_ai_* tools), so nobody connects Google to Earshot for actions.
+  Click → hub builds a self-contained prompt (type-specific mission +
+  payload + bubble + last 150 transcript lines with speaker names + Tier-1
+  context + date) and sends {type:"task", id, title, prompt} DOWN the
+  capture ws (Tenant.dispatchTask). main.py spawns `claude -p` (prompt via
+  stdin — no argv quoting issues; stream-json out) in
+  <app-data>/Earshot/tasks/<id>. Guardrails: NO Bash, `--permission-mode
+  acceptEdits` (file writes jailed to the task dir), allowlist =
+  WebSearch/WebFetch/ToolSearch + mcp__earshot + the claude.ai connector
+  servers (Gmail, Google_Calendar, Google_Drive, Notion); email missions say
+  DRAFT only, never send; 14-min watchdog (hub times out at 15). Progress
+  streams back as {type:"task_update", note} / {type:"task_done", ok,
+  summary, files}; hub tracks tenant.tasks, broadcasts {type:"tasks"},
+  flips the action button running→done/error, and the deliverables folder
+  opens on the user's machine (when files were written). Task events bypass
+  the recording gate (bubbles stay actionable after Stop). Capture agents
+  advertise {type:"caps", claude:true} on connect — _find_claude() checks
+  PATH plus common install dirs because Finder/Explorer-launched apps get a
+  bare PATH. No capable agent → executeAction fallback (hub Google →
+  artifact). UX cues: pulsing "your Claude · <task>" topbar chip with the
+  agent's live activity note, spinner on the action button, toast on done.
+  Two hard-won spawn facts (both cost a live debug round): (1) connector
+  tools are DEFERRED — invisible until a ToolSearch loads them, so every
+  mission prompt says "search before deciding it isn't connected"; (2) MCP
+  permission rules need SERVER-LEVEL names (mcp__claude_ai_Gmail) — wildcard
+  tool patterns (mcp__claude_ai_*) silently deny.
+- **MCP endpoint (read side):** POST /mcp (server/mcp.js — stateless
+  Streamable HTTP, @modelcontextprotocol/sdk). Auth: `Authorization: Bearer
+  <captureKey>` or the browser cookie; local mode needs none. Tools (all
+  tenant-scoped): list_sessions, get_session, get_transcript,
+  search_transcripts, get_live_board. Settings → "Your Claude" shows a
+  copyable `claude mcp add --transport http …` one-liner so ANY of the
+  user's Claudes can search their conversations; device task agents get it
+  automatically (mcp.json written per task).
+- Accepted v1 tradeoff: transcript text reaches a web-enabled agent on the
+  user's machine, so a hostile meeting participant is a prompt-injection
+  vector. Mitigations: tasks fire only on the user's own click, no Bash,
+  writes jailed to the task dir, work is visible in the topbar chip.
+- Tests: ci_test.mjs covers caps→dispatch→progress→done, calendar/email
+  routing preference, no-agent fallbacks (brief + .eml), MCP auth + tenant
+  scoping (EARSHOT_TEST_SEED=1 enables POST /test/seed-bubble — bubbles
+  without an LLM). Verified with real binaries: `claude` CLI against /mcp
+  (listed 12 real sessions), _run_task end-to-end (file written under
+  acceptEdits, MCP called from inside the task), and the FULL production
+  path — seeded email action click → hub → capture ws → spawned Claude →
+  real Gmail draft in Connor's account via his claude.ai connector.
 
 ## Hosted mode (coworker on a MacBook)
 
@@ -224,6 +322,10 @@ the app (Internal for Workspace) to avoid weekly re-connects.
 Actions upgrade: with Google connected, calendar → real event (sendUpdates=
 all, attendees from payload, model told to use directory emails) and email →
 real Gmail DRAFT (never auto-send, hedged); artifact fallback on any failure.
+NOTE (2026-08-05): this hub-side Google path is now the SECOND preference for
+calendar/email actions — a connected device agent (user's own Claude +
+claude.ai connectors) takes them first; hub Google remains the only source of
+Tier-1 calendar CONTEXT (the record-start fetch runs hub-side).
 
 ## Hard-won facts (don't re-derive)
 

@@ -15,19 +15,25 @@ Config via env:
     EARSHOT_MODEL   whisper model name        (default: large-v3-turbo)
     EARSHOT_DEVICE  cuda | cpu                (default: cuda)
     EARSHOT_WS      hub websocket url         (default: ws://127.0.0.1:7071/ingest)
+    EARSHOT_ASR     local | groq              (default: local; the hub's
+                    {"type":"config"} downlink overrides this live — in groq
+                    mode segments ship as audio and the hub transcribes)
 """
 from __future__ import annotations  # pyaudio exists only on Windows; keep its annotations lazy
 
 import sys
 
-if sys.platform == "win32":
-    import cuda_paths  # noqa: F401  (must be imported before faster_whisper)
-
+import base64
+import io
 import json
 import os
 import queue
+import shutil
+import subprocess
 import threading
 import time
+import wave
+from pathlib import Path
 
 
 def _load_env_file():
@@ -49,7 +55,6 @@ _load_env_file()
 
 import numpy as np
 import soxr
-from faster_whisper import WhisperModel
 from websockets.sync.client import connect
 
 if sys.platform == "win32":
@@ -78,6 +83,26 @@ PRE_ROLL_S = 0.4         # audio kept before speech onset
 asr_queue: "queue.Queue[tuple[str, np.ndarray, float]]" = queue.Queue()
 out_queue: "queue.Queue[dict]" = queue.Queue()
 PAUSED = threading.Event()  # tray app toggles this; segments are dropped while set
+
+# ASR mode, pushed by the hub over the ws ({"type":"config", ...}) and applied
+# live. "local" = faster-whisper here (today's behavior); "groq" = ship the
+# audio segment to the hub, which transcribes via Groq's API — thin agents
+# never download a model or load CUDA. Env is only the pre-config fallback.
+ASR_MODE = os.environ.get("EARSHOT_ASR", "local")
+ASR_MODEL = MODEL_NAME
+CONFIG_READY = threading.Event()  # set once the hub has told us the mode
+
+
+def apply_config(msg: dict):
+    global ASR_MODE, ASR_MODEL
+    mode = msg.get("asrMode")
+    if mode in ("local", "groq"):
+        if mode != ASR_MODE:
+            print(f"[asr] mode -> {mode}")
+        ASR_MODE = mode
+    if msg.get("asrModel"):  # null/absent = keep the platform/env default
+        ASR_MODEL = msg["asrModel"]
+    CONFIG_READY.set()
 
 
 class Segmenter:
@@ -176,61 +201,305 @@ def stream_worker(source: str, device_info: dict, p: pyaudio.PyAudio):
         seg.feed(pcm)
 
 
+_model = None
+_model_name = None
+
+
+def _get_model(name: str):
+    """Lazy on purpose: a groq-mode agent must never pull CUDA DLLs or
+    trigger the first-run whisper download — that cost is the reason thin
+    mode exists. Reloads if the hub pushes a different model name."""
+    global _model, _model_name
+    if _model is None or _model_name != name:
+        if sys.platform == "win32":
+            import cuda_paths  # noqa: F401  (must be imported before faster_whisper)
+        from faster_whisper import WhisperModel
+
+        print(f"[asr] loading {name} on {DEVICE} ...")
+        compute = "float16" if DEVICE == "cuda" else "int8"
+        _model = WhisperModel(name, device=DEVICE, compute_type=compute)
+        _model_name = name
+        print("[asr] model ready")
+    return _model
+
+
+def _wav_b64(audio: np.ndarray) -> str:
+    """Mono float32 [-1,1] @16k -> base64 of a 16-bit PCM WAV."""
+    pcm = (audio * 32767.0).clip(-32768, 32767).astype("<i2")
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(TARGET_RATE)
+        w.writeframes(pcm.tobytes())
+    return base64.b64encode(buf.getvalue()).decode("ascii")
+
+
+# groq mode: mic segments leave before transcription, but the echo gate's
+# text-evidence check needs each segment's loopback overlap once the hub's
+# transcript comes back down — remember it briefly, keyed by segment ts
+_me_overlap: dict[float, float] = {}
+
+
 def asr_worker():
-    print(f"[asr] loading {MODEL_NAME} on {DEVICE} ...")
-    compute = "float16" if DEVICE == "cuda" else "int8"
-    model = WhisperModel(MODEL_NAME, device=DEVICE, compute_type=compute)
-    print("[asr] model ready")
     labeler = SpeakerLabeler()
     known_speakers = 0
     last_snapshot = 0.0
+    first = True
     while True:
         source, audio, start_ts = asr_queue.get()
+        if first:
+            # give the hub a moment to push the mode before the first segment
+            # can trigger a whisper load/download the user never needed
+            CONFIG_READY.wait(timeout=5)
+            first = False
         if PAUSED.is_set():
             continue
         seg_end = start_ts + len(audio) / TARGET_RATE
+        overlap = 0.0
         if source == "me":
             # timing gate: a mic segment buried in loopback speech is echo,
-            # however badly it would transcribe — skip the GPU entirely
+            # however badly it would transcribe — skip the GPU (and any
+            # upload) entirely
             overlap = echo_gate.loopback_overlap(start_ts, seg_end)
             if overlap >= echo_gate.GATE_OVERLAP and echo_gate.gate_engaged():
                 print(f"[echo] mic segment dropped ({overlap:.0%} inside loopback speech)")
                 continue
-        try:
-            segments, _ = model.transcribe(
-                audio,
-                language="en",
-                beam_size=1,
-                vad_filter=True,
-                condition_on_previous_text=False,
-            )
-            text = " ".join(s.text.strip() for s in segments).strip()
-        except Exception as e:
-            print(f"[asr] error: {e}")
-            continue
-        if not text:
-            continue
-        if source == "me":
-            # text evidence layer: a mic line that reads like a recent loopback
-            # line is a confirmed echo — drop it and (in auto mode) arm the gate
-            match = echo_gate.mic_text_match(start_ts, text)
-            if match >= echo_gate.EVIDENCE_MATCH and overlap >= 0.3:
-                echo_gate.record_hit()
-                print(f"[echo] mic line dropped (reads like loopback, match {match:.2f})")
+        if ASR_MODE == "groq":
+            event = {
+                "type": "audio",
+                "source": source,
+                "ts": start_ts,
+                "rate": TARGET_RATE,
+                "format": "wav",
+                "data": _wav_b64(audio),
+            }
+            if source == "me":
+                now = time.time()
+                for k in [k for k in _me_overlap if now - k > 90]:
+                    del _me_overlap[k]
+                _me_overlap[start_ts] = overlap
+            else:
+                speaker = labeler.label(audio)
+                if speaker:
+                    event["speaker"] = speaker
+            print(f"  [{event.get('speaker', source)}] {len(audio) / TARGET_RATE:.1f}s -> hub")
+            out_queue.put(event)
+        else:
+            try:
+                segments, _ = _get_model(ASR_MODEL).transcribe(
+                    audio,
+                    language="en",
+                    beam_size=1,
+                    vad_filter=True,
+                    condition_on_previous_text=False,
+                )
+                text = " ".join(s.text.strip() for s in segments).strip()
+            except Exception as e:
+                print(f"[asr] error: {e}")
                 continue
-        event = {"type": "transcript", "source": source, "text": text, "ts": start_ts}
-        if source == "them":
-            echo_gate.note_them_text(start_ts, text)
-            speaker = labeler.label(audio)
-            if speaker:
-                event["speaker"] = speaker
-        print(f"  [{event.get('speaker', source)}] {text}")
-        out_queue.put(event)
+            if not text:
+                continue
+            if source == "me":
+                # text evidence layer: a mic line that reads like a recent loopback
+                # line is a confirmed echo — drop it and (in auto mode) arm the gate
+                match = echo_gate.mic_text_match(start_ts, text)
+                if match >= echo_gate.EVIDENCE_MATCH and overlap >= 0.3:
+                    echo_gate.record_hit()
+                    print(f"[echo] mic line dropped (reads like loopback, match {match:.2f})")
+                    continue
+            event = {"type": "transcript", "source": source, "text": text, "ts": start_ts}
+            if source == "them":
+                echo_gate.note_them_text(start_ts, text)
+                speaker = labeler.label(audio)
+                if speaker:
+                    event["speaker"] = speaker
+            print(f"  [{event.get('speaker', source)}] {text}")
+            out_queue.put(event)
         # centroid snapshot: on a new voice, else at most every 20s
         if labeler.clusters and (len(labeler.clusters) != known_speakers or time.time() - last_snapshot > 20):
             known_speakers = len(labeler.clusters)
             last_snapshot = time.time()
             out_queue.put({"type": "speakers", "speakers": labeler.snapshot()})
+
+
+# ---- device-agent tasks ----
+# The hub pushes {"type":"task", id, title, prompt} down this websocket when
+# the user clicks an "agent" action. We spawn the user's OWN Claude Code
+# (their login, their billing — the hub's shared key is never involved) in a
+# per-task directory, stream progress back up as task_update events, and ship
+# the outcome as task_done. Guardrails: no Bash, file writes accepted only in
+# the task directory (acceptEdits), web + the Earshot MCP explicitly allowed.
+# The mcp__<server> entries are the user's OWN claude.ai connectors (Gmail,
+# Calendar, Drive, ...) — the point of running on their machine is that those
+# connections already exist, so Earshot never asks them to connect anything.
+# Server-level rules (mcp__claude_ai_Gmail) are required: wildcard tool
+# patterns (mcp__claude_ai_*) silently DENY — verified live. ToolSearch must
+# be allowed too: connector tools are deferred until searched for.
+TASK_TIMEOUT_S = 14 * 60  # hub gives up at 15 min; die first so it hears from us
+TASK_ALLOWED_TOOLS = ",".join([
+    "WebSearch", "WebFetch", "ToolSearch", "mcp__earshot",
+    "mcp__claude_ai_Gmail", "mcp__claude_ai_Google_Calendar",
+    "mcp__claude_ai_Google_Drive", "mcp__claude_ai_Notion",
+])
+
+
+def _find_claude() -> str | None:
+    """The packaged app is launched from Explorer/Finder, whose PATH often
+    misses dev-tool locations — check the common install spots too."""
+    hit = shutil.which("claude")
+    if hit:
+        return hit
+    home = Path.home()
+    candidates = [home / ".local" / "bin" / ("claude.exe" if sys.platform == "win32" else "claude")]
+    if sys.platform == "win32" and os.environ.get("APPDATA"):
+        candidates.append(Path(os.environ["APPDATA"]) / "npm" / "claude.cmd")
+    elif IS_MAC:
+        candidates += [Path("/opt/homebrew/bin/claude"), Path("/usr/local/bin/claude")]
+    for c in candidates:
+        if c.is_file():
+            return str(c)
+    return None
+
+
+def _tasks_root() -> Path:
+    if sys.platform == "win32":
+        return Path(os.environ.get("APPDATA", str(Path.home()))) / "Earshot" / "tasks"
+    if IS_MAC:
+        return Path.home() / "Library" / "Application Support" / "Earshot" / "tasks"
+    return Path.home() / ".earshot" / "tasks"
+
+
+def _hub_http_base() -> str:
+    """ws(s)://host/ingest?... -> http(s)://host (for the MCP endpoint)."""
+    url = HUB_URL.split("?")[0]
+    url = url.replace("wss://", "https://").replace("ws://", "http://")
+    return url[: -len("/ingest")] if url.endswith("/ingest") else url
+
+
+def _task_note(msg: dict) -> str | None:
+    """One short human line from a stream-json assistant event, for the
+    dashboard's live 'your Claude is working' chip."""
+    for block in msg.get("message", {}).get("content", []):
+        if block.get("type") == "tool_use":
+            name = block.get("name", "tool").replace("mcp__earshot__", "earshot: ")
+            return f"using {name}"
+        if block.get("type") == "text" and block.get("text", "").strip():
+            return block["text"].strip()[:140]
+    return None
+
+
+def _run_task(msg: dict):
+    task_id, title, prompt = str(msg.get("id") or ""), str(msg.get("title") or "task"), str(msg.get("prompt") or "")
+    if not task_id or not prompt:
+        return
+
+    def done(ok: bool, summary: str, files: list[str] | None = None):
+        out_queue.put({"type": "task_done", "id": task_id, "ok": ok, "summary": summary[:600], "files": files or []})
+
+    claude = _find_claude()
+    if not claude:
+        return done(False, "Claude Code isn't installed on this computer (or isn't on PATH).")
+    tdir = _tasks_root() / task_id
+    tdir.mkdir(parents=True, exist_ok=True)
+    mcp = {"mcpServers": {"earshot": {"type": "http", "url": _hub_http_base() + "/mcp"}}}
+    if CAPTURE_KEY:
+        mcp["mcpServers"]["earshot"]["headers"] = {"Authorization": "Bearer " + CAPTURE_KEY}
+    (tdir / "mcp.json").write_text(json.dumps(mcp))
+    # no --strict-mcp-config: the user's own MCP config (incl. claude.ai
+    # connectors) loads alongside the earshot server from mcp.json; only the
+    # allowlisted tools run without asking, everything else is auto-denied
+    cmd = [
+        claude, "-p", "--output-format", "stream-json", "--verbose",
+        "--permission-mode", "acceptEdits",
+        "--allowedTools", TASK_ALLOWED_TOOLS,
+        "--mcp-config", "mcp.json",
+        "--max-turns", "60",
+    ]
+    if sys.platform == "win32" and claude.lower().endswith((".cmd", ".bat")):
+        cmd = ["cmd", "/c"] + cmd  # CreateProcess won't exec batch scripts directly
+    print(f"[task] {task_id} starting: {title}")
+    out_queue.put({"type": "task_update", "id": task_id, "note": "agent starting on your device"})
+    result_text, ok = "", False
+    try:
+        with open(tdir / "stderr.log", "wb") as errlog:
+            proc = subprocess.Popen(
+                cmd, cwd=str(tdir),
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=errlog,
+                creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
+            )
+            watchdog = threading.Timer(TASK_TIMEOUT_S, proc.kill)
+            watchdog.start()
+            try:
+                proc.stdin.write(prompt.encode("utf-8"))  # prompt via stdin: no argv length/quoting issues
+                proc.stdin.close()
+                for raw in proc.stdout:
+                    try:
+                        ev = json.loads(raw)
+                    except Exception:
+                        continue
+                    if ev.get("type") == "assistant":
+                        note = _task_note(ev)
+                        if note:
+                            out_queue.put({"type": "task_update", "id": task_id, "note": note})
+                    elif ev.get("type") == "result":
+                        result_text = str(ev.get("result") or "")
+                        ok = ev.get("subtype") == "success" and not ev.get("is_error")
+                proc.wait()
+            finally:
+                watchdog.cancel()
+    except Exception as e:
+        return done(False, f"Couldn't run the local Claude agent: {e}")
+    files = sorted(
+        p.name for p in tdir.iterdir()
+        if p.is_file() and p.name not in ("mcp.json", "stderr.log")
+    )
+    if not result_text:
+        result_text = "The agent produced no result (timed out or crashed — see stderr.log in the task folder)."
+    print(f"[task] {task_id} {'done' if ok else 'FAILED'}: {result_text[:120]}")
+    done(ok, result_text, files)
+    if ok and files:
+        # the deliverables live on this machine — show them, same philosophy
+        # as local-mode artifact actions
+        try:
+            if sys.platform == "win32":
+                os.startfile(tdir)  # noqa: S606
+            elif IS_MAC:
+                subprocess.Popen(["open", str(tdir)])
+        except Exception:
+            pass
+
+
+def _handle_downlink(msg: dict):
+    if msg.get("type") == "config":
+        apply_config(msg)
+    elif msg.get("type") == "task":
+        threading.Thread(target=_run_task, args=(msg,), daemon=True).start()
+    elif msg.get("type") == "transcript" and msg.get("text"):
+        # groq mode: the hub transcribed our audio — run the same echo-gate
+        # text-evidence path the local branch of asr_worker runs
+        ts, text = msg.get("ts", 0.0), msg["text"]
+        if msg.get("source") == "them":
+            echo_gate.note_them_text(ts, text)
+        elif msg.get("source") == "me":
+            overlap = _me_overlap.pop(ts, 0.0)
+            match = echo_gate.mic_text_match(ts, text)
+            if match >= echo_gate.EVIDENCE_MATCH and overlap >= 0.3:
+                echo_gate.record_hit()
+                print(f"[echo] mic line reads like loopback per hub (match {match:.2f})")
+
+
+def _ws_reader(ws):
+    """Consumes hub->capture messages (config, groq-mode transcripts). One
+    sender + one reader thread on a sync connection is websockets' supported
+    threading pattern. Dies with the connection; ws_sender spawns a fresh one."""
+    try:
+        while True:
+            msg = json.loads(ws.recv())
+            if isinstance(msg, dict):
+                _handle_downlink(msg)
+    except Exception:
+        return
 
 
 def ws_sender():
@@ -240,6 +509,10 @@ def ws_sender():
         try:
             with connect(HUB_URL) as ws:
                 print(f"[ws] connected to {HUB_URL}")
+                # capabilities first: the hub routes "agent" actions to this
+                # device only if the user's own Claude Code is runnable here
+                ws.send(json.dumps({"type": "caps", "claude": _find_claude() is not None}))
+                threading.Thread(target=_ws_reader, args=(ws,), daemon=True).start()
                 while True:
                     if pending is None:
                         pending = out_queue.get()

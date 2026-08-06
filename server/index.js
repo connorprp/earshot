@@ -13,6 +13,7 @@ import { WebSocketServer } from "ws";
 import { distill, applyOps } from "./distill.js";
 import { executeAction } from "./actions.js";
 import { closeoutSession } from "./closeout.js";
+import { handleMcp } from "./mcp.js";
 import {
   authEnabled,
   publicConfig,
@@ -29,6 +30,7 @@ import {
   handleCallback,
   currentCalendarEvent,
 } from "./google.js";
+import { groqConfigured, transcribeSegment, ASR_MODELS, defaultAsrMode } from "./asr.js";
 import {
   initDb,
   seedCaptureKeys,
@@ -66,6 +68,8 @@ const RESTORE_MAX_DISTILLS = 4;  // restored bubbles untouched after this many d
 const ECHO_WINDOW_MS = 15_000;   // a "them" line this recent can claim a "me" line as its echo
 const ECHO_HOLD_MS = 6_000;      // "me" lines wait this long in case their "them" twin arrives late
 const ECHO_OVERLAP = 0.62;       // fraction of "me" tokens fuzzy-found in one "them" line = echo
+const TASK_TIMEOUT_MS = 15 * 60 * 1000; // device-agent task with no task_done by then = error
+const TASK_PRUNE_MS = 60_000;    // finished tasks linger this long in the dashboard task list
 
 // Shared server-side API key (sk-ant-api03-…): when set, EVERY tenant's
 // distills run on it (billed to this API account, not any coworker's
@@ -109,6 +113,11 @@ class Tenant {
     this.captureSockets = new Set();
     this.sessionContext = ""; // Tier-1 context: directory + current calendar meeting
     this.googleConnected = false;
+    this.asrMode = defaultAsrMode(); // "local" | "groq"; user pref overrides on hydration
+    this.asrModel = null;            // local-mode whisper model; null = agent's platform default
+    this.groqChain = Promise.resolve(); // serializes Groq calls per tenant (transcript order)
+    this.tasks = new Map();      // device-agent tasks: id -> {id, bubbleId, actionId, title, status, note}
+    this.taskTimers = new Map(); // task id -> timeout handle (kept out of the JSON-serialized task)
     this.claudeToken = CLAUDE_TOKENS.get(userId) || null; // may be replaced from the user's stored token
     this.outDir = path.join(OUT_ROOT, userId === "local" ? "local" : userId.replace(/[^a-z0-9]+/gi, "-"));
     fs.mkdirSync(this.outDir, { recursive: true });
@@ -137,12 +146,168 @@ class Tenant {
       captureConnected: this.captureSockets.size > 0,
       claudeConnected: this.claudeConnected,
       googleConnected: this.googleConnected,
+      asrMode: this.asrMode,
+      asrOk: this.asrMode !== "groq" || groqConfigured,
+      agentAvailable: Boolean(this.agentSocket()),
     };
   }
 
+  // ---- device-agent tasks ----
+  // "agent" actions don't run on the hub at all: the task (a self-contained
+  // prompt) goes DOWN the capture websocket to the user's machine, where the
+  // capture agent spawns the user's own Claude Code (their login, their
+  // billing) to do the real work. The hub's contribution is context: it holds
+  // the transcript, bubble, and session context the local agent can't see.
+  agentSocket() {
+    for (const ws of this.captureSockets) if (ws.readyState === 1 && ws._caps?.claude) return ws;
+    return null;
+  }
+
+  tasksMsg() {
+    return { type: "tasks", tasks: [...this.tasks.values()] };
+  }
+
+  broadcastTasks() {
+    this.broadcast(this.tasksMsg());
+  }
+
+  // per-type mission: calendar/email actions prefer the user's ALREADY
+  // CONNECTED apps (claude.ai connectors surface in their Claude Code as
+  // mcp__claude_ai_* tools) — no Earshot-side Google OAuth involved
+  taskMission(bubble, action) {
+    const p = action.payload || {};
+    // connector tools are DEFERRED in Claude Code — they don't appear until a
+    // ToolSearch loads them, so every mission must say "search before you
+    // decide it isn't connected" (verified live: without this line the agent
+    // wrote the fallback artifact while a working Gmail connector sat unused)
+    if (action.type === "calendar") {
+      return [
+        `Create this calendar event for the user:`,
+        JSON.stringify(p, null, 1),
+        ``,
+        `- FIRST run ToolSearch (e.g. "google calendar create event") — the user's connected apps are deferred tools that only appear after a search.`,
+        `- If Google Calendar tools load (mcp__claude_ai_Google_Calendar__*), create the real event there, inviting the listed attendees.`,
+        `- Only if no calendar tools exist (never try to authenticate anything): write the event as an RFC-5545 .ics file in the current working directory instead.`,
+      ].join("\n");
+    }
+    if (action.type === "email") {
+      return [
+        `Draft this email for the user:`,
+        JSON.stringify(p, null, 1),
+        ``,
+        `- FIRST run ToolSearch (e.g. "gmail create draft") — the user's connected apps are deferred tools that only appear after a search.`,
+        `- If Gmail tools load (mcp__claude_ai_Gmail__*), create a DRAFT with create_draft. NEVER send an email — drafts only; the user reviews and sends.`,
+        `- Only if no Gmail tools exist (never try to authenticate anything): write a .eml file (starting with an "X-Unsent: 1" header line) in the current working directory instead.`,
+        `- If the subject or body is thin, complete it from the conversation context below.`,
+      ].join("\n");
+    }
+    return p.brief || bubble.summary || "";
+  }
+
+  buildTaskPrompt(bubble, action) {
+    const p = action.payload || {};
+    const names = this.state.speakers || {};
+    const who = (l) => (l.source === "me" ? "Me" : names[l.speaker] || l.speaker || "Them");
+    const transcript = this.transcript.slice(-150).map((l) => `[${who(l)}] ${l.text}`).join("\n");
+    return [
+      `You are completing a real-world task on behalf of the user ("Me"). It was identified during a live conversation captured by Earshot, an ambient meeting assistant. Work autonomously — nobody is available to answer questions.`,
+      ``,
+      `# Task: ${p.title || p.subject || action.label || bubble.title}`,
+      ``,
+      this.taskMission(bubble, action),
+      ``,
+      `# The conversation concept this came from`,
+      JSON.stringify({ title: bubble.title, summary: bubble.summary, details: bubble.details || [] }, null, 1),
+      ...(this.sessionContext ? [``, `# Context`, this.sessionContext] : []),
+      ...(transcript ? [``, `# Recent conversation transcript`, transcript] : []),
+      ``,
+      `Current datetime: ${new Date().toString()}`,
+      ``,
+      `# Instructions`,
+      `- The user's own connected apps may be available as mcp__claude_ai_* tools (Gmail, Google Calendar, Google Drive, Notion, ...). They are DEFERRED — run ToolSearch to load them before concluding one isn't connected. Prefer them whenever the task calls for a real-world object (an email draft, a calendar event, a shared doc). Never authenticate or connect a new service, and never SEND email — drafts only.`,
+      `- Otherwise produce the deliverable as one or more files in the current working directory (markdown unless the task clearly calls for another format).`,
+      `- An "earshot" MCP server is connected, holding the user's past recorded conversations (list_sessions, get_session, get_transcript, search_transcripts, get_live_board). Use it when the task needs context beyond the transcript above.`,
+      `- The transcript is speech-to-text: words get garbled and tense/agency can flip. Hedge uncertain facts rather than inventing specifics.`,
+      `- End with a 2-3 sentence summary of what you produced (mention where it landed: Gmail draft, calendar, or files).`,
+    ].join("\n");
+  }
+
+  // returns the task if it was dispatched, null if no capable device agent
+  dispatchTask(bubble, action) {
+    const ws = this.agentSocket();
+    if (!ws) return null;
+    const id = `t-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
+    const p = action.payload || {};
+    const task = {
+      id,
+      bubbleId: bubble.id,
+      actionId: action.id,
+      title: p.title || p.subject || action.label || bubble.title,
+      status: "running",
+      note: "sent to your device",
+      startedAt: Date.now(),
+    };
+    this.tasks.set(id, task);
+    this.taskTimers.set(
+      id,
+      setTimeout(
+        () => this.handleTaskEvent({ type: "task_done", id, ok: false, summary: "Timed out — no result from the device agent after 15 minutes." }),
+        TASK_TIMEOUT_MS
+      )
+    );
+    ws.send(JSON.stringify({ type: "task", id, title: task.title, prompt: this.buildTaskPrompt(bubble, action) }));
+    this.log(`task ${id} -> device agent: ${task.title}`);
+    this.broadcastTasks();
+    return task;
+  }
+
+  handleTaskEvent(ev) {
+    const task = this.tasks.get(ev.id);
+    if (!task || task.status !== "running") return;
+    if (ev.type === "task_update") {
+      task.note = String(ev.note || "").slice(0, 200);
+      return this.broadcastTasks();
+    }
+    // task_done
+    clearTimeout(this.taskTimers.get(task.id));
+    this.taskTimers.delete(task.id);
+    task.status = ev.ok ? "done" : "error";
+    task.note = String(ev.summary || "").slice(0, 600);
+    task.files = Array.isArray(ev.files) ? ev.files.slice(0, 20).map(String) : [];
+    task.endedAt = Date.now();
+    const bubble = this.state.bubbles.find((b) => b.id === task.bubbleId);
+    const action = bubble?.actions?.find((a) => a.id === task.actionId);
+    if (action) {
+      action.status = task.status;
+      persistBubble(this.userId, this.sessionId, bubble);
+      this.bumpAndBroadcast();
+    }
+    this.broadcast({ type: "task_done", ok: ev.ok === true, title: task.title, summary: task.note, files: task.files });
+    this.broadcastTasks();
+    this.log(`task ${task.id} ${task.status}: ${task.title}`);
+    const timer = setTimeout(() => {
+      this.tasks.delete(task.id);
+      this.broadcastTasks();
+    }, TASK_PRUNE_MS);
+    timer.unref?.();
+  }
+
+  // downlink to capture agents: which ASR mode to run and (local mode) which
+  // whisper model; sent on /ingest connect and on every settings change
+  configMsg() {
+    return { type: "config", asrMode: this.asrMode, asrModel: this.asrModel };
+  }
+
+  pushConfig() {
+    const msg = JSON.stringify(this.configMsg());
+    for (const ws of this.captureSockets) if (ws.readyState === 1) ws.send(msg);
+  }
+
   async loadStoredToken() {
-    if (!authEnabled || this.userId === "local") return;
     const user = await getOrCreateUser(this.userId);
+    if (user.asrMode === "local" || user.asrMode === "groq") this.asrMode = user.asrMode;
+    if (user.asrModel && ASR_MODELS.includes(user.asrModel)) this.asrModel = user.asrModel;
+    if (!authEnabled || this.userId === "local") return;
     this.googleConnected = Boolean(user.googleTokenEnc);
     if (user.claudeTokenEnc) {
       const token = decryptSecret(user.claudeTokenEnc);
@@ -215,13 +380,23 @@ class Tenant {
   }
 
   // ---- capture ingest ----
-  handleCaptureEvent(ev) {
-    if (!this.recording) return; // not recording: nothing is shown or saved
+  handleCaptureEvent(ev, ws) {
+    // capability + task events work regardless of recording: bubbles stay
+    // actionable after Stop, so their agent tasks must too
+    if (ev.type === "caps" && ws) {
+      ws._caps = { claude: Boolean(ev.claude) };
+      this.log(`capture caps: claude ${ws._caps.claude ? "available" : "not found"}`);
+      this.broadcast(this.status());
+      return;
+    }
+    if (ev.type === "task_update" || ev.type === "task_done") return this.handleTaskEvent(ev);
+    if (!this.recording) return; // not recording: nothing shown, saved, or sent to Groq
     if (ev.type === "speakers" && Array.isArray(ev.speakers)) {
       this.speakerProfiles = ev.speakers;
       persistSpeakers(this.sessionId, this.speakerProfiles, [...this.activeSpeakers]);
       return;
     }
+    if (ev.type === "audio") return this.handleAudioSegment(ev, ws);
     if (ev.type !== "transcript" || !ev.text) return;
     if (ev.source === "them") {
       if (ev.speaker) this.activeSpeakers.add(ev.speaker);
@@ -252,6 +427,36 @@ class Tenant {
       }, ECHO_HOLD_MS);
       this.heldMe.add(h);
     }
+  }
+
+  // thin capture mode: the agent shipped raw audio instead of text — transcribe
+  // via Groq, then feed the result through the normal transcript path (layer-2
+  // echo, persistence, ticker, distill all inherited). Calls are serialized per
+  // tenant so lines land in speaking order; failures drop the segment, never
+  // the hub. Transcripts are also echoed down the originating socket so the
+  // agent's echo gate can gather its text evidence (it has no local ASR).
+  handleAudioSegment(ev, ws) {
+    if (this.asrMode !== "groq" || !groqConfigured) return; // stale/old agent: ignore
+    if (ev.format !== "wav" || typeof ev.data !== "string" || ev.data.length > 2_000_000) return;
+    const { source, ts, speaker } = ev;
+    if (source !== "me" && source !== "them") return;
+    this.groqChain = this.groqChain
+      .then(async () => {
+        if (!this.recording) return; // recording stopped while queued
+        const wav = Buffer.from(ev.data, "base64");
+        let text;
+        try {
+          text = await transcribeSegment(wav);
+        } catch (e) {
+          if (e.status && e.status < 500) throw e; // 4xx: retrying won't help
+          text = await transcribeSegment(wav); // one retry on 5xx/network
+        }
+        if (!text) return;
+        const tev = { type: "transcript", source, text, ts, ...(speaker ? { speaker } : {}) };
+        if (ws && ws.readyState === 1) ws.send(JSON.stringify(tev)); // pre-filter, on purpose
+        this.handleCaptureEvent(tev);
+      })
+      .catch((e) => this.log(`groq asr failed, segment dropped: ${e.message}`));
   }
 
   acceptLine(ev) {
@@ -414,7 +619,9 @@ function tenantFor(userId) {
   if (!tenants.has(userId)) {
     const t = new Tenant(userId);
     tenants.set(userId, t);
-    t.loadStoredToken(); // async; lands well before the first distill
+    // async; lands well before the first distill. /ingest awaits it so the
+    // config downlink carries the user's stored ASR mode, not the default.
+    t.ready = t.loadStoredToken().catch((e) => console.error(`[hub:${userId}] hydration failed: ${e.message}`));
   }
   return tenants.get(userId);
 }
@@ -508,7 +715,7 @@ const server = http.createServer(async (req, res) => {
   if (!authEnabled) {
     // local mode: vite dev server (5173) talks to us cross-origin
     res.setHeader("Access-Control-Allow-Origin", "*");
-    res.setHeader("Access-Control-Allow-Headers", "content-type");
+    res.setHeader("Access-Control-Allow-Headers", "content-type, authorization, mcp-protocol-version");
   }
   if (req.method === "OPTIONS") return res.end();
   const urlPath = req.url?.split("?")[0] || "/";
@@ -619,6 +826,24 @@ const server = http.createServer(async (req, res) => {
     }
   }
 
+  // MCP endpoint for the user's own Claude (Claude Code, Desktop, or the
+  // device task agent). Not cookie-gated like the rest: headless clients
+  // authenticate with their capture key as a bearer token instead.
+  if (urlPath === "/mcp") {
+    const bearer = (req.headers.authorization || "").replace(/^Bearer\s+/i, "").trim();
+    const mcpUser = !authEnabled ? "local" : (bearer && userByCaptureKey(bearer)) || browserUser(req);
+    if (!mcpUser) {
+      res.statusCode = 401;
+      res.setHeader("content-type", "application/json");
+      return res.end(JSON.stringify({ jsonrpc: "2.0", error: { code: -32000, message: "Authorization: Bearer <capture key> required." }, id: null }));
+    }
+    return handleMcp(req, res, tenantFor(mcpUser)).catch((e) => {
+      console.error("[mcp] request failed:", e.message);
+      if (!res.headersSent) res.statusCode = 500;
+      res.end();
+    });
+  }
+
   // everything below belongs to exactly one signed-in tenant
   const userId = browserUser(req);
   if (!userId) {
@@ -684,17 +909,24 @@ const server = http.createServer(async (req, res) => {
   // ---- self-serve settings ----
   if (req.method === "GET" && req.url === "/me") {
     const user = await getOrCreateUser(userId);
-    const proto = (req.headers["x-forwarded-proto"] || "") === "https" ? "wss" : "ws";
+    const https = (req.headers["x-forwarded-proto"] || "") === "https";
+    const proto = https ? "wss" : "ws";
     res.setHeader("content-type", "application/json");
     return res.end(
       JSON.stringify({
         email: userId,
         captureKey: user.captureKey || null,
         wsUrl: `${proto}://${req.headers.host}/ingest`,
+        mcpUrl: `${https ? "https" : "http"}://${req.headers.host}/mcp`,
+        agentAvailable: Boolean(t.agentSocket()),
         captureConnected: t.captureSockets.size > 0,
         claudeConnected: t.claudeConnected,
         googleConfigured,
         googleConnected: Boolean(user.googleTokenEnc),
+        asrMode: t.asrMode,
+        asrModel: t.asrModel,
+        asrModels: ASR_MODELS,
+        groqConfigured,
       })
     );
   }
@@ -720,6 +952,25 @@ const server = http.createServer(async (req, res) => {
     await setClaudeToken(userId, token ? encryptSecret(token) : null);
     t.broadcast(t.status());
     return res.end(JSON.stringify({ ok: true, claudeConnected: t.claudeConnected }));
+  }
+  if (req.method === "POST" && req.url === "/me/asr") {
+    let body = "";
+    for await (const chunk of req) body += chunk;
+    const { asrMode, asrModel } = JSON.parse(body || "{}");
+    res.setHeader("content-type", "application/json");
+    const fail = (message) => {
+      res.statusCode = 400;
+      return res.end(JSON.stringify({ ok: false, message }));
+    };
+    if (asrMode !== "local" && asrMode !== "groq") return fail("asrMode must be 'local' or 'groq'.");
+    if (asrMode === "groq" && !groqConfigured) return fail("Cloud transcription isn't configured on this server (GROQ_API_KEY missing).");
+    if (asrModel != null && !ASR_MODELS.includes(asrModel)) return fail("Unknown whisper model.");
+    t.asrMode = asrMode;
+    t.asrModel = asrModel || null;
+    await setUserField(userId, { asrMode: t.asrMode, asrModel: t.asrModel });
+    t.broadcast(t.status());
+    t.pushConfig(); // connected capture agents switch live
+    return res.end(JSON.stringify({ ok: true, asrMode: t.asrMode, asrModel: t.asrModel }));
   }
   if (req.method === "POST" && req.url === "/me/capture-key/rotate") {
     const captureKey = await rotateCaptureKey(userId);
@@ -769,6 +1020,17 @@ const server = http.createServer(async (req, res) => {
     return res.end(JSON.stringify(data));
   }
 
+  // CI-only: seed a bubble without a distill so the action/task path is
+  // testable end-to-end (bubbles otherwise only exist via the LLM)
+  if (process.env.EARSHOT_TEST_SEED === "1" && req.method === "POST" && urlPath === "/test/seed-bubble") {
+    let body = "";
+    for await (const chunk of req) body += chunk;
+    t.state.bubbles.push(JSON.parse(body));
+    t.bumpAndBroadcast();
+    res.setHeader("content-type", "application/json");
+    return res.end(JSON.stringify({ ok: true }));
+  }
+
   if (req.method === "POST" && (req.url === "/action" || req.url === "/dismiss")) {
     let body = "";
     for await (const chunk of req) body += chunk;
@@ -787,6 +1049,26 @@ const server = http.createServer(async (req, res) => {
     if (!bubble || !action) {
       res.statusCode = 404;
       return res.end(JSON.stringify({ ok: false, message: "not found" }));
+    }
+    // Preference order for actions with real-world side effects: the user's
+    // OWN Claude on their device (it already has their Gmail/Calendar/Drive
+    // connected via claude.ai connectors) → hub-side Google (if they linked
+    // it here) → artifact file. Calendar without a start time skips the agent
+    // so executeAction can return its "edit the bubble first" message.
+    const agentRoutable =
+      action.type === "agent" ||
+      action.type === "email" ||
+      (action.type === "calendar" && (action.payload || {}).start);
+    if (agentRoutable) {
+      const task = t.dispatchTask(bubble, action);
+      if (task) {
+        action.status = "running";
+        persistBubble(userId, t.sessionId, bubble);
+        t.bumpAndBroadcast();
+        return res.end(
+          JSON.stringify({ ok: true, status: "running", message: `Your Claude is on it: ${task.title}` })
+        );
+      }
     }
     let result;
     try {
@@ -807,7 +1089,9 @@ const server = http.createServer(async (req, res) => {
 });
 
 // ---------- websockets ----------
-const wss = new WebSocketServer({ server });
+// maxPayload: audio segments top out ~700KB (15.8s base64 WAV); 8MB is
+// headroom, not the default 100MiB attack surface
+const wss = new WebSocketServer({ server, maxPayload: 8 * 1024 * 1024 });
 
 wss.on("connection", (ws, req) => {
   if (req.url?.startsWith("/ingest")) {
@@ -821,6 +1105,11 @@ wss.on("connection", (ws, req) => {
     t.captureSockets.add(ws);
     t.log("capture connected");
     t.broadcast(t.status());
+    // config downlink: wait for hydration so the stored pref (not the server
+    // default) is what the agent hears first
+    Promise.resolve(t.ready).then(() => {
+      if (ws.readyState === 1) ws.send(JSON.stringify(t.configMsg()));
+    });
     ws.on("message", (data) => {
       let ev;
       try {
@@ -828,7 +1117,7 @@ wss.on("connection", (ws, req) => {
       } catch {
         return;
       }
-      t.handleCaptureEvent(ev);
+      t.handleCaptureEvent(ev, ws);
     });
     ws.on("close", () => {
       t.captureSockets.delete(ws);
@@ -843,6 +1132,7 @@ wss.on("connection", (ws, req) => {
     ws.send(JSON.stringify({ type: "state", state: t.state }));
     ws.send(JSON.stringify({ type: "recording", value: t.recording }));
     ws.send(JSON.stringify(t.status()));
+    if (t.tasks.size) ws.send(JSON.stringify(t.tasksMsg()));
     for (const line of t.transcript.slice(-30)) ws.send(JSON.stringify(line));
     ws.on("close", () => t.dashboards.delete(ws));
   }

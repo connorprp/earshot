@@ -48,6 +48,8 @@ Bubble shape:
      "payload":{"to":"","subject":"...","body":"..."}},
     {"id":"slug","type":"spreadsheet","label":"Make a spreadsheet",
      "payload":{"name":"...","columns":["..."],"rows":[["..."]]}},
+    {"id":"slug","type":"agent","label":"Draft the counselor referral",
+     "payload":{"title":"...","brief":"self-contained markdown work order: the goal, every load-bearing fact/name/date from the conversation, and the exact deliverable to produce"}},
     {"id":"slug","type":"claude_code","label":"Send to Claude Code",
      "payload":{"title":"...","brief":"full markdown task brief for a coding agent"}},
     {"id":"slug","type":"note","label":"Save as note",
@@ -63,6 +65,12 @@ Rules:
 - Actions are hedged bets: 2-4 per bubble, ordered most-likely first. It's fine
   to offer several plausible paths (calendar + note + email). The UI adds an
   "ignore" affordance — never include an ignore action yourself.
+- "agent" actions spawn the user's own Claude agent on their computer: it can
+  research, draft documents, and produce finished files autonomously. Prefer
+  "agent" over "note" when the obvious next step is a WORK PRODUCT (a referral,
+  report, plan, comparison, analysis, polished draft) rather than just
+  remembering something. Label it with the deliverable ("Draft counselor
+  referral", "Research childcare options"). The brief must stand alone.
 - Pre-fill payloads as completely as the conversation allows. Resolve relative
   dates ("next Thursday", "tomorrow at 2") to concrete datetimes using the
   current datetime provided. If a critical field is unknown, leave it "".

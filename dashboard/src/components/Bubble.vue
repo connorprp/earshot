@@ -27,8 +27,10 @@ const accent = computed(() => `var(--accent-${props.bubble.kind || "discussion"}
         :key="a.id"
         class="action"
         :class="a.status"
+        :title="a.status === 'running' ? 'Your Claude agent is working on this on your device' : ''"
         @click="$emit('action', a)"
       >
+        <span v-if="a.status === 'running'" class="btn-spinner"></span>
         {{ a.status === "done" ? "✓ " : "" }}{{ a.label }}
       </button>
     </div>

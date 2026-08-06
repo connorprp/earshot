@@ -277,3 +277,16 @@ export async function getSession(userId, id) {
   ]);
   return session ? { session, transcript, bubbles } : null;
 }
+
+// full-history text search for the MCP read side (regex, newest first)
+export async function searchTranscripts(userId, query, limit = 30) {
+  if (!db) return [];
+  const esc = query.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return db
+    .collection("transcripts")
+    .find(
+      { userId, text: { $regex: esc, $options: "i" } },
+      { projection: { _id: 0, userId: 0 }, sort: { at: -1 }, limit }
+    )
+    .toArray();
+}

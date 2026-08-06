@@ -129,6 +129,16 @@ export async function executeAction(action, bubble, outDir = OUT_DIR, googleUser
       fs.writeFileSync(file, `# ${p.title || bubble.title}\n\n${p.brief || bubble.summary}\n`);
       return deliver(file, `Brief written. Run: claude "Read '${file}' and do what it describes"`);
     }
+    case "agent": {
+      // fallback only: with a Claude-capable capture agent connected, the hub
+      // dispatches this as a device task instead of ever reaching here
+      const file = path.join(outDir, `${safeName(p.title || bubble.title)}-brief.md`);
+      fs.writeFileSync(file, `# ${p.title || bubble.title}\n\n${p.brief || bubble.summary}\n`);
+      return deliver(
+        file,
+        "No Claude agent reachable on your computer — saved the work order as a brief instead. Open the Earshot app (and install Claude Code) to run these on your device."
+      );
+    }
     case "note": {
       const file = path.join(outDir, "notes.md");
       const stamp = new Date().toLocaleString();
