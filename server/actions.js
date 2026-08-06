@@ -46,6 +46,24 @@ function icsDate(iso) {
   return `${d.getFullYear()}${pad(d.getMonth() + 1)}${pad(d.getDate())}T${pad(d.getHours())}${pad(d.getMinutes())}00`;
 }
 
+// The artifact path has no model to read instructions, so instructions the
+// user typed in the send sheet are folded into the payload field that ends up
+// in the file (notes/body/brief/markdown). Returns a COPY — the stored bubble
+// must keep the model's original payload.
+export function withUserNotes(action, notes) {
+  const n = String(notes || "").trim();
+  if (!n) return action;
+  const p = { ...(action.payload || {}) };
+  const field =
+    action.type === "email" ? "body"
+    : action.type === "note" ? "markdown"
+    : action.type === "claude_code" || action.type === "agent" ? "brief"
+    : "notes"; // calendar description; spreadsheet has no prose field, so it
+               // rides along on the payload for the record
+  p[field] = `${p[field] ? `${p[field]}\n\n` : ""}From you: ${n}`;
+  return { ...action, payload: p };
+}
+
 // googleUser: the tenant's user doc when their Google account is connected —
 // calendar/email actions then do the REAL thing (event with invites, Gmail
 // draft) instead of producing an artifact. Everything else, and any Google

@@ -7,6 +7,9 @@
 //   bubbles     every concept bubble, upserted on each change; removed/dismissed
 //               bubbles stay as docs with a flag (nothing is ever deleted)
 //   ops         audit trail of every distill patch batch
+//   threads     one Claude conversation per concept+action: the messages the
+//               user's own Claude streamed back, and the claude session id a
+//               follow-up resumes
 // If Mongo is unreachable at startup the hub still runs; writes become no-ops.
 // Callers (Tenant instances) pass their userId and sessionId explicitly —
 // this module keeps no per-session state.
@@ -46,6 +49,7 @@ export async function initDb() {
       db.collection("bubbles").createIndex({ sessionId: 1, bubbleId: 1 }, { unique: true }),
       db.collection("sessions").createIndex({ userId: 1, lastActivityAt: -1 }),
       db.collection("ops").createIndex({ sessionId: 1, at: 1 }),
+      db.collection("threads").createIndex({ userId: 1, sessionId: 1, bubbleId: 1, actionId: 1 }),
     ]);
     // one-time migration: docs written before multi-tenancy belong to "local"
     for (const c of ["sessions", "transcripts", "bubbles", "ops"]) {
@@ -242,6 +246,47 @@ export function persistRemoval(sessionId, bubbleId, reason) {
   );
 }
 
+// ---- agent threads (a Claude conversation, anchored to a concept) ----
+// One doc per (session, bubble, action): the messages the user's own Claude
+// streamed back, plus the claude session id that lets a follow-up RESUME that
+// same conversation on their machine. sessionId is a plain string here (the
+// board's session, or "live" when nothing is recording) — a thread outlives
+// the session it was started from.
+export function saveThread(thread) {
+  if (!db) return;
+  const { messages, ...head } = thread;
+  guarded(
+    db.collection("threads").updateOne(
+      { _id: thread.id },
+      { $set: head, $setOnInsert: { messages: [] } },
+      { upsert: true }
+    )
+  );
+}
+
+export function appendThreadMessages(threadId, messages, head = {}) {
+  if (!db || !messages.length) return;
+  guarded(
+    db.collection("threads").updateOne(
+      { _id: threadId },
+      { $push: { messages: { $each: messages } }, $set: { ...head, updatedAt: new Date() } }
+    )
+  );
+}
+
+export async function getThread(userId, threadId) {
+  if (!db) return null;
+  return db.collection("threads").findOne({ _id: threadId, userId });
+}
+
+// newest first; the sheet asks for one bubble+action, the archive for a session
+export async function findThreads(userId, filter = {}, limit = 50) {
+  if (!db) return [];
+  const q = { userId };
+  for (const k of ["sessionId", "bubbleId", "actionId"]) if (filter[k]) q[k] = filter[k];
+  return db.collection("threads").find(q, { sort: { updatedAt: -1 }, limit }).toArray();
+}
+
 // voice profiles: capture-process cluster snapshot + which ids spoke this session
 export function persistSpeakers(sessionId, speakers, activeIds) {
   if (!db || !sessionId) return;
@@ -402,14 +447,21 @@ export async function getSessionTail(userId, sessionId, limit = 150) {
 
 // targeted status write so a click on an archived bubble never rewrites (or
 // un-removes) the rest of the stored doc
-export function setBubbleActionStatus(userId, sessionId, bubbleId, actionId, status) {
+// extra.notes: the instructions the user typed when they clicked (omitted on
+// the completion write, so finishing a task never erases what was asked; ""
+// is a real value — a later click with an empty box clears the old note).
+// extra.threadId: the agent conversation this click opened.
+export function setBubbleActionStatus(userId, sessionId, bubbleId, actionId, status, extra = {}) {
   if (!db) return;
   const _id = oid(sessionId);
   if (!_id) return;
+  const set = { "actions.$[a].status": status, actionRunAt: new Date() };
+  if (extra.notes !== undefined) set["actions.$[a].userNotes"] = extra.notes;
+  if (extra.threadId) set["actions.$[a].threadId"] = extra.threadId;
   guarded(
     db.collection("bubbles").updateOne(
       { sessionId: _id, bubbleId, userId },
-      { $set: { "actions.$[a].status": status, actionRunAt: new Date() } },
+      { $set: set },
       { arrayFilters: [{ "a.id": actionId }] }
     )
   );

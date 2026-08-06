@@ -176,9 +176,11 @@ export function applyOps(state, ops) {
     } else if (op.op === "update" && op.id) {
       const b = state.bubbles.find((x) => x.id === op.id);
       if (b) {
+        const prior = b.actions || [];
         Object.assign(b, op.bubble || {}, { id: b.id, createdAt: b.createdAt, updatedAt: Date.now() });
         delete b.restored; // an update confirms a provisionally-restored bubble
         normalizeActions(b);
+        carryActionHistory(prior, b.actions);
         changed = true;
       }
     } else if (op.op === "remove" && op.id) {
@@ -196,6 +198,19 @@ export function applyOps(state, ops) {
     }
   }
   return changed;
+}
+
+// An update op rewrites the whole actions array, so what the USER did with a
+// button (ran it, typed instructions for it) would be erased by the next
+// distill. Carry that across — but only onto an action that is still the same
+// action: ids are positional (a0, a1…), so label+type must match too.
+function carryActionHistory(prior, next) {
+  for (const a of next) {
+    const p = prior.find((x) => x.id === a.id && x.label === a.label && x.type === a.type);
+    if (!p) continue;
+    if (p.status && p.status !== "idle") a.status = p.status;
+    if (p.userNotes) a.userNotes = p.userNotes;
+  }
 }
 
 function normalizeActions(bubble) {

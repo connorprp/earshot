@@ -11,7 +11,7 @@ import zlib from "node:zlib";
 import { fileURLToPath } from "node:url";
 import { WebSocketServer } from "ws";
 import { distill, applyOps } from "./distill.js";
-import { executeAction } from "./actions.js";
+import { executeAction, withUserNotes } from "./actions.js";
 import { closeoutSession } from "./closeout.js";
 import { handleMcp } from "./mcp.js";
 import { renderExport } from "./export.js";
@@ -59,6 +59,10 @@ import {
   getSessionTail,
   setBubbleActionStatus,
   getPreviousSession,
+  saveThread,
+  appendThreadMessages,
+  getThread,
+  findThreads,
 } from "./db.js";
 
 const PORT = process.env.EARSHOT_PORT || 7071;
@@ -125,6 +129,7 @@ class Tenant {
     this.asrModel = null;            // local-mode whisper model; null = agent's platform default
     this.groqChain = Promise.resolve(); // serializes Groq calls per tenant (transcript order)
     this.tasks = new Map();      // device-agent tasks: id -> {id, bubbleId, actionId, title, status, note}
+    this.threads = new Map();    // agent conversations: threadId -> {bubbleId, actionId, claudeSessionId, messages[]}
     this.taskTimers = new Map(); // task id -> timeout handle (kept out of the JSON-serialized task)
     this.claudeToken = CLAUDE_TOKENS.get(userId) || null; // may be replaced from the user's stored token
     this.outDir = path.join(OUT_ROOT, userId === "local" ? "local" : userId.replace(/[^a-z0-9]+/gi, "-"));
@@ -268,8 +273,10 @@ class Tenant {
 
   // ctx lets an ARCHIVED bubble supply its own session's transcript/names/date
   // instead of the live board's — running a past session's button must never
-  // read the conversation happening right now
-  buildTaskPrompt(bubble, action, ctx = null) {
+  // read the conversation happening right now.
+  // notes = whatever the user typed in the send sheet before clicking; it wins
+  // over the model-written mission (they saw the mission and chose to change it)
+  buildTaskPrompt(bubble, action, ctx = null, notes = "") {
     const p = action.payload || {};
     const names = ctx ? ctx.speakerNames || {} : this.state.speakers || {};
     const who = (l) => (l.source === "me" ? "Me" : names[l.speaker] || l.speaker || "Them");
@@ -287,6 +294,17 @@ class Tenant {
       `# Task: ${p.title || p.subject || action.label || bubble.title}`,
       ``,
       this.taskMission(bubble, action),
+      ...(notes
+        ? [
+            ``,
+            `# The user's own instructions for this task`,
+            `The user typed these just now, while looking at the task above. They are the most`,
+            `recent and most authoritative word on what they want: where they conflict with`,
+            `anything else here, follow these. Do not treat them as optional flavor.`,
+            ``,
+            notes,
+          ]
+        : []),
       ``,
       `# The conversation concept this came from`,
       JSON.stringify({ title: bubble.title, summary: bubble.summary, details: bubble.details || [] }, null, 1),
@@ -306,7 +324,10 @@ class Tenant {
   }
 
   // returns the task if it was dispatched, null if no capable device agent.
-  // opts.sessionId + opts.ctx mark it as an archived-session action.
+  // opts.sessionId + opts.ctx mark it as an archived-session action;
+  // opts.notes carries the user's typed instructions into the prompt;
+  // opts.thread attaches it to a concept's conversation (opts.prompt +
+  // opts.resume = a follow-up turn continuing that same Claude session).
   dispatchTask(bubble, action, opts = {}) {
     const ws = this.agentSocket();
     if (!ws) return null;
@@ -317,6 +338,7 @@ class Tenant {
       bubbleId: bubble.id,
       actionId: action.id,
       sessionId: opts.sessionId || null, // set = the bubble lives in the archive, not on the board
+      threadId: opts.thread?.id || null,
       title: p.title || p.subject || action.label || bubble.title,
       status: "running",
       note: "sent to your device",
@@ -331,11 +353,96 @@ class Tenant {
       )
     );
     ws.send(
-      JSON.stringify({ type: "task", id, title: task.title, prompt: this.buildTaskPrompt(bubble, action, opts.ctx || null) })
+      JSON.stringify({
+        type: "task",
+        id,
+        threadId: task.threadId,
+        title: task.title,
+        prompt: opts.prompt || this.buildTaskPrompt(bubble, action, opts.ctx || null, opts.notes || ""),
+        // the claude session id of an earlier turn: the agent resumes THAT
+        // conversation instead of starting a new one
+        resume: opts.resume || null,
+      })
     );
-    this.log(`task ${id} -> device agent: ${task.title}`);
+    this.log(`task ${id} -> device agent: ${task.title}${opts.resume ? " (follow-up)" : ""}`);
     this.broadcastTasks();
     return task;
+  }
+
+  // ---- agent threads ----
+  // A thread is one Claude conversation, owned by the concept it came from:
+  // (session, bubble, action). Its messages are what the user's own Claude
+  // streamed back — the same text a terminal would print — so the dashboard
+  // can show the session live and the user can keep talking to it.
+  threadView(th) {
+    return { ...th, messages: th.messages || [] };
+  }
+
+  // the NEWEST thread for that button: clicking an action again starts a fresh
+  // run, and the sheet should open the conversation the user just started
+  async lookupThread(sessionKey, bubbleId, actionId) {
+    let newest = null;
+    for (const th of this.threads.values())
+      if (th.sessionId === sessionKey && th.bubbleId === bubbleId && th.actionId === actionId)
+        if (!newest || new Date(th.updatedAt) >= new Date(newest.updatedAt)) newest = th;
+    if (newest) return newest;
+    const [doc] = await findThreads(this.userId, { sessionId: sessionKey, bubbleId, actionId }, 1).catch(() => []);
+    if (!doc) return null;
+    const th = { ...doc, id: doc._id, messages: doc.messages || [] };
+    delete th._id;
+    this.threads.set(th.id, th);
+    return th;
+  }
+
+  async threadById(threadId) {
+    if (this.threads.has(threadId)) return this.threads.get(threadId);
+    const doc = await getThread(this.userId, threadId).catch(() => null);
+    if (!doc) return null;
+    const th = { ...doc, id: doc._id, messages: doc.messages || [] };
+    delete th._id;
+    this.threads.set(th.id, th);
+    return th;
+  }
+
+  newThread(sessionKey, bubble, action) {
+    const th = {
+      id: `th-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`,
+      userId: this.userId,
+      sessionId: sessionKey,
+      bubbleId: bubble.id,
+      actionId: action.id,
+      actionLabel: action.label || "",
+      actionType: action.type,
+      concept: bubble.title, // "organized by concept" is the whole point: a
+      title: (action.payload || {}).title || action.label || bubble.title, // thread never floats free of its bubble
+      claudeSessionId: null,
+      status: "idle",
+      messages: [],
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    };
+    this.threads.set(th.id, th);
+    saveThread(th);
+    return th;
+  }
+
+  // append + persist + push to open dashboards, all in one place so a live
+  // viewer and the stored record can never disagree
+  appendThread(th, messages, head = {}) {
+    if (!messages.length && !Object.keys(head).length) return;
+    const stamped = messages.map((m) => ({ at: new Date(), ...m }));
+    th.messages.push(...stamped);
+    Object.assign(th, head);
+    th.updatedAt = new Date();
+    appendThreadMessages(th.id, stamped, head);
+    this.broadcast({
+      type: "thread",
+      threadId: th.id,
+      bubbleId: th.bubbleId,
+      actionId: th.actionId,
+      status: th.status,
+      messages: stamped,
+    });
   }
 
   handleTaskEvent(ev) {
@@ -345,35 +452,77 @@ class Tenant {
       task.note = String(ev.note || "").slice(0, 200);
       return this.broadcastTasks();
     }
+    // the agent's own session id, learned from the first stream event: this is
+    // what a follow-up resumes
+    if (ev.type === "task_session") {
+      const th = this.threads.get(task.threadId);
+      if (th && ev.sessionId) {
+        th.claudeSessionId = String(ev.sessionId);
+        saveThread(th);
+      }
+      return;
+    }
+    // the Claude session as it happens: assistant text, tool calls, results
+    if (ev.type === "task_stream") {
+      const th = this.threads.get(task.threadId);
+      if (!th || !Array.isArray(ev.items) || !ev.items.length) return;
+      this.appendThread(
+        th,
+        ev.items.slice(0, 40).map((it) => ({
+          role: ["text", "thinking"].includes(it.kind) ? "assistant" : it.kind === "tool" ? "tool" : "tool_result",
+          text: String(it.text || "").slice(0, 6000),
+          ...(it.name ? { name: String(it.name).slice(0, 80) } : {}),
+          ...(it.ok === false ? { ok: false } : {}),
+        }))
+      );
+      return;
+    }
     // task_done
     clearTimeout(this.taskTimers.get(task.id));
     this.taskTimers.delete(task.id);
-    task.status = ev.ok ? "done" : "error";
+    task.status = ev.cancelled ? "cancelled" : ev.ok ? "done" : "error";
     task.note = String(ev.summary || "").slice(0, 600);
     task.files = Array.isArray(ev.files) ? ev.files.slice(0, 20).map(String) : [];
     task.endedAt = Date.now();
+    // a stopped task leaves the button clickable again — nothing was finished
+    const buttonStatus = task.status === "cancelled" ? "idle" : task.status;
     if (task.sessionId) {
       // archived bubble: the board doesn't hold it, so the status goes straight
       // to its stored doc and the dashboard patches the session it's viewing
-      setBubbleActionStatus(this.userId, task.sessionId, task.bubbleId, task.actionId, task.status);
+      setBubbleActionStatus(this.userId, task.sessionId, task.bubbleId, task.actionId, buttonStatus);
     } else {
       const bubble = this.state.bubbles.find((b) => b.id === task.bubbleId);
       const action = bubble?.actions?.find((a) => a.id === task.actionId);
       if (action) {
-        action.status = task.status;
+        action.status = buttonStatus;
         persistBubble(this.userId, this.boardSessionId(), bubble);
         this.bumpAndBroadcast();
       }
     }
+    const th = this.threads.get(task.threadId);
+    if (th) {
+      this.appendThread(
+        th,
+        [
+          task.status === "cancelled"
+            ? { role: "system", text: "You stopped this task." }
+            : { role: "result", text: task.note, ok: ev.ok === true, files: task.files },
+        ],
+        { status: task.status === "error" ? "error" : "idle", lastTaskId: null }
+      );
+    }
     this.broadcast({
       type: "task_done",
       ok: ev.ok === true,
+      cancelled: task.status === "cancelled",
       title: task.title,
       summary: task.note,
       files: task.files,
       bubbleId: task.bubbleId,
       actionId: task.actionId,
       sessionId: task.sessionId,
+      threadId: task.threadId,
+      status: buttonStatus,
     });
     this.broadcastTasks();
     this.log(`task ${task.id} ${task.status}: ${task.title}`);
@@ -382,6 +531,25 @@ class Tenant {
       this.broadcastTasks();
     }, TASK_PRUNE_MS);
     timer.unref?.();
+  }
+
+  // Stop a task the user changed their mind about. The kill has to happen on
+  // their machine (that's where Claude runs), so we ask the agent — but we
+  // finish the task here immediately rather than waiting for a clean exit
+  // that a killed process may never produce. The agent's own task_done then
+  // hits the "not running" guard and is ignored.
+  cancelTask(taskId) {
+    const task = this.tasks.get(taskId);
+    if (!task || task.status !== "running") return false;
+    const ws = this.agentSocket();
+    if (ws) ws.send(JSON.stringify({ type: "task_cancel", id: taskId }));
+    this.handleTaskEvent({ type: "task_done", id: taskId, ok: false, cancelled: true, summary: "Stopped by you." });
+    return true;
+  }
+
+  runningTaskForThread(threadId) {
+    for (const t of this.tasks.values()) if (t.threadId === threadId && t.status === "running") return t;
+    return null;
   }
 
   // downlink to capture agents: which ASR mode to run and (local mode) which
@@ -533,7 +701,8 @@ class Tenant {
       this.broadcast(this.status());
       return;
     }
-    if (ev.type === "task_update" || ev.type === "task_done") return this.handleTaskEvent(ev);
+    if (["task_update", "task_done", "task_stream", "task_session"].includes(ev.type))
+      return this.handleTaskEvent(ev);
     if (!this.recording) return; // not recording: nothing shown, saved, or sent to Groq
     // audio/transcript/voice-profile events come from exactly one agent
     if ((ev.type === "transcript" || ev.type === "audio" || ev.type === "speakers") && !this.streamOwner(ws)) return;
@@ -855,6 +1024,51 @@ function personalizedInstaller(osName, req, captureKey) {
     .replaceAll("{{HTTP_URL}}", `${https ? "https" : "http"}://${host}`)
     .replaceAll("{{WS_URL}}", `${https ? "wss" : "ws"}://${host}/ingest`)
     .replaceAll("{{CAPTURE_KEY}}", captureKey);
+}
+
+// Where an action click lands: a bubble on the live board, or one read back
+// out of the archive (which brings its OWN session as context). Shared by
+// /action and /action/preview so the previewed prompt is the sent prompt.
+async function resolveActionTarget(t, userId, { bubbleId, actionId, sessionId }) {
+  const board = t.boardSessionId() ? String(t.boardSessionId()) : null;
+  const archivedId = sessionId && sessionId !== "live" && sessionId !== board ? String(sessionId) : null;
+  let bubble, ctx = null;
+  if (archivedId) {
+    bubble = await getSessionBubble(userId, archivedId, bubbleId).catch(() => null);
+    const tail = bubble ? await getSessionTail(userId, archivedId).catch(() => null) : null;
+    if (tail) {
+      ctx = {
+        lines: tail.lines,
+        speakerNames: tail.session.speakerNames || {},
+        startedAt: tail.session.startedAt,
+        title: tail.session.report?.title || tail.session.calendarEvent?.title || "",
+        report: tail.session.report || null,
+      };
+    }
+  } else {
+    bubble = t.state.bubbles.find((b) => b.id === bubbleId);
+  }
+  const action = bubble?.actions?.find((a) => a.id === actionId);
+  // calendar without a start time skips the agent so executeAction can return
+  // its "edit the bubble first" message
+  const agentRoutable = action ? action.type !== "calendar" || Boolean((action.payload || {}).start) : false;
+  return { bubble, action, ctx, archivedId, agentRoutable };
+}
+
+// user-typed instructions are free text from the browser: trim + cap so a
+// paste can't balloon the prompt sent to the device agent
+function cleanNotes(raw) {
+  return String(raw || "").trim().slice(0, 4000);
+}
+
+// Which conversation a thread belongs to, as a plain string. "live" is a real
+// key, not a placeholder: a bubble clicked while nothing is recording still
+// owns its thread, and the same bubble reopened from the archive resolves to
+// the session's id either way.
+function threadSessionKey(t, sessionId) {
+  const board = t.boardSessionId() ? String(t.boardSessionId()) : null;
+  if (!sessionId || sessionId === "live") return board || "live";
+  return String(sessionId);
 }
 
 // ---------- http api ----------
@@ -1226,10 +1440,100 @@ const server = http.createServer(async (req, res) => {
     return res.end(JSON.stringify({ ok: true }));
   }
 
+  // ---- agent threads: the Claude session that a concept's button opened ----
+  // the sheet asks for the thread behind (bubble, action) when it opens
+  if (req.method === "GET" && urlPath === "/thread") {
+    const q = new URL(req.url, "http://x").searchParams;
+    res.setHeader("content-type", "application/json");
+    const thread = await t.lookupThread(
+      threadSessionKey(t, q.get("sessionId")),
+      q.get("bubbleId") || "",
+      q.get("actionId") || ""
+    );
+    return res.end(
+      JSON.stringify({
+        ok: true,
+        thread: thread ? t.threadView(thread) : null,
+        running: thread ? Boolean(t.runningTaskForThread(thread.id)) : false,
+      })
+    );
+  }
+
+  // keep talking to the same Claude session (it resumes on the user's machine)
+  if (req.method === "POST" && urlPath === "/thread/reply") {
+    let body = "";
+    for await (const chunk of req) body += chunk;
+    const { threadId, text } = JSON.parse(body || "{}");
+    res.setHeader("content-type", "application/json");
+    const thread = await t.threadById(String(threadId || ""));
+    const message = cleanNotes(text);
+    if (!thread) {
+      res.statusCode = 404;
+      return res.end(JSON.stringify({ ok: false, message: "not found" }));
+    }
+    if (!message) return res.end(JSON.stringify({ ok: false, message: "Type something first." }));
+    if (t.runningTaskForThread(thread.id))
+      return res.end(JSON.stringify({ ok: false, message: "Your Claude is still working — stop it first." }));
+    if (!thread.claudeSessionId)
+      return res.end(
+        JSON.stringify({ ok: false, message: "That session can't be resumed — run the action again to start a new one." })
+      );
+    // a follow-up carries no mission or transcript: the resumed session on the
+    // user's machine still holds all of it
+    const task = t.dispatchTask(
+      { id: thread.bubbleId, title: thread.concept || "" },
+      { id: thread.actionId, label: thread.actionLabel, type: thread.actionType, payload: { title: thread.title } },
+      { thread, prompt: message, resume: thread.claudeSessionId, sessionId: thread.sessionId === "live" ? null : thread.sessionId }
+    );
+    if (!task)
+      return res.end(JSON.stringify({ ok: false, message: "Your Claude agent isn't connected on this computer." }));
+    t.appendThread(thread, [{ role: "user", text: message }], { status: "running", lastTaskId: task.id });
+    return res.end(JSON.stringify({ ok: true, status: "running" }));
+  }
+
+  // stop a task mid-flight (the kill happens on the user's machine)
+  if (req.method === "POST" && urlPath === "/thread/cancel") {
+    let body = "";
+    for await (const chunk of req) body += chunk;
+    const { threadId, taskId } = JSON.parse(body || "{}");
+    res.setHeader("content-type", "application/json");
+    const task = taskId ? t.tasks.get(String(taskId)) : t.runningTaskForThread(String(threadId || ""));
+    if (!task || !t.cancelTask(task.id))
+      return res.end(JSON.stringify({ ok: false, message: "Nothing is running for that action." }));
+    return res.end(JSON.stringify({ ok: true, message: "Stopped." }));
+  }
+
+  // what WOULD be sent: the exact prompt the device agent gets, so the send
+  // sheet can show it (and show it changing as the user types instructions)
+  if (req.method === "POST" && req.url === "/action/preview") {
+    let body = "";
+    for await (const chunk of req) body += chunk;
+    const req_ = JSON.parse(body || "{}");
+    res.setHeader("content-type", "application/json");
+    const { bubble, action, ctx, agentRoutable } = await resolveActionTarget(t, userId, req_);
+    if (!bubble || !action) {
+      res.statusCode = 404;
+      return res.end(JSON.stringify({ ok: false, message: "not found" }));
+    }
+    const p = action.payload || {};
+    return res.end(
+      JSON.stringify({
+        ok: true,
+        title: p.title || p.subject || action.label || bubble.title,
+        type: action.type,
+        // routing the click will actually take, so the sheet can say so
+        route: agentRoutable && t.agentSocket() ? "agent" : "hub",
+        prompt: agentRoutable
+          ? t.buildTaskPrompt(bubble, action, ctx, cleanNotes(req_.notes))
+          : "",
+      })
+    );
+  }
+
   if (req.method === "POST" && (req.url === "/action" || req.url === "/dismiss")) {
     let body = "";
     for await (const chunk of req) body += chunk;
-    const { bubbleId, actionId, sessionId } = JSON.parse(body || "{}");
+    const { bubbleId, actionId, sessionId, notes } = JSON.parse(body || "{}");
     res.setHeader("content-type", "application/json");
 
     if (req.url === "/dismiss") {
@@ -1242,42 +1546,45 @@ const server = http.createServer(async (req, res) => {
     // A bubble from a PAST session is just as clickable as a live one; it only
     // changes where the bubble is read from, which conversation the agent gets
     // as context, and where the resulting status is written.
-    const board = t.boardSessionId() ? String(t.boardSessionId()) : null;
-    const archivedId = sessionId && sessionId !== "live" && sessionId !== board ? String(sessionId) : null;
-    let bubble, ctx = null;
-    if (archivedId) {
-      bubble = await getSessionBubble(userId, archivedId, bubbleId).catch(() => null);
-      const tail = bubble ? await getSessionTail(userId, archivedId).catch(() => null) : null;
-      if (tail) {
-        ctx = {
-          lines: tail.lines,
-          speakerNames: tail.session.speakerNames || {},
-          startedAt: tail.session.startedAt,
-          title: tail.session.report?.title || tail.session.calendarEvent?.title || "",
-          report: tail.session.report || null,
-        };
-      }
-    } else {
-      bubble = t.state.bubbles.find((b) => b.id === bubbleId);
-    }
-
-    const action = bubble?.actions?.find((a) => a.id === actionId);
+    const { bubble, action, ctx, archivedId, agentRoutable } = await resolveActionTarget(t, userId, {
+      bubbleId,
+      actionId,
+      sessionId,
+    });
     if (!bubble || !action) {
       res.statusCode = 404;
       return res.end(JSON.stringify({ ok: false, message: "not found" }));
     }
+    const userNotes = cleanNotes(notes);
+    // recorded on the action itself so the board (and the archive, months
+    // later) shows what was actually asked for, not just that it ran. Set even
+    // when empty: a re-run with a cleared box means "no instructions this time"
+    action.userNotes = userNotes;
     // EVERY action prefers the user's OWN Claude on their device (it already
     // has their Gmail/Calendar/Drive/Notion connected via claude.ai
     // connectors) → hub-side Google (if linked here) → artifact file.
-    // Calendar without a start time skips the agent so executeAction can
-    // return its "edit the bubble first" message.
-    const agentRoutable = action.type !== "calendar" || Boolean((action.payload || {}).start);
     if (agentRoutable) {
-      const task = t.dispatchTask(bubble, action, archivedId ? { sessionId: archivedId, ctx } : {});
+      // the click opens a CONVERSATION with the user's Claude, kept under the
+      // concept it came from; follow-ups (POST /thread/reply) resume it
+      const thread = t.agentSocket() ? t.newThread(threadSessionKey(t, archivedId), bubble, action) : null;
+      const task = t.dispatchTask(bubble, action, {
+        notes: userNotes,
+        thread,
+        ...(archivedId ? { sessionId: archivedId, ctx } : {}),
+      });
       if (task) {
+        action.threadId = thread.id;
+        t.appendThread(
+          thread,
+          [{ role: "user", text: userNotes || `▶ ${action.label || "Run this action"}` }],
+          { status: "running", lastTaskId: task.id }
+        );
         action.status = "running";
         if (archivedId) {
-          setBubbleActionStatus(userId, archivedId, bubbleId, actionId, "running");
+          setBubbleActionStatus(userId, archivedId, bubbleId, actionId, "running", {
+            notes: userNotes,
+            threadId: thread.id,
+          });
         } else {
           persistBubble(userId, t.boardSessionId(), bubble);
           t.bumpAndBroadcast();
@@ -1291,13 +1598,15 @@ const server = http.createServer(async (req, res) => {
     try {
       const user = await getOrCreateUser(userId);
       const googleUser = googleConfigured && user.googleTokenEnc ? user : null;
-      result = await executeAction(action, bubble, t.outDir, googleUser);
+      // no agent to read instructions: fold them into the artifact itself so
+      // what the user typed still reaches the .ics/.eml/brief they get back
+      result = await executeAction(withUserNotes(action, userNotes), bubble, t.outDir, googleUser);
     } catch (e) {
       result = { ok: false, message: String(e.message || e) };
     }
     action.status = result.ok ? "done" : "error";
     if (archivedId) {
-      setBubbleActionStatus(userId, archivedId, bubbleId, actionId, action.status);
+      setBubbleActionStatus(userId, archivedId, bubbleId, actionId, action.status, { notes: userNotes });
     } else {
       persistBubble(userId, t.boardSessionId(), bubble);
       t.bumpAndBroadcast();

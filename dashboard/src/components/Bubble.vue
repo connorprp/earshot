@@ -12,6 +12,7 @@ const props = defineProps({
 defineEmits(["action", "dismiss"]);
 
 const accent = computed(() => `var(--accent-${props.bubble.kind || "discussion"}, var(--dim))`);
+const askedFor = computed(() => (props.bubble.actions || []).filter((a) => a.userNotes));
 </script>
 
 <template>
@@ -34,16 +35,27 @@ const accent = computed(() => `var(--accent-${props.bubble.kind || "discussion"}
         :class="a.status"
         :title="
           a.status === 'running'
-            ? 'Your Claude agent is working on this on your device'
-            : archived
-              ? 'Runs now on your Claude, using this past session as context'
-              : ''
+            ? 'Your Claude is working on this — click to watch or stop it'
+            : a.threadId
+              ? 'Open the Claude session for this action'
+              : archived
+                ? 'Runs now on your Claude, using this past session as context'
+                : ''
         "
         @click="$emit('action', a)"
       >
         <span v-if="a.status === 'running'" class="btn-spinner"></span>
         {{ a.status === "done" ? "✓ " : "" }}{{ a.label }}
+        <!-- a session exists behind this button: click reopens the conversation -->
+        <span v-if="a.threadId && a.status !== 'running'" class="thread-dot">💬</span>
       </button>
     </div>
+    <!-- what the user typed in the send sheet, kept with the action so the
+         archive shows what was actually asked for, not just that it ran -->
+    <ul v-if="askedFor.length" class="asked">
+      <li v-for="a in askedFor" :key="a.id">
+        <span class="asked-label">{{ a.label }}:</span> “{{ a.userNotes }}”
+      </li>
+    </ul>
   </div>
 </template>

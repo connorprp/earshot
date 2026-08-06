@@ -145,8 +145,9 @@ body {
 .action.done { border-color: #3fb950; color: #3fb950; }
 .action.done:hover { background: #3fb950; color: #0d1117; }
 .action.error { border-color: #f85149; color: #f85149; }
+/* a running action stays CLICKABLE: the click opens its session, where the
+   user can watch it work or stop it */
 .action.running {
-  pointer-events: none;
   display: inline-flex; align-items: center; gap: 6px;
   border-color: var(--accent-decision); color: var(--accent-decision);
   animation: agent-glow 1.6s ease-in-out infinite;
@@ -159,6 +160,11 @@ body {
 @keyframes agent-glow {
   50% { box-shadow: 0 0 8px 0 var(--accent-decision); }
 }
+/* instructions the user typed when they ran an action — kept on the bubble */
+.asked { list-style: none; display: flex; flex-direction: column; gap: 3px; margin-top: 2px; }
+.asked li { font-size: 11px; color: var(--dim); line-height: 1.5; font-style: italic; }
+.asked-label { font-style: normal; opacity: 0.8; }
+.thread-dot { font-size: 9px; opacity: 0.75; margin-left: 2px; }
 
 /* ---- session sidebar (archive nav) ---- */
 .sidebar {

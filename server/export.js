@@ -77,6 +77,11 @@ export function renderSessionMarkdown({ session = {}, transcript = [], bubbles =
           b.actions.map((a) => `${a.label}${a.status && a.status !== "idle" ? ` (${a.status})` : ""}`).join(" · "),
         ``
       );
+      // instructions typed in the send sheet: part of the record of what was
+      // asked for, not just which button was pressed
+      for (const a of b.actions.filter((x) => x.userNotes)) {
+        out.push(`> You asked (${a.label}): ${a.userNotes}`, ``);
+      }
     }
   }
 

@@ -348,6 +348,13 @@ TASK_DEFAULT_CONNECTORS = ["Gmail", "Google Calendar", "Google Drive", "Notion"]
 # make real, and used here to auto-allow exactly the user's connected servers.
 _CONNECTORS: list[str] | None = None
 
+# live task processes, so the dashboard's Stop can kill one mid-run; task ids
+# the user stopped (so we report "stopped", not "crashed"); and the claude
+# session id per task, which is what a follow-up turn resumes.
+_RUNNING: dict[str, subprocess.Popen] = {}
+_CANCELLED: set[str] = set()
+_SESSIONS: dict[str, str] = {}
+
 
 def _connector_slug(name: str) -> str:
     import re
@@ -439,8 +446,64 @@ def _task_note(msg: dict) -> str | None:
     return None
 
 
+def _tool_summary(block: dict) -> str:
+    """The interesting argument of a tool call, for the dashboard's tool line
+    (the full input is noise: file contents, whole email bodies)."""
+    inp = block.get("input") or {}
+    for key in ("query", "prompt", "url", "command", "file_path", "path", "subject", "title", "name"):
+        v = inp.get(key)
+        if isinstance(v, str) and v.strip():
+            return v.strip()[:200]
+    try:
+        return json.dumps(inp)[:200]
+    except Exception:
+        return ""
+
+
+def _stream_items(ev: dict) -> list[dict]:
+    """A stream-json event -> compact display items, so the dashboard shows the
+    session the way a terminal would (assistant text, tool calls, results)
+    without shipping raw tool payloads over the wire."""
+    items: list[dict] = []
+    kind = ev.get("type")
+    if kind == "assistant":
+        for block in ev.get("message", {}).get("content", []):
+            btype = block.get("type")
+            if btype == "text" and block.get("text", "").strip():
+                items.append({"kind": "text", "text": block["text"].strip()[:6000]})
+            elif btype == "thinking" and block.get("thinking", "").strip():
+                items.append({"kind": "thinking", "text": block["thinking"].strip()[:2000]})
+            elif btype == "tool_use":
+                items.append({
+                    "kind": "tool",
+                    "name": str(block.get("name") or "tool"),
+                    "text": _tool_summary(block),
+                })
+    elif kind == "user":
+        # tool results come back as a "user" event in stream-json
+        content = ev.get("message", {}).get("content", [])
+        for block in content if isinstance(content, list) else []:
+            if block.get("type") != "tool_result":
+                continue
+            payload = block.get("content")
+            if isinstance(payload, list):
+                text = " ".join(str(c.get("text", "")) for c in payload if isinstance(c, dict))
+            else:
+                text = str(payload or "")
+            text = text.strip()
+            if text:
+                items.append({
+                    "kind": "tool_result",
+                    "text": text[:800],
+                    "ok": not block.get("is_error"),
+                })
+    return items
+
+
 def _run_task(msg: dict):
     task_id, title, prompt = str(msg.get("id") or ""), str(msg.get("title") or "task"), str(msg.get("prompt") or "")
+    thread_id = str(msg.get("threadId") or "")
+    resume = str(msg.get("resume") or "")  # a claude session id: continue THAT conversation
     if not task_id or not prompt:
         return
 
@@ -450,8 +513,11 @@ def _run_task(msg: dict):
     claude = _find_claude()
     if not claude:
         return done(False, "Claude Code isn't installed on this computer (or isn't on PATH).")
-    tdir = _tasks_root() / task_id
+    # the thread owns the working directory, so every turn of a conversation
+    # sees (and adds to) the same deliverables
+    tdir = _tasks_root() / (thread_id or task_id)
     tdir.mkdir(parents=True, exist_ok=True)
+    before = {p.name for p in tdir.iterdir() if p.is_file()}
     mcp = {"mcpServers": {"earshot": {"type": "http", "url": _hub_http_base() + "/mcp"}}}
     if CAPTURE_KEY:
         mcp["mcpServers"]["earshot"]["headers"] = {"Authorization": "Bearer " + CAPTURE_KEY}
@@ -466,18 +532,21 @@ def _run_task(msg: dict):
         "--mcp-config", "mcp.json",
         "--max-turns", "60",
     ]
+    if resume:
+        cmd += ["--resume", resume]
     if sys.platform == "win32" and claude.lower().endswith((".cmd", ".bat")):
         cmd = ["cmd", "/c"] + cmd  # CreateProcess won't exec batch scripts directly
-    print(f"[task] {task_id} starting: {title}")
+    print(f"[task] {task_id} starting: {title}{' (resume)' if resume else ''}")
     out_queue.put({"type": "task_update", "id": task_id, "note": "agent starting on your device"})
     result_text, ok = "", False
     try:
-        with open(tdir / "stderr.log", "wb") as errlog:
+        with open(tdir / "stderr.log", "ab") as errlog:
             proc = subprocess.Popen(
                 cmd, cwd=str(tdir),
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=errlog,
                 creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
             )
+            _RUNNING[task_id] = proc  # so a cancel from the hub can kill it
             watchdog = threading.Timer(TASK_TIMEOUT_S, proc.kill)
             watchdog.start()
             try:
@@ -488,6 +557,18 @@ def _run_task(msg: dict):
                         ev = json.loads(raw)
                     except Exception:
                         continue
+                    # the session id lets the hub send follow-up turns that
+                    # RESUME this conversation instead of starting fresh
+                    if ev.get("session_id") and thread_id:
+                        sid = str(ev["session_id"])
+                        if sid != _SESSIONS.get(task_id):
+                            _SESSIONS[task_id] = sid
+                            out_queue.put({"type": "task_session", "id": task_id,
+                                           "threadId": thread_id, "sessionId": sid})
+                    items = _stream_items(ev)
+                    if items and thread_id:
+                        out_queue.put({"type": "task_stream", "id": task_id,
+                                       "threadId": thread_id, "items": items})
                     if ev.get("type") == "assistant":
                         note = _task_note(ev)
                         if note:
@@ -498,8 +579,14 @@ def _run_task(msg: dict):
                 proc.wait()
             finally:
                 watchdog.cancel()
+                _RUNNING.pop(task_id, None)
+                _SESSIONS.pop(task_id, None)
     except Exception as e:
         return done(False, f"Couldn't run the local Claude agent: {e}")
+    if task_id in _CANCELLED:
+        _CANCELLED.discard(task_id)
+        print(f"[task] {task_id} cancelled by the user")
+        return done(False, "Stopped by you.")
     files = sorted(
         p.name for p in tdir.iterdir()
         if p.is_file() and p.name not in ("mcp.json", "stderr.log")
@@ -508,9 +595,9 @@ def _run_task(msg: dict):
         result_text = "The agent produced no result (timed out or crashed — see stderr.log in the task folder)."
     print(f"[task] {task_id} {'done' if ok else 'FAILED'}: {result_text[:120]}")
     done(ok, result_text, files)
-    if ok and files:
-        # the deliverables live on this machine — show them, same philosophy
-        # as local-mode artifact actions
+    # only NEW deliverables pop the folder open: a follow-up turn that just
+    # answers a question shouldn't throw a window at the user
+    if ok and set(files) - before:
         try:
             if sys.platform == "win32":
                 os.startfile(tdir)  # noqa: S606
@@ -520,11 +607,26 @@ def _run_task(msg: dict):
             pass
 
 
+def _cancel_task(task_id: str):
+    """The user pressed stop in the dashboard. The hub has already given up on
+    this task, so all we owe it is a dead process."""
+    proc = _RUNNING.get(task_id)
+    if not proc:
+        return
+    _CANCELLED.add(task_id)
+    try:
+        proc.kill()
+    except Exception:
+        pass
+
+
 def _handle_downlink(msg: dict):
     if msg.get("type") == "config":
         apply_config(msg)
     elif msg.get("type") == "task":
         threading.Thread(target=_run_task, args=(msg,), daemon=True).start()
+    elif msg.get("type") == "task_cancel":
+        _cancel_task(str(msg.get("id") or ""))
     elif msg.get("type") == "transcript" and msg.get("text"):
         # groq mode: the hub transcribed our audio — run the same echo-gate
         # text-evidence path the local branch of asr_worker runs

@@ -40,9 +40,12 @@ hub.stdout.on("data", (d) => (log += d));
 hub.stderr.on("data", (d) => (log += d));
 
 let failures = 0;
-function check(label, cond) {
+function check(label, cond, detail = "") {
   console.log(`  ${cond ? "PASS" : "FAIL"}  ${label}`);
-  if (!cond) failures++;
+  if (!cond) {
+    failures++;
+    if (detail) console.log(`        got: ${detail}`);
+  }
 }
 
 function wsClose(url, headers = {}) {
@@ -284,6 +287,139 @@ try {
   const noteTask = capDown.filter((m) => m.type === "task").find((m) => m.prompt.includes("Meeting note"));
   check("note action routes to the user's own Claude (Notion/Drive mission)",
     noteRes.status === "running" && !!noteTask && noteTask.prompt.includes("Notion"));
+  // the send sheet: preview the exact prompt, then send with the user's own
+  // instructions folded into it
+  const prev = await (await fetch(`${BASE}/action/preview`, {
+    method: "POST", headers: { cookie: alice, "content-type": "application/json" },
+    body: JSON.stringify({ bubbleId: "b-note", actionId: "a1", notes: "keep it to three bullets" }),
+  })).json();
+  check("action preview returns the agent-bound prompt",
+    prev.ok === true && prev.route === "agent" && prev.prompt.includes("Meeting note"));
+  check("preview shows the user's instructions in the prompt",
+    prev.prompt.includes("keep it to three bullets") && prev.prompt.includes("The user's own instructions"));
+  check("preview 404s for an unknown action",
+    (await fetch(`${BASE}/action/preview`, {
+      method: "POST", headers: { cookie: alice, "content-type": "application/json" },
+      body: JSON.stringify({ bubbleId: "b-note", actionId: "nope" }),
+    })).status === 404);
+  await fetch(`${BASE}/action`, {
+    method: "POST", headers: { cookie: alice, "content-type": "application/json" },
+    body: JSON.stringify({ bubbleId: "b-note", actionId: "a1", notes: "keep it to three bullets" }),
+  });
+  await sleep(300);
+  const notesTask = capDown.filter((m) => m.type === "task").reverse()
+    .find((m) => m.prompt.includes("Meeting note"));
+  check("typed instructions reach the device agent's prompt",
+    !!notesTask && notesTask.prompt.includes("keep it to three bullets"));
+  const noted = await (await fetch(`${BASE}/state`, { headers: { cookie: alice } })).json();
+  check("instructions are recorded on the action",
+    noted.bubbles.find((b) => b.id === "b-note")?.actions[0].userNotes === "keep it to three bullets");
+  const notedMd = await (await fetch(`${BASE}/sessions/live/export?format=md`, { headers: { cookie: alice } })).text();
+  check("recorded instructions land in the export",
+    notedMd.includes("You asked (Save as note): keep it to three bullets"));
+  // the sheet pre-fills with the last note, so re-running with a cleared box
+  // has to mean "no instructions this time"
+  await fetch(`${BASE}/action`, {
+    method: "POST", headers: { cookie: alice, "content-type": "application/json" },
+    body: JSON.stringify({ bubbleId: "b-note", actionId: "a1", notes: "" }),
+  });
+  const cleared = await (await fetch(`${BASE}/state`, { headers: { cookie: alice } })).json();
+  check("re-running with an empty box clears the recorded instructions",
+    cleared.bubbles.find((b) => b.id === "b-note")?.actions[0].userNotes === "");
+  // ---- the action's Claude session (thread): stream, resume, stop ----
+  // its own bubble: clicking an action twice starts two runs, and this block
+  // needs to know exactly which conversation it is talking about
+  await fetch(`${BASE}/test/seed-bubble`, {
+    method: "POST", headers: { cookie: alice, "content-type": "application/json" },
+    body: JSON.stringify({
+      id: "b-thread", title: "Thread test", summary: "s",
+      actions: [{ id: "a1", type: "agent", label: "Do the thing", status: "idle",
+        payload: { title: "Threaded work order", brief: "Do the thing." } }],
+    }),
+  });
+  await fetch(`${BASE}/action`, {
+    method: "POST", headers: { cookie: alice, "content-type": "application/json" },
+    body: JSON.stringify({ bubbleId: "b-thread", actionId: "a1", notes: "keep it to three bullets" }),
+  });
+  await sleep(300);
+  const threadTask = capDown.filter((m) => m.type === "task").at(-1);
+  check("a dispatched task carries the thread it belongs to",
+    !!threadTask?.threadId && threadTask.resume === null &&
+    threadTask.prompt.includes("Threaded work order"));
+  const tid = threadTask.id, thId = threadTask.threadId;
+  taskCap.send(JSON.stringify({ type: "task_session", id: tid, threadId: thId, sessionId: "claude-sess-1" }));
+  taskCap.send(JSON.stringify({ type: "task_stream", id: tid, threadId: thId, items: [
+    { kind: "text", text: "Looking at the concept now." },
+    { kind: "tool", name: "mcp__claude_ai_Notion__create_page", text: "Meeting note" },
+    { kind: "tool_result", text: "page created", ok: true },
+  ] }));
+  await sleep(300);
+  check("the session streams to open dashboards",
+    dashT.some((m) => m.type === "thread" && m.threadId === thId &&
+      m.messages.some((x) => x.role === "assistant" && x.text.includes("Looking at the concept"))));
+  const th1 = await (await fetch(
+    `${BASE}/thread?bubbleId=b-thread&actionId=a1`, { headers: { cookie: alice } })).json();
+  check("the thread holds the whole conversation, in order",
+    th1.thread?.messages.map((m) => m.role).join(",") === "user,assistant,tool,tool_result" &&
+    th1.thread.messages[0].text === "keep it to three bullets",
+    JSON.stringify(th1.thread?.messages?.map((m) => [m.role, (m.text || "").slice(0, 30)])));
+  check("the thread is anchored to its concept",
+    th1.thread.bubbleId === "b-thread" && th1.thread.actionId === "a1" && th1.running === true,
+    `${th1.thread.bubbleId}/${th1.thread.actionId} running=${th1.running}`);
+  check("a reply is refused while the agent is still working",
+    (await (await fetch(`${BASE}/thread/reply`, {
+      method: "POST", headers: { cookie: alice, "content-type": "application/json" },
+      body: JSON.stringify({ threadId: thId, text: "hi" }),
+    })).json()).ok === false);
+  taskCap.send(JSON.stringify({ type: "task_done", id: tid, ok: true, summary: "Note saved.", files: ["note.md"] }));
+  await sleep(300);
+  const th2 = await (await fetch(
+    `${BASE}/thread?bubbleId=b-thread&actionId=a1`, { headers: { cookie: alice } })).json();
+  check("the result lands in the thread and the session becomes resumable",
+    th2.thread.messages.at(-1).role === "result" && th2.thread.claudeSessionId === "claude-sess-1" &&
+    th2.running === false);
+  check("an empty reply is refused",
+    (await (await fetch(`${BASE}/thread/reply`, {
+      method: "POST", headers: { cookie: alice, "content-type": "application/json" },
+      body: JSON.stringify({ threadId: thId, text: "   " }),
+    })).json()).ok === false);
+  const replyRes = await (await fetch(`${BASE}/thread/reply`, {
+    method: "POST", headers: { cookie: alice, "content-type": "application/json" },
+    body: JSON.stringify({ threadId: thId, text: "also mention the deadline" }),
+  })).json();
+  await sleep(300);
+  const followUp = capDown.filter((m) => m.type === "task").at(-1);
+  check("a follow-up resumes the same Claude session, carrying only the new turn",
+    replyRes.ok === true && followUp.resume === "claude-sess-1" &&
+    followUp.prompt === "also mention the deadline" && followUp.threadId === thId);
+  // stopping: the kill request goes to the device, the button frees up again
+  const cancelRes = await (await fetch(`${BASE}/thread/cancel`, {
+    method: "POST", headers: { cookie: alice, "content-type": "application/json" },
+    body: JSON.stringify({ threadId: thId }),
+  })).json();
+  await sleep(300);
+  check("stop asks the device agent to kill the task",
+    cancelRes.ok === true && capDown.some((m) => m.type === "task_cancel" && m.id === followUp.id));
+  const afterCancel = await (await fetch(`${BASE}/state`, { headers: { cookie: alice } })).json();
+  check("a stopped action goes back to clickable, not done",
+    afterCancel.bubbles.find((b) => b.id === "b-thread")?.actions[0].status === "idle");
+  const th3 = await (await fetch(
+    `${BASE}/thread?bubbleId=b-thread&actionId=a1`, { headers: { cookie: alice } })).json();
+  check("the stop is recorded in the conversation",
+    th3.thread.messages.at(-1).role === "system" && th3.running === false);
+  check("a late task_done from the killed process is ignored",
+    (() => {
+      taskCap.send(JSON.stringify({ type: "task_done", id: followUp.id, ok: true, summary: "too late" }));
+      return true;
+    })());
+  await sleep(200);
+  const th4 = await (await fetch(
+    `${BASE}/thread?bubbleId=b-thread&actionId=a1`, { headers: { cookie: alice } })).json();
+  check("...so the stopped conversation keeps its ending",
+    th4.thread.messages.at(-1).role === "system");
+  check("threads are tenant-scoped",
+    (await (await fetch(`${BASE}/thread?bubbleId=b-thread&actionId=a1`,
+      { headers: { cookie: bob } })).json()).thread === null);
   // bob has no Claude-capable agent: same clicks fall back to artifacts
   await seedBubble(bob, "b-task-bob", "Bob fallback test");
   const fb = await (await fetch(`${BASE}/action`, {
@@ -301,10 +437,17 @@ try {
   });
   const fbEmail = await (await fetch(`${BASE}/action`, {
     method: "POST", headers: { cookie: bob, "content-type": "application/json" },
-    body: JSON.stringify({ bubbleId: "b-email-bob", actionId: "a1" }),
+    body: JSON.stringify({ bubbleId: "b-email-bob", actionId: "a1", notes: "mention the Tuesday deadline" }),
   })).json();
   check("email action without a device agent falls back to .eml",
     fbEmail.ok === true && (fbEmail.downloadUrl || "").includes(".eml"));
+  // no agent = no model to read instructions, so they ride into the artifact
+  const eml = await (await fetch(`${BASE}${fbEmail.downloadUrl}`, { headers: { cookie: bob } })).text();
+  check("instructions land in the artifact when there's no agent",
+    eml.includes("mention the Tuesday deadline"));
+  const bobBoard = await (await fetch(`${BASE}/state`, { headers: { cookie: bob } })).json();
+  check("the stored bubble keeps the model's original payload",
+    bobBoard.bubbles.find((b) => b.id === "b-email-bob")?.actions[0].payload.body === "hello");
   aliceDashT.terminate(); taskCap.terminate();
 
   // ---- MCP endpoint (the user's own Claude reads their Earshot data) ----
@@ -476,6 +619,33 @@ try {
   // Claude token and sit in SDK retries for minutes
 } finally {
   hub.kill();
+}
+
+// pure-function check: a distill update rewrites a bubble's whole actions
+// array, and must not erase what the USER did with those buttons
+{
+  const { applyOps } = await import("./distill.js");
+  const state = {
+    bubbles: [
+      {
+        id: "b1", title: "t", createdAt: 1,
+        actions: [
+          { id: "a0", type: "email", label: "Draft email", status: "done", userNotes: "cc dana" },
+          { id: "a1", type: "note", label: "Save a note", status: "idle" },
+        ],
+      },
+    ],
+  };
+  applyOps(state, [
+    { op: "update", id: "b1", bubble: { summary: "new", actions: [
+      { id: "a0", type: "email", label: "Draft email" },
+      { id: "a1", type: "calendar", label: "Book the follow-up" }, // a DIFFERENT action reusing a1
+    ] } },
+  ]);
+  const [a0, a1] = state.bubbles[0].actions;
+  check("a distill update keeps the user's instructions on the same action",
+    a0.userNotes === "cc dana" && a0.status === "done");
+  check("history is not carried onto a replaced action", !a1.userNotes && a1.status === "idle");
 }
 
 if (failures) {

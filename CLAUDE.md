@@ -51,7 +51,8 @@ server/     Node ESM — ws hub (fan-in capture, fan-out dashboards), distill
             db.js — MongoDB Atlas persistence (Connor's "rusty" cluster, db
             "earshot"): sessions / transcripts (every line verbatim) /
             bubbles (upserted per change, removed = flag not delete) / ops
-            (distill audit trail). Sessions are manual: POST /record/start
+            (distill audit trail) / threads (a Claude conversation per
+            concept+action — see "Threads" below). Sessions are manual: POST /record/start
             opens one (clears the board), /record/stop flushes a final
             distill and sets endedAt; ingest lines are dropped while not
             recording. Hub restart < 30 min after last activity resumes an
@@ -194,6 +195,63 @@ auth — see Claude auth notes).
   — verified live: labels changed to "Add to Google Calendar" / "Create
   tasks in Asana" / "Save specs to Google Drive" — (b) names them in each
   task prompt as "verified connected", and (c) shows them in Settings.
+  **Send sheet (2026-08-06):** a click no longer fires immediately — it opens
+  `dashboard/src/components/ActionSheet.vue`, which offers a free-text
+  "your instructions" box and a fold-out preview of the EXACT prompt the
+  device agent will get (POST /action/preview, same
+  `resolveActionTarget` + `buildTaskPrompt` path as the real send, so the
+  preview can't drift from what ships; it re-renders debounced as you type).
+  Sending with an empty box = the old behavior byte-for-byte. The notes ride
+  /action → dispatchTask → a `# The user's own instructions for this task`
+  section placed right after the mission and declared authoritative over it
+  (the user typed them while looking at the mission). Trimmed + capped at 4000
+  chars hub-side. No device agent = no model to read them, so
+  `withUserNotes()` (actions.js) folds them into the artifact payload instead
+  (email→body, note→markdown, brief→brief, else notes) on a COPY — the stored
+  bubble keeps the model's original payload. Works identically on archived
+  bubbles (the sheet passes sessionId through). ⌘/Ctrl+Enter sends, Esc
+  cancels. **The instructions are part of the record:** they're written to
+  `action.userNotes` on the bubble (live board via persistBubble; archive via
+  setBubbleActionStatus's optional `notes` arg — passed on click, omitted on
+  the task_done write so finishing never erases it), rendered under the
+  buttons, included in md exports ("You asked (label): …"), and pre-filled
+  when the sheet reopens. An empty box on a re-run clears the old note (that's
+  why "" is a real value, distinct from undefined). Because a distill `update`
+  op rewrites a bubble's whole actions array, `carryActionHistory` in
+  distill.js re-applies status + userNotes onto actions that survive — matched
+  on id AND label AND type, since ids are positional (a0, a1) and the model
+  reuses them for different actions.
+  **Threads — a Claude session per concept (2026-08-06):** a click no longer
+  fires a one-shot task; it opens a CONVERSATION that lives on the bubble.
+  New Mongo collection `threads`, one doc per (session, bubble, action):
+  `{claudeSessionId, status, messages[]}`, where messages are what the user's
+  own Claude streamed back. Capture forwards stream-json as compact display
+  items (`_stream_items` in main.py: assistant text, thinking, `tool` with the
+  one interesting arg, `tool_result` truncated to 800 chars — raw tool payloads
+  never cross the wire) via `{type:"task_stream", id, threadId, items}`, plus
+  `{type:"task_session"}` carrying Claude's own session id. The hub appends,
+  persists, and broadcasts `{type:"thread", threadId, messages, status}`; the
+  dashboard renders it terminal-style in ActionSheet.vue and follows along
+  live. **Follow-ups resume that same session:** POST /thread/reply →
+  dispatchTask with `resume: claudeSessionId` and the user's text as the WHOLE
+  prompt (no mission, no transcript — the resumed session on their machine
+  still holds it), and capture spawns `claude -p --resume <sid>`. The working
+  directory is keyed by threadId, not task id, so every turn of a conversation
+  shares one deliverables folder (and only NEW files pop it open). Reads: GET
+  /thread?bubbleId&actionId[&sessionId] returns the newest thread for that
+  button; clicking an action again starts a fresh thread (a new run), and the
+  sheet always shows the latest. `action.threadId` is stored on the bubble so
+  the button shows a 💬 and reopens the session — including in the archive
+  (setBubbleActionStatus takes `{notes, threadId}`).
+  **Stop (2026-08-06):** POST /thread/cancel → hub sends
+  `{type:"task_cancel", id}` down the capture ws (capture keeps `_RUNNING`
+  task_id → Popen and kills it), and the hub finishes the task IMMEDIATELY
+  rather than waiting for a clean exit a killed process may never produce —
+  the agent's own late task_done then hits the "not running" guard and is
+  ignored. A cancelled task leaves the button `idle` (nothing was finished,
+  so it stays clickable) and writes a "You stopped this task." system line
+  into the thread. Running actions are clickable on purpose: the click opens
+  the live session, which is where Stop lives.
   Click → hub builds a self-contained prompt (mission + payload + bubble +
   last 150 transcript lines with speaker names + Tier-1 context + date) and
   sends {type:"task", id, title, prompt} DOWN the capture ws

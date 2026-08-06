@@ -1,6 +1,7 @@
 <script setup>
 import { ref, computed, onMounted, nextTick, watch } from "vue";
 import Bubble from "./components/Bubble.vue";
+import ActionSheet from "./components/ActionSheet.vue";
 
 // vite dev (:5173) talks to a local hub; a built dashboard is served BY the
 // hub, so everything is same-origin (and wss behind https)
@@ -362,19 +363,23 @@ function connect() {
       }
     } else if (msg.type === "closeout") closingOut.value = msg.value;
     else if (msg.type === "tasks") tasks.value = msg.tasks;
+    // the user's Claude, talking: streamed into the open action sheet
+    else if (msg.type === "thread") threadFeed.value = msg;
     else if (msg.type === "task_done") {
       // an archived bubble isn't in the broadcast state — patch the open
       // session's copy so its button flips to done/error like a live one
       if (msg.sessionId && msg.sessionId === viewing.value?.id) {
         const b = (viewing.value.bubbles || []).find((x) => x.id === msg.bubbleId);
         const a = b?.actions?.find((x) => x.id === msg.actionId);
-        if (a) a.status = msg.ok ? "done" : "error";
+        if (a) a.status = msg.status || (msg.ok ? "done" : "error");
       }
-      showToast(
-        msg.ok
-          ? `✓ Your Claude finished: ${msg.title}${msg.files?.length ? ` (${msg.files.length} file${msg.files.length > 1 ? "s" : ""} on your device)` : ""}`
-          : `Your Claude couldn't finish "${msg.title}": ${(msg.summary || "").slice(0, 140)}`
-      );
+      if (msg.cancelled) showToast(`Stopped: ${msg.title}`);
+      else
+        showToast(
+          msg.ok
+            ? `✓ Your Claude finished: ${msg.title}${msg.files?.length ? ` (${msg.files.length} file${msg.files.length > 1 ? "s" : ""} on your device)` : ""}`
+            : `Your Claude couldn't finish "${msg.title}": ${(msg.summary || "").slice(0, 140)}`
+        );
     }
     else if (msg.type === "report") {
       showToast(`Session report saved: ${msg.report?.title || "untitled"}`);
@@ -442,29 +447,24 @@ function closeStartAgent() {
   clearTimeout(agentWaitTimer);
 }
 
-async function runAction(bubble, action) {
-  action.status = "busy";
-  try {
-    const res = await fetch(`${HTTP_BASE}/action`, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      // sessionId present = a bubble from the archive: the hub reads it from
-      // Mongo and gives the agent THAT session's transcript as context
-      body: JSON.stringify({ bubbleId: bubble.id, actionId: action.id, sessionId: viewing.value?.id }),
-    });
-    const result = await res.json();
-    // agent actions come back "running": the device agent will flip them to
-    // done/error via a later state broadcast
-    action.status = result.ok ? result.status || "done" : "error";
-    showToast(result.message);
-    // hosted mode: the artifact downloads and this machine's default app opens it
-    if (result.downloadUrl) window.open(`${HTTP_BASE}${result.downloadUrl}`, "_blank");
-    // real Google action: open the created event
-    if (result.link) window.open(result.link, "_blank");
-  } catch (e) {
-    action.status = "error";
-    showToast(`Action failed: ${e.message}`);
-  }
+// Clicking an action opens its Claude session: instructions first, then the
+// live stream of your own Claude working, then as many follow-up turns as you
+// want. The sheet owns the POSTs (it knows the thread); we own the board.
+const pendingAction = ref(null); // { bubble, action, sessionId }
+const threadFeed = ref(null);    // latest {type:"thread"} ws message
+
+function openActionSheet(bubble, action) {
+  pendingAction.value = { bubble, action, sessionId: viewing.value?.id };
+}
+
+// the sheet ran something: reflect it on the button and handle the non-agent
+// outcomes (artifact download, real Google event link)
+function onActionRan(result) {
+  const p = pendingAction.value;
+  if (p) p.action.status = result.ok ? result.status || "done" : "error";
+  if (result.message) showToast(result.message);
+  if (result.downloadUrl) window.open(`${HTTP_BASE}${result.downloadUrl}`, "_blank");
+  if (result.link) window.open(result.link, "_blank");
 }
 
 async function dismiss(bubble) {
@@ -694,7 +694,7 @@ onMounted(async () => {
             :bubble="b"
             :flash="!viewing && flashIds.has(b.id)"
             :archived="Boolean(viewing)"
-            @action="runAction(b, $event)"
+            @action="openActionSheet(b, $event)"
             @dismiss="dismiss(b)"
           />
           <div v-if="viewBubbles.length === 0" key="__empty" class="empty">
@@ -781,6 +781,19 @@ onMounted(async () => {
       </template>
     </div>
   </div>
+
+  <ActionSheet
+    v-if="pendingAction"
+    :key="`${pendingAction.bubble.id}:${pendingAction.action.id}`"
+    :http-base="HTTP_BASE"
+    :bubble="pendingAction.bubble"
+    :action="pendingAction.action"
+    :session-id="pendingAction.sessionId"
+    :feed="threadFeed"
+    @sending="pendingAction.action.status = 'busy'"
+    @ran="onActionRan"
+    @close="pendingAction = null"
+  />
 
   <div v-if="showSettings" class="signin-overlay" @click.self="showSettings = false">
     <div class="signin-card settings-card">
