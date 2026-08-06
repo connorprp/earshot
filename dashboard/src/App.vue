@@ -567,7 +567,7 @@ onMounted(async () => {
         </p>
         <label>Let any Claude of yours search your Earshot conversations (paste in a terminal):</label>
         <div class="keyrow">
-          <code>{{ mcpCommand }}</code>
+          <code class="code-wrap">{{ mcpCommand }}</code>
           <button class="mini" @click="copyMcp">copy</button>
         </div>
       </div>

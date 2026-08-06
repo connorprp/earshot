@@ -200,7 +200,14 @@ body {
   overflow: hidden; text-overflow: ellipsis; min-width: 0;
 }
 .agent-chip .agent-more { font-weight: 700; flex: none; }
-.settings-card { max-width: 480px; text-align: left; align-items: stretch; }
+.settings-card {
+  max-width: min(480px, calc(100vw - 32px));
+  text-align: left; align-items: stretch;
+  /* overflow != visible zeroes the flex-item automatic minimum size, so wide
+     children can never force the card past its max-width again */
+  overflow-x: hidden;
+  max-height: calc(100vh - 48px); overflow-y: auto;
+}
 .settings-card h3 { font-size: 13px; display: flex; justify-content: space-between; }
 .settings-card h3 .ok { color: #3fb950; font-weight: 400; font-size: 11px; }
 .settings-card h3 .bad { color: #f85149; font-weight: 400; font-size: 11px; }
@@ -211,6 +218,11 @@ body {
 .settings-block code {
   font-size: 11px; background: var(--bg); border: 1px solid var(--border);
   padding: 4px 8px; border-radius: 6px; overflow-x: auto; white-space: nowrap;
+}
+/* long one-liners (the MCP add command) wrap instead of inflating the modal:
+   nowrap min-content width beats the card's max-width and blows it open */
+.settings-block code.code-wrap {
+  white-space: pre-wrap; word-break: break-all; line-height: 1.6;
 }
 .keyrow { display: flex; gap: 6px; align-items: center; }
 .keyrow code, .keyrow input { flex: 1; min-width: 0; }
