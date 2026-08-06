@@ -337,11 +337,61 @@ def asr_worker():
 # patterns (mcp__claude_ai_*) silently DENY — verified live. ToolSearch must
 # be allowed too: connector tools are deferred until searched for.
 TASK_TIMEOUT_S = 14 * 60  # hub gives up at 15 min; die first so it hears from us
-TASK_ALLOWED_TOOLS = ",".join([
-    "WebSearch", "WebFetch", "ToolSearch", "mcp__earshot",
-    "mcp__claude_ai_Gmail", "mcp__claude_ai_Google_Calendar",
-    "mcp__claude_ai_Google_Drive", "mcp__claude_ai_Notion",
-])
+TASK_BASE_TOOLS = ["WebSearch", "WebFetch", "ToolSearch", "mcp__earshot"]
+# pre-probe fallback: the most common connectors, allowed blind
+TASK_DEFAULT_CONNECTORS = ["Gmail", "Google Calendar", "Google Drive", "Notion"]
+
+# connected claude.ai connectors, probed once per process via `claude mcp list`
+# (~8s) in a background thread; None until the probe lands. Display names
+# ("Google Calendar") — slugified on use ("claude_ai_Google_Calendar"). Shipped
+# up in caps so the hub can steer the distill toward actions that these apps
+# make real, and used here to auto-allow exactly the user's connected servers.
+_CONNECTORS: list[str] | None = None
+
+
+def _connector_slug(name: str) -> str:
+    import re
+    return "claude_ai_" + re.sub(r"[^A-Za-z0-9]+", "_", name).strip("_")
+
+
+def _task_allowed_tools() -> str:
+    names = _CONNECTORS if _CONNECTORS is not None else TASK_DEFAULT_CONNECTORS
+    return ",".join(TASK_BASE_TOOLS + [f"mcp__{_connector_slug(n)}" for n in names])
+
+
+def _probe_connectors():
+    """`claude mcp list` prints one line per server, claude.ai connectors as
+    'claude.ai <Name>: <url> - ✔ Connected' / '! Needs authentication'."""
+    global _CONNECTORS
+    claude = _find_claude()
+    if not claude:
+        return
+    cmd = [claude, "mcp", "list"]
+    if sys.platform == "win32" and claude.lower().endswith((".cmd", ".bat")):
+        cmd = ["cmd", "/c"] + cmd
+    try:
+        out = subprocess.run(
+            cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=90,
+            creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
+        ).stdout
+    except Exception as e:
+        print(f"[caps] connector probe failed: {e}")
+        return
+    found = []
+    for line in out.splitlines():
+        if line.startswith("claude.ai ") and "Connected" in line and ":" in line:
+            found.append(line[len("claude.ai "):].split(":", 1)[0].strip())
+    _CONNECTORS = found
+    print(f"[caps] connected apps: {', '.join(found) or 'none'}")
+    out_queue.put(_caps_msg())  # update the hub (first caps went out pre-probe)
+
+
+def _caps_msg() -> dict:
+    return {
+        "type": "caps",
+        "claude": _find_claude() is not None,
+        "connectors": _CONNECTORS or [],
+    }
 
 
 def _find_claude() -> str | None:
@@ -412,7 +462,7 @@ def _run_task(msg: dict):
     cmd = [
         claude, "-p", "--output-format", "stream-json", "--verbose",
         "--permission-mode", "acceptEdits",
-        "--allowedTools", TASK_ALLOWED_TOOLS,
+        "--allowedTools", _task_allowed_tools(),
         "--mcp-config", "mcp.json",
         "--max-turns", "60",
     ]
@@ -509,9 +559,10 @@ def ws_sender():
         try:
             with connect(HUB_URL) as ws:
                 print(f"[ws] connected to {HUB_URL}")
-                # capabilities first: the hub routes "agent" actions to this
-                # device only if the user's own Claude Code is runnable here
-                ws.send(json.dumps({"type": "caps", "claude": _find_claude() is not None}))
+                # capabilities first: the hub routes actions to this device
+                # only if the user's own Claude Code is runnable here (a
+                # second caps lands once the connector probe finishes)
+                ws.send(json.dumps(_caps_msg()))
                 threading.Thread(target=_ws_reader, args=(ws,), daemon=True).start()
                 while True:
                     if pending is None:
@@ -541,6 +592,7 @@ def find_devices(p: pyaudio.PyAudio):
 def main():
     threading.Thread(target=asr_worker, daemon=True).start()
     threading.Thread(target=ws_sender, daemon=True).start()
+    threading.Thread(target=_probe_connectors, daemon=True).start()
 
     if IS_MAC:
         import mac_audio

@@ -112,6 +112,7 @@ const recording = ref(false);
 const recPending = ref(false);
 const tasks = ref([]);           // device-agent tasks (hub "tasks" broadcasts)
 const agentAvailable = ref(false); // a capture agent with Claude Code is connected
+const agentConnectors = ref([]);   // apps connected to the user's own Claude
 const bubbles = ref([]);
 const stateSpeakers = ref({});
 const lines = ref([]);
@@ -215,6 +216,7 @@ function connect() {
       claudeConnected.value = msg.claudeConnected;
       googleConnected.value = msg.googleConnected;
       agentAvailable.value = Boolean(msg.agentAvailable);
+      if (Array.isArray(msg.agentConnectors)) agentConnectors.value = msg.agentConnectors;
       if (typeof msg.asrOk === "boolean") asrOk.value = msg.asrOk;
       // agent we were waiting on just connected -> begin recording seamlessly
       if (!hadAgent && msg.captureConnected && showStartAgent.value) {
@@ -560,10 +562,14 @@ onMounted(async () => {
       <div v-if="me" class="settings-block">
         <h3>3 · Your Claude <span :class="(me.agentAvailable || agentAvailable) ? 'ok' : 'bad'">{{ (me.agentAvailable || agentAvailable) ? "agent ready" : "no agent" }}</span></h3>
         <p>
-          Bubble buttons marked as agent tasks (drafting a document, doing research)
-          run on <b>your own Claude</b>, on your computer — install
+          Every bubble button runs on <b>your own Claude</b>, on your computer, using the
+          apps you've already connected to it — install
           <a href="https://claude.com/claude-code" target="_blank">Claude Code</a>, sign in
           once, and the Earshot app does the rest. Watch the topbar while a task runs.
+        </p>
+        <p v-if="agentConnectors.length || me.agentConnectors?.length">
+          Working through your Claude:
+          <b>{{ (agentConnectors.length ? agentConnectors : me.agentConnectors).join(", ") }}</b>
         </p>
         <label>Let any Claude of yours search your Earshot conversations (paste in a terminal):</label>
         <div class="keyrow">

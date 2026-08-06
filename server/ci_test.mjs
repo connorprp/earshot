@@ -203,7 +203,7 @@ try {
   const capDown = [];
   taskCap.on("message", (d) => capDown.push(JSON.parse(d)));
   await new Promise((r) => taskCap.on("open", r));
-  taskCap.send(JSON.stringify({ type: "caps", claude: true }));
+  taskCap.send(JSON.stringify({ type: "caps", claude: true, connectors: ["Gmail", "Google Drive"] }));
   await sleep(300);
   const dashT = [];
   const aliceDashT = await new Promise((resolve) => {
@@ -213,6 +213,8 @@ try {
   });
   await sleep(300);
   check("dashboard hears agentAvailable after caps", dashT.some((m) => m.type === "status" && m.agentAvailable === true));
+  check("status carries the user's connected apps",
+    dashT.some((m) => m.type === "status" && m.agentConnectors?.includes("Gmail")));
   const seedBubble = (cookie, id, title = "John Smith support") =>
     fetch(`${BASE}/test/seed-bubble`, {
       method: "POST", headers: { cookie, "content-type": "application/json" },
@@ -264,6 +266,24 @@ try {
   const calTask = capDown.filter((m) => m.type === "task").find((m) => m.prompt.includes("Membership sync"));
   check("calendar task prefers connectors, falls back to .ics",
     !!calTask && calTask.prompt.includes("mcp__claude_ai_Google_Calendar") && calTask.prompt.includes(".ics"));
+  check("task prompt names the verified connected apps", !!calTask && calTask.prompt.includes("verified connected: Gmail, Google Drive"));
+  // notes (and every other type) route through the user's Claude too
+  await fetch(`${BASE}/test/seed-bubble`, {
+    method: "POST", headers: { cookie: alice, "content-type": "application/json" },
+    body: JSON.stringify({
+      id: "b-note", title: "Note routing", summary: "s",
+      actions: [{ id: "a1", type: "note", label: "Save as note", status: "idle",
+        payload: { title: "Meeting note", markdown: "note body" } }],
+    }),
+  });
+  const noteRes = await (await fetch(`${BASE}/action`, {
+    method: "POST", headers: { cookie: alice, "content-type": "application/json" },
+    body: JSON.stringify({ bubbleId: "b-note", actionId: "a1" }),
+  })).json();
+  await sleep(300);
+  const noteTask = capDown.filter((m) => m.type === "task").find((m) => m.prompt.includes("Meeting note"));
+  check("note action routes to the user's own Claude (Notion/Drive mission)",
+    noteRes.status === "running" && !!noteTask && noteTask.prompt.includes("Notion"));
   // bob has no Claude-capable agent: same clicks fall back to artifacts
   await seedBubble(bob, "b-task-bob", "Bob fallback test");
   const fb = await (await fetch(`${BASE}/action`, {

@@ -149,6 +149,7 @@ class Tenant {
       asrMode: this.asrMode,
       asrOk: this.asrMode !== "groq" || groqConfigured,
       agentAvailable: Boolean(this.agentSocket()),
+      agentConnectors: this.agentConnectors(),
     };
   }
 
@@ -161,6 +162,29 @@ class Tenant {
   agentSocket() {
     for (const ws of this.captureSockets) if (ws.readyState === 1 && ws._caps?.claude) return ws;
     return null;
+  }
+
+  // apps connected to the user's own Claude (claude.ai connectors), as
+  // reported by their capture agent — steers both the distill (which action
+  // buttons to offer) and the task missions (where deliverables land)
+  agentConnectors() {
+    const all = new Set();
+    for (const ws of this.captureSockets)
+      if (ws.readyState === 1 && ws._caps?.claude) for (const c of ws._caps.connectors || []) all.add(c);
+    return [...all];
+  }
+
+  // appended to the distill context live (caps can change mid-session)
+  connectorContext() {
+    const apps = this.agentConnectors();
+    if (!apps.length) return "";
+    return (
+      `\nAction buttons execute through the user's own Claude agent, which has these apps ` +
+      `connected: ${apps.join(", ")}. Prefer actions those apps make REAL (email → Gmail draft, ` +
+      `scheduling → Google Calendar event, notes/docs → Notion or Drive, spreadsheets → Google ` +
+      `Sheets, tasks → Asana/Linear/monday) and word labels accordingly ("Draft in Gmail", ` +
+      `"Add to Google Calendar").`
+    );
   }
 
   tasksMsg() {
@@ -201,6 +225,35 @@ class Tenant {
         `- If the subject or body is thin, complete it from the conversation context below.`,
       ].join("\n");
     }
+    if (action.type === "note") {
+      return [
+        `Save this note for the user:`,
+        JSON.stringify(p, null, 1),
+        ``,
+        `- FIRST run ToolSearch — the user's connected apps are deferred tools that only appear after a search.`,
+        `- Save it where the user keeps notes: a Notion page if Notion is connected, else a Google Doc (Google Drive create_file) titled like the note.`,
+        `- Only if neither is connected (never try to authenticate anything): write it as a .md file in the current working directory.`,
+      ].join("\n");
+    }
+    if (action.type === "spreadsheet") {
+      return [
+        `Create this spreadsheet for the user:`,
+        JSON.stringify(p, null, 1),
+        ``,
+        `- FIRST run ToolSearch — the user's connected apps are deferred tools that only appear after a search.`,
+        `- If Google Drive is connected, create it as a real Google Sheet (create_file supports Google Workspace types) so the user can open and extend it.`,
+        `- Only if Drive isn't connected (never try to authenticate anything): write a .csv in the current working directory.`,
+      ].join("\n");
+    }
+    if (action.type === "claude_code") {
+      return [
+        `Prepare this coding task for the user:`,
+        JSON.stringify(p, null, 1),
+        ``,
+        `- Write the full brief to a "<slug>-brief.md" file in the current working directory so the user can hand it to a coding session with repo access.`,
+        `- You have no repository access here — do NOT attempt the code changes; sharpen the brief instead (acceptance criteria, files likely involved if the conversation named any).`,
+      ].join("\n");
+    }
     return p.brief || bubble.summary || "";
   }
 
@@ -224,7 +277,7 @@ class Tenant {
       `Current datetime: ${new Date().toString()}`,
       ``,
       `# Instructions`,
-      `- The user's own connected apps may be available as mcp__claude_ai_* tools (Gmail, Google Calendar, Google Drive, Notion, ...). They are DEFERRED — run ToolSearch to load them before concluding one isn't connected. Prefer them whenever the task calls for a real-world object (an email draft, a calendar event, a shared doc). Never authenticate or connect a new service, and never SEND email — drafts only.`,
+      `- The user's own connected apps are available as mcp__claude_ai_* tools${this.agentConnectors().length ? ` — verified connected: ${this.agentConnectors().join(", ")}` : " (Gmail, Google Calendar, Google Drive, ...)"}. They are DEFERRED — run ToolSearch to load them before concluding one isn't connected. Prefer them whenever the task calls for a real-world object (an email draft, a calendar event, a shared doc). Never authenticate or connect a new service, and never SEND email — drafts only.`,
       `- Otherwise produce the deliverable as one or more files in the current working directory (markdown unless the task clearly calls for another format).`,
       `- An "earshot" MCP server is connected, holding the user's past recorded conversations (list_sessions, get_session, get_transcript, search_transcripts, get_live_board). Use it when the task needs context beyond the transcript above.`,
       `- The transcript is speech-to-text: words get garbled and tense/agency can flip. Hedge uncertain facts rather than inventing specifics.`,
@@ -384,8 +437,14 @@ class Tenant {
     // capability + task events work regardless of recording: bubbles stay
     // actionable after Stop, so their agent tasks must too
     if (ev.type === "caps" && ws) {
-      ws._caps = { claude: Boolean(ev.claude) };
-      this.log(`capture caps: claude ${ws._caps.claude ? "available" : "not found"}`);
+      ws._caps = {
+        claude: Boolean(ev.claude),
+        connectors: Array.isArray(ev.connectors) ? ev.connectors.slice(0, 40).map(String) : [],
+      };
+      this.log(
+        `capture caps: claude ${ws._caps.claude ? "available" : "not found"}` +
+          (ws._caps.connectors.length ? ` (${ws._caps.connectors.join(", ")})` : "")
+      );
       this.broadcast(this.status());
       return;
     }
@@ -482,7 +541,7 @@ class Tenant {
     this.distilling = true;
     this.broadcast({ type: "distilling", value: true });
     try {
-      const ops = await distill(this.state, lines, this.distillNote, this.claudeEnv, this.sessionContext);
+      const ops = await distill(this.state, lines, this.distillNote, this.claudeEnv, this.sessionContext + this.connectorContext());
       this.log(`distill: ${lines.length} lines -> ${ops.length} ops`);
       let changed = applyOps(this.state, ops);
       if (changed) {
@@ -919,6 +978,7 @@ const server = http.createServer(async (req, res) => {
         wsUrl: `${proto}://${req.headers.host}/ingest`,
         mcpUrl: `${https ? "https" : "http"}://${req.headers.host}/mcp`,
         agentAvailable: Boolean(t.agentSocket()),
+        agentConnectors: t.agentConnectors(),
         captureConnected: t.captureSockets.size > 0,
         claudeConnected: t.claudeConnected,
         googleConfigured,
@@ -1050,15 +1110,12 @@ const server = http.createServer(async (req, res) => {
       res.statusCode = 404;
       return res.end(JSON.stringify({ ok: false, message: "not found" }));
     }
-    // Preference order for actions with real-world side effects: the user's
-    // OWN Claude on their device (it already has their Gmail/Calendar/Drive
-    // connected via claude.ai connectors) → hub-side Google (if they linked
-    // it here) → artifact file. Calendar without a start time skips the agent
-    // so executeAction can return its "edit the bubble first" message.
-    const agentRoutable =
-      action.type === "agent" ||
-      action.type === "email" ||
-      (action.type === "calendar" && (action.payload || {}).start);
+    // EVERY action prefers the user's OWN Claude on their device (it already
+    // has their Gmail/Calendar/Drive/Notion connected via claude.ai
+    // connectors) → hub-side Google (if linked here) → artifact file.
+    // Calendar without a start time skips the agent so executeAction can
+    // return its "edit the bubble first" message.
+    const agentRoutable = action.type !== "calendar" || Boolean((action.payload || {}).start);
     if (agentRoutable) {
       const task = t.dispatchTask(bubble, action);
       if (task) {

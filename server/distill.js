@@ -85,6 +85,12 @@ Rules:
   recording belongs to. Ground identities in it: prefer its real names/emails
   for participants, action payloads (attendees, to:), and the speakers op.
   People in the meeting's attendee list are the most likely voices.
+- CONTEXT may also list apps connected to the user's own Claude agent (which
+  executes every action button). Weight action choices toward what those apps
+  make real — e.g. with Gmail connected an email action produces an actual
+  draft, with Google Calendar a real event, with Notion/Drive real notes and
+  sheets — and let labels say so ("Draft in Gmail"). Without such a list,
+  actions still work but produce files.
 - Output [] if the new lines change nothing.`;
 
 function upcomingDays(now, n = 14) {

@@ -129,23 +129,37 @@ bills the shared server key — it runs on the user's OWN Claude Code login on
 their machine, the only sanctioned path (the server can't hold subscription
 auth — see Claude auth notes).
 
-- **Device tasks (write side):** actions with real-world side effects route
-  by preference: **the user's own Claude on their device → hub Google (if
-  linked) → artifact file**. Routed types: "agent" (new distill action type,
-  {title, brief}, preferred over "note" for work products), "calendar", and
-  "email" — the last two use the user's ALREADY-CONNECTED claude.ai
-  connectors (Gmail/Calendar surface in their Claude Code as
-  mcp__claude_ai_* tools), so nobody connects Google to Earshot for actions.
-  Click → hub builds a self-contained prompt (type-specific mission +
-  payload + bubble + last 150 transcript lines with speaker names + Tier-1
-  context + date) and sends {type:"task", id, title, prompt} DOWN the
-  capture ws (Tenant.dispatchTask). main.py spawns `claude -p` (prompt via
-  stdin — no argv quoting issues; stream-json out) in
-  <app-data>/Earshot/tasks/<id>. Guardrails: NO Bash, `--permission-mode
-  acceptEdits` (file writes jailed to the task dir), allowlist =
-  WebSearch/WebFetch/ToolSearch + mcp__earshot + the claude.ai connector
-  servers (Gmail, Google_Calendar, Google_Drive, Notion); email missions say
-  DRAFT only, never send; 14-min watchdog (hub times out at 15). Progress
+- **Device tasks (write side):** EVERY action type routes by preference:
+  **the user's own Claude on their device → hub Google (if linked) →
+  artifact file** (Connor's call 2026-08-05: notes/spreadsheets too, not
+  just side-effect types; only a calendar action missing its start time
+  skips the agent). Type-specific missions: calendar → real Google Calendar
+  event; email → Gmail DRAFT (never send); note → Notion page or Google
+  Doc; spreadsheet → real Google Sheet; claude_code → sharpened brief file;
+  agent → free-form work product. Every mission carries its own fallback
+  ("if not connected, write the .ics/.eml/.md/.csv in cwd — never
+  authenticate anything"), so nobody connects Google to Earshot for actions.
+  **Connector awareness:** capture probes `claude mcp list` (~8s, background
+  thread, cached per process) and ships the user's CONNECTED claude.ai
+  connectors in its caps message; the hub (a) appends them to every distill
+  prompt (connectorContext) so the model offers actions those apps make real
+  — verified live: labels changed to "Add to Google Calendar" / "Create
+  tasks in Asana" / "Save specs to Google Drive" — (b) names them in each
+  task prompt as "verified connected", and (c) shows them in Settings.
+  Click → hub builds a self-contained prompt (mission + payload + bubble +
+  last 150 transcript lines with speaker names + Tier-1 context + date) and
+  sends {type:"task", id, title, prompt} DOWN the capture ws
+  (Tenant.dispatchTask). main.py spawns `claude -p` (prompt via stdin — no
+  argv quoting issues; stream-json out) in <app-data>/Earshot/tasks/<id>.
+  Guardrails: NO Bash, `--permission-mode acceptEdits` (file writes jailed
+  to the task dir), allowlist = WebSearch/WebFetch/ToolSearch +
+  mcp__earshot + server-level rules for exactly the user's connected
+  connectors (pre-probe fallback: Gmail/Calendar/Drive/Notion); email
+  missions say DRAFT only, never send; 14-min watchdog (hub times out at
+  15). NOTE: allowing all connected connectors is Connor's
+  breadth-over-caution call — a Groundhogg/QuickBooks connector means those
+  tools run without asking too; revisit if coworkers get sensitive
+  connectors. Progress
   streams back as {type:"task_update", note} / {type:"task_done", ok,
   summary, files}; hub tracks tenant.tasks, broadcasts {type:"tasks"},
   flips the action button running→done/error, and the deliverables folder
