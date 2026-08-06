@@ -22,6 +22,8 @@ jobs:
           curl -sL -o capture/models/nemo_en_titanet_small.onnx \
             https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/nemo_en_titanet_small.onnx
       - run: cd capture && python ci_test_mac.py
+      # deliverable links + the guardrails on opening them (posix branch)
+      - run: python capture/test_links.py
 
   hub-auth:
     runs-on: ubuntu-latest
@@ -46,6 +48,9 @@ jobs:
       - uses: actions/setup-python@v5
         with: { python-version: "3.12", cache: pip }
       - run: pip install -r capture/requirements-win-cpu.txt pystray pillow pyinstaller
+      # deliverable links + the guardrails on opening them (windows branch:
+      # os.startfile, and the executable extensions that matter most here)
+      - run: python capture/test_links.py
       - name: Build
         run: >
           pyinstaller --noconfirm --onefile --windowed --name EarshotCapture

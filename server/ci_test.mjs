@@ -371,13 +371,55 @@ try {
       method: "POST", headers: { cookie: alice, "content-type": "application/json" },
       body: JSON.stringify({ threadId: thId, text: "hi" }),
     })).json()).ok === false);
-  taskCap.send(JSON.stringify({ type: "task_done", id: tid, ok: true, summary: "Note saved.", files: ["note.md"] }));
+  taskCap.send(JSON.stringify({
+    type: "task_done", id: tid, ok: true, summary: "Note saved.", files: ["note.md", "brief.docx"],
+    links: [
+      { label: "Open the brief", file: "brief.docx" },
+      { label: "Open the Gmail draft", url: "https://mail.google.com/mail/u/0/#drafts?compose=abc" },
+      { label: "Nonsense", url: "javascript:alert(1)" }, // neither url nor file survives
+      { label: "Empty" },
+    ],
+  }));
   await sleep(300);
   const th2 = await (await fetch(
     `${BASE}/thread?bubbleId=b-thread&actionId=a1`, { headers: { cookie: alice } })).json();
   check("the result lands in the thread and the session becomes resumable",
     th2.thread.messages.at(-1).role === "result" && th2.thread.claudeSessionId === "claude-sess-1" &&
     th2.running === false);
+  // what the agent made comes back as things the user can open
+  const done = th2.thread.messages.at(-1);
+  check("the result carries openable deliverables",
+    done.links?.length === 2 && done.links[0].file === "brief.docx" &&
+    done.links[1].url.startsWith("https://mail.google.com"),
+    JSON.stringify(done.links));
+  check("a link with no usable target is dropped",
+    !done.links.some((l) => l.label === "Nonsense" || l.label === "Empty"));
+  check("the dashboard hears the deliverables on task_done",
+    dashT.some((m) => m.type === "task_done" && m.links?.some((l) => l.file === "brief.docx")));
+  const openRes = await (await fetch(`${BASE}/thread/open`, {
+    method: "POST", headers: { cookie: alice, "content-type": "application/json" },
+    body: JSON.stringify({ threadId: thId, file: "brief.docx" }),
+  })).json();
+  await sleep(200);
+  check("opening a deliverable asks the device that holds it",
+    openRes.ok === true && capDown.some((m) => m.type === "open" && m.file === "brief.docx" && m.threadId === thId));
+  await fetch(`${BASE}/thread/open`, {
+    method: "POST", headers: { cookie: alice, "content-type": "application/json" },
+    body: JSON.stringify({ threadId: thId, file: "../../etc/passwd" }),
+  });
+  await sleep(200);
+  check("a path never reaches the device — only a bare name",
+    capDown.filter((m) => m.type === "open").every((m) => !m.file.includes("/") && !m.file.includes("\\")));
+  check("opening an unknown thread 404s",
+    (await fetch(`${BASE}/thread/open`, {
+      method: "POST", headers: { cookie: alice, "content-type": "application/json" },
+      body: JSON.stringify({ threadId: "th-nope", file: "x.docx" }),
+    })).status === 404);
+  check("bob cannot open alice's deliverables",
+    (await fetch(`${BASE}/thread/open`, {
+      method: "POST", headers: { cookie: bob, "content-type": "application/json" },
+      body: JSON.stringify({ threadId: thId, file: "brief.docx" }),
+    })).status === 404);
   check("an empty reply is refused",
     (await (await fetch(`${BASE}/thread/reply`, {
       method: "POST", headers: { cookie: alice, "content-type": "application/json" },

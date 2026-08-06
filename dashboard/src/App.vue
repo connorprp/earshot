@@ -377,7 +377,7 @@ function connect() {
       else
         showToast(
           msg.ok
-            ? `✓ Your Claude finished: ${msg.title}${msg.files?.length ? ` (${msg.files.length} file${msg.files.length > 1 ? "s" : ""} on your device)` : ""}`
+            ? `✓ Your Claude finished: ${msg.title}${msg.links?.length ? " — click the action to open what it made" : ""}`
             : `Your Claude couldn't finish "${msg.title}": ${(msg.summary || "").slice(0, 140)}`
         );
     }
@@ -792,6 +792,7 @@ onMounted(async () => {
     :feed="threadFeed"
     @sending="pendingAction.action.status = 'busy'"
     @ran="onActionRan"
+    @toast="showToast"
     @close="pendingAction = null"
   />
 

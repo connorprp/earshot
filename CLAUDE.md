@@ -243,6 +243,27 @@ auth — see Claude auth notes).
   sheet always shows the latest. `action.threadId` is stored on the bubble so
   the button shows a 💬 and reopens the session — including in the archive
   (setBubbleActionStatus takes `{notes, threadId}`).
+  **Deliverables (2026-08-06):** a finished task ends with things the user can
+  OPEN, not just prose. The mission prompt asks the agent to close its reply
+  with a fenced ```earshot-links block —
+  `[{"label","file"}|{"label","url"}]` — which capture parses out of the final
+  text (`_parse_links`), strips from the summary, and validates: a `file` must
+  exist directly inside that thread's task dir, a `url` must be http(s).
+  Whatever the model forgets, every NEW file in the task dir still gets an
+  "Open <name>" link, so the buttons appear even with no cooperation. They ride
+  task_done → the thread's result message → buttons in the sheet: a url is a
+  plain anchor, a file POSTs /thread/open, which sends `{type:"open",
+  threadId, file}` down the capture ws (`_open_path`) — the browser can't
+  reach a file on the user's machine and file:// links are blocked from an
+  https page, so opening happens on the device that holds it. Guardrails:
+  the hub strips path separators (a bare NAME crosses the wire), capture
+  re-validates against the tasks root, and it refuses to launch runnable
+  extensions (`_NEVER_OPEN`: .exe/.bat/.ps1/.lnk/…) — opening the folder
+  instead, so a prompt-injected agent can't hand the user a one-click payload.
+  This REPLACED the old auto-open of the deliverables folder on completion:
+  with real buttons, a window opening itself on every finished turn is noise.
+  Tests: capture/test_links.py (parsing + the open guardrails, run on Windows
+  and macOS in CI).
   **Stop (2026-08-06):** POST /thread/cancel → hub sends
   `{type:"task_cancel", id}` down the capture ws (capture keeps `_RUNNING`
   task_id → Popen and kills it), and the hub finishes the task IMMEDIATELY
@@ -268,8 +289,8 @@ auth — see Claude auth notes).
   connectors. Progress
   streams back as {type:"task_update", note} / {type:"task_done", ok,
   summary, files}; hub tracks tenant.tasks, broadcasts {type:"tasks"},
-  flips the action button running→done/error, and the deliverables folder
-  opens on the user's machine (when files were written). Task events bypass
+  flips the action button running→done/error, and the finished task's
+  deliverables become clickable buttons (see "Deliverables" above). Task events bypass
   the recording gate (bubbles stay actionable after Stop). Capture agents
   advertise {type:"caps", claude:true} on connect — _find_claude() checks
   PATH plus common install dirs because Finder/Explorer-launched apps get a

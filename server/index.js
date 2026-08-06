@@ -320,6 +320,13 @@ class Tenant {
       `- An "earshot" MCP server is connected, holding the user's past recorded conversations (list_sessions, get_session, get_transcript, search_transcripts, get_live_board). Use it when the task needs context beyond the transcript above.`,
       `- The transcript is speech-to-text: words get garbled and tense/agency can flip. Hedge uncertain facts rather than inventing specifics.`,
       `- End with a 2-3 sentence summary of what you produced (mention where it landed: Gmail draft, calendar, or files).`,
+      // the dashboard turns this into real buttons — a file opens on the
+      // user's machine, a url opens in their browser
+      `- Then, as the LAST thing in your reply, list what you made so the user can open it, in a fenced block exactly like this (omit the block only if you produced nothing):`,
+      "```earshot-links",
+      `[{"label": "Open the proposal", "file": "proposal.docx"}, {"label": "Open the Gmail draft", "url": "https://mail.google.com/mail/u/0/#drafts?compose=..."}]`,
+      "```",
+      `  Use "file" for something you wrote in the working directory (name only, no path) and "url" for anything that lives on the web — the real link to the draft, event, doc, sheet or page you created, never a guessed one. Label them the way a person would say it out loud.`,
     ].join("\n");
   }
 
@@ -483,6 +490,16 @@ class Tenant {
     task.status = ev.cancelled ? "cancelled" : ev.ok ? "done" : "error";
     task.note = String(ev.summary || "").slice(0, 600);
     task.files = Array.isArray(ev.files) ? ev.files.slice(0, 20).map(String) : [];
+    // what the agent made, as things the user can actually open: a file (the
+    // device agent opens it) or a url (the browser does)
+    task.links = (Array.isArray(ev.links) ? ev.links : [])
+      .slice(0, 12)
+      .map((l) => ({
+        label: String(l.label || "Open").slice(0, 80),
+        ...(String(l.url || "").startsWith("http") ? { url: String(l.url).slice(0, 500) } : {}),
+        ...(l.file ? { file: String(l.file).slice(0, 200) } : {}),
+      }))
+      .filter((l) => l.url || l.file);
     task.endedAt = Date.now();
     // a stopped task leaves the button clickable again — nothing was finished
     const buttonStatus = task.status === "cancelled" ? "idle" : task.status;
@@ -506,7 +523,7 @@ class Tenant {
         [
           task.status === "cancelled"
             ? { role: "system", text: "You stopped this task." }
-            : { role: "result", text: task.note, ok: ev.ok === true, files: task.files },
+            : { role: "result", text: task.note, ok: ev.ok === true, files: task.files, links: task.links },
         ],
         { status: task.status === "error" ? "error" : "idle", lastTaskId: null }
       );
@@ -518,6 +535,7 @@ class Tenant {
       title: task.title,
       summary: task.note,
       files: task.files,
+      links: task.links,
       bubbleId: task.bubbleId,
       actionId: task.actionId,
       sessionId: task.sessionId,
@@ -1489,6 +1507,30 @@ const server = http.createServer(async (req, res) => {
       return res.end(JSON.stringify({ ok: false, message: "Your Claude agent isn't connected on this computer." }));
     t.appendThread(thread, [{ role: "user", text: message }], { status: "running", lastTaskId: task.id });
     return res.end(JSON.stringify({ ok: true, status: "running" }));
+  }
+
+  // open a deliverable. The file is on the USER's machine (a browser can't
+  // reach it, and file:// links are blocked from an https page), so the click
+  // becomes a request to the device agent that holds it.
+  if (req.method === "POST" && urlPath === "/thread/open") {
+    let body = "";
+    for await (const chunk of req) body += chunk;
+    const { threadId, file } = JSON.parse(body || "{}");
+    res.setHeader("content-type", "application/json");
+    const thread = await t.threadById(String(threadId || ""));
+    if (!thread) {
+      res.statusCode = 404;
+      return res.end(JSON.stringify({ ok: false, message: "not found" }));
+    }
+    const ws = t.agentSocket();
+    if (!ws)
+      return res.end(
+        JSON.stringify({ ok: false, message: "That file is on the computer that ran the task — start Earshot there to open it." })
+      );
+    // a name, never a path: the agent re-checks this against its task folder
+    const name = String(file || "").replace(/[\\/]/g, "").slice(0, 200);
+    ws.send(JSON.stringify({ type: "open", threadId: thread.id, file: name }));
+    return res.end(JSON.stringify({ ok: true, message: name ? `Opening ${name} on your computer.` : "Opening the folder on your computer." }));
   }
 
   // stop a task mid-flight (the kill happens on the user's machine)

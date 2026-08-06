@@ -28,6 +28,7 @@ import io
 import json
 import os
 import queue
+import re
 import shutil
 import subprocess
 import threading
@@ -500,6 +501,77 @@ def _stream_items(ev: dict) -> list[dict]:
     return items
 
 
+# Deliverables can't be opened from the dashboard: the browser may be on
+# another machine, and file:// links are blocked from an https page. So the
+# agent reports WHAT it produced, and opening it happens here, on the device
+# that holds it. Executables are never opened by a click — a task's own agent
+# writes into the task dir, and a prompt-injected one must not be able to hand
+# the user a one-click .bat.
+_NEVER_OPEN = {
+    ".exe", ".bat", ".cmd", ".com", ".scr", ".msi", ".ps1", ".vbs", ".vbe",
+    ".js", ".jse", ".wsf", ".wsh", ".hta", ".jar", ".reg", ".lnk", ".app", ".sh",
+}
+_LINK_BLOCK = re.compile(r"```earshot-links\s*(.+?)```", re.S)
+
+
+def _parse_links(text: str, tdir: Path) -> tuple[str, list[dict]]:
+    """Pull the agent's machine-readable result block out of its final summary:
+
+        ```earshot-links
+        [{"label": "Open the proposal", "file": "proposal.docx"},
+         {"label": "Open the Gmail draft", "url": "https://mail.google.com/..."}]
+        ```
+
+    Returns (summary without the block, links). Anything malformed is ignored —
+    the caller still falls back to the files that appeared in the task dir.
+    """
+    links: list[dict] = []
+    m = _LINK_BLOCK.search(text)
+    if m:
+        text = (text[: m.start()] + text[m.end():]).strip()
+        try:
+            for it in json.loads(m.group(1).strip())[:12]:
+                if not isinstance(it, dict):
+                    continue
+                label = str(it.get("label") or "").strip()[:80]
+                url, name = str(it.get("url") or "").strip(), str(it.get("file") or "").strip()
+                if url.startswith(("http://", "https://")):
+                    links.append({"label": label or "Open", "url": url[:500]})
+                elif name:
+                    # only a real file, only inside this task's directory
+                    p = (tdir / name).resolve()
+                    if p.is_file() and p.parent == tdir.resolve():
+                        links.append({"label": label or f"Open {p.name}", "file": p.name})
+        except Exception as e:
+            print(f"[task] links block ignored ({e})")
+    return text, links
+
+
+def _open_path(thread_id: str, name: str) -> None:
+    """The dashboard asked to open a deliverable. It names a file inside a task
+    directory — never a path, never anything runnable."""
+    root = _tasks_root().resolve()
+    tdir = (root / thread_id).resolve()
+    target = tdir if not name else (tdir / name).resolve()
+    if not (target == tdir or target.parent == tdir) or not str(target).startswith(str(root)):
+        return print(f"[task] refused to open outside the task folder: {name}")
+    if not target.exists():
+        return print(f"[task] nothing to open at {target}")
+    if target.is_file() and target.suffix.lower() in _NEVER_OPEN:
+        print(f"[task] refusing to launch {target.name} — opening its folder instead")
+        target = tdir
+    try:
+        if sys.platform == "win32":
+            os.startfile(target)  # noqa: S606
+        elif IS_MAC:
+            subprocess.Popen(["open", str(target)])
+        else:
+            subprocess.Popen(["xdg-open", str(target)])
+        print(f"[task] opened {target}")
+    except Exception as e:
+        print(f"[task] could not open {target}: {e}")
+
+
 def _run_task(msg: dict):
     task_id, title, prompt = str(msg.get("id") or ""), str(msg.get("title") or "task"), str(msg.get("prompt") or "")
     thread_id = str(msg.get("threadId") or "")
@@ -507,8 +579,13 @@ def _run_task(msg: dict):
     if not task_id or not prompt:
         return
 
-    def done(ok: bool, summary: str, files: list[str] | None = None):
-        out_queue.put({"type": "task_done", "id": task_id, "ok": ok, "summary": summary[:600], "files": files or []})
+    def done(ok: bool, summary: str, files: list[str] | None = None, links: list[dict] | None = None):
+        out_queue.put({
+            "type": "task_done", "id": task_id, "ok": ok, "summary": summary[:600],
+            "files": files or [], "links": links or [],
+            # the dashboard needs this to ask us to open one of those files
+            "threadId": thread_id,
+        })
 
     claude = _find_claude()
     if not claude:
@@ -593,18 +670,14 @@ def _run_task(msg: dict):
     )
     if not result_text:
         result_text = "The agent produced no result (timed out or crashed — see stderr.log in the task folder)."
+    result_text, links = _parse_links(result_text, tdir)
+    # whatever the agent forgot to list, the new files still get a button
+    named = {l.get("file") for l in links}
+    for name in sorted(set(files) - before):
+        if name not in named:
+            links.append({"label": f"Open {name}", "file": name})
     print(f"[task] {task_id} {'done' if ok else 'FAILED'}: {result_text[:120]}")
-    done(ok, result_text, files)
-    # only NEW deliverables pop the folder open: a follow-up turn that just
-    # answers a question shouldn't throw a window at the user
-    if ok and set(files) - before:
-        try:
-            if sys.platform == "win32":
-                os.startfile(tdir)  # noqa: S606
-            elif IS_MAC:
-                subprocess.Popen(["open", str(tdir)])
-        except Exception:
-            pass
+    done(ok, result_text, files, links)
 
 
 def _cancel_task(task_id: str):
@@ -627,6 +700,8 @@ def _handle_downlink(msg: dict):
         threading.Thread(target=_run_task, args=(msg,), daemon=True).start()
     elif msg.get("type") == "task_cancel":
         _cancel_task(str(msg.get("id") or ""))
+    elif msg.get("type") == "open":
+        _open_path(str(msg.get("threadId") or ""), str(msg.get("file") or ""))
     elif msg.get("type") == "transcript" and msg.get("text"):
         # groq mode: the hub transcribed our audio — run the same echo-gate
         # text-evidence path the local branch of asr_worker runs

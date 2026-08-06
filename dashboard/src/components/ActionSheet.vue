@@ -15,7 +15,9 @@ const props = defineProps({
   // latest {type:"thread"} ws message; we take the ones addressed to us
   feed: { type: Object, default: null },
 });
-const emit = defineEmits(["sending", "ran", "close"]);
+// "ran" = the action itself was dispatched (the button's status follows it);
+// "toast" = just tell the user something, the button is unaffected
+const emit = defineEmits(["sending", "ran", "toast", "close"]);
 
 const draft = ref(props.action.userNotes || "");
 const box = ref(null);
@@ -129,7 +131,7 @@ async function send() {
       if (r.ok) running.value = true;
       else {
         draft.value = text; // give it back rather than swallowing what they wrote
-        emit("ran", r);
+        emit("toast", r.message);
       }
     } finally {
       busy.value = false;
@@ -163,6 +165,19 @@ async function send() {
   }
 }
 
+// deliverables live on the machine that ran the task, so opening one is a
+// request to that agent — not a link this browser could ever follow
+async function openFile(file) {
+  const r = await (
+    await fetch(`${props.httpBase}/thread/open`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ threadId: thread.value?.id, file: file || "" }),
+    })
+  ).json();
+  emit("toast", r.message);
+}
+
 async function stop() {
   const r = await (
     await fetch(`${props.httpBase}/thread/cancel`, {
@@ -172,7 +187,7 @@ async function stop() {
     })
   ).json();
   if (r.ok) running.value = false;
-  else emit("ran", r);
+  else emit("toast", r.message);
 }
 
 function onKey(e) {
@@ -219,7 +234,16 @@ onBeforeUnmount(() => {
             <div class="result" :class="{ bad: m.ok === false }">
               <b>{{ m.ok === false ? "✗ didn't finish" : "✓ done" }}</b>
               <span class="msg-text">{{ m.text }}</span>
-              <p v-if="m.files?.length" class="files">wrote: {{ m.files.join(", ") }}</p>
+              <!-- what it made, as things you can actually open: a url goes to
+                   the browser, a file opens on the computer that ran the task -->
+              <div v-if="m.links?.length || m.files?.length" class="deliverables">
+                <template v-for="(l, j) in m.links || []" :key="j">
+                  <a v-if="l.url" class="mini dl" :href="l.url" target="_blank" rel="noopener">↗ {{ l.label }}</a>
+                  <button v-else class="mini dl" @click="openFile(l.file)">📄 {{ l.label }}</button>
+                </template>
+                <button v-if="m.files?.length" class="mini" @click="openFile('')">open the folder</button>
+              </div>
+              <p v-if="m.files?.length" class="files">on your computer: {{ m.files.join(", ") }}</p>
             </div>
           </template>
           <template v-else-if="m.role === 'system'">
@@ -329,6 +353,8 @@ label { font-size: 11px; color: var(--dim); }
 }
 .result.bad { border-color: #f85149; }
 .result .files { margin: 0; font-size: 11px; color: var(--dim); }
+.deliverables { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 2px; }
+.deliverables .mini { text-decoration: none; }
 .sys { color: var(--dim); font-size: 11px; }
 .working { color: var(--dim); font-size: 11px; align-items: center; }
 
