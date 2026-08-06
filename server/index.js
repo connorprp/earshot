@@ -73,6 +73,7 @@ const ECHO_WINDOW_MS = 15_000;   // a "them" line this recent can claim a "me" l
 const ECHO_HOLD_MS = 6_000;      // "me" lines wait this long in case their "them" twin arrives late
 const ECHO_OVERLAP = 0.62;       // fraction of "me" tokens fuzzy-found in one "them" line = echo
 const TASK_TIMEOUT_MS = 15 * 60 * 1000; // device-agent task with no task_done by then = error
+const PRIMARY_IDLE_MS = 15_000;  // stream ownership can pass to another agent after this much silence
 const TASK_PRUNE_MS = 60_000;    // finished tasks linger this long in the dashboard task list
 
 // Shared server-side API key (sk-ant-api03-…): when set, EVERY tenant's
@@ -116,6 +117,8 @@ class Tenant {
     this.heldMe = new Set();    // { ev, tokens, timer } "me" lines waiting out ECHO_HOLD_MS
     this.dashboards = new Set();
     this.captureSockets = new Set();
+    this.primaryCapture = null;  // the one capture socket whose audio we ingest
+    this.primaryLastAt = 0;      // last stream event from it (ownership can pass when quiet)
     this.sessionContext = ""; // Tier-1 context: directory + current calendar meeting
     this.googleConnected = false;
     this.asrMode = defaultAsrMode(); // "local" | "groq"; user pref overrides on hydration
@@ -149,6 +152,7 @@ class Tenant {
     return {
       type: "status",
       captureConnected: this.captureSockets.size > 0,
+      captureAgents: this.captureSockets.size, // >1 = duplicate audio, extras muted
       claudeConnected: this.claudeConnected,
       googleConnected: this.googleConnected,
       asrMode: this.asrMode,
@@ -474,6 +478,45 @@ class Tenant {
     this.state.rev++;
   }
 
+  // ---- one capture agent owns the stream ----
+  // Several agents on one account hear the SAME microphone, so every utterance
+  // arrives once per agent — verified in production 2026-08-06: four instances
+  // of the app (one an old build whose single-instance guard predated the
+  // feature) stored every line 4x, each with slightly different ASR wording.
+  // Extra agents stay CONNECTED (caps, tasks and config all keep working);
+  // only their stream events are dropped, before any Groq spend. Ownership
+  // passes on close or after PRIMARY_IDLE_MS of silence, so a real handoff
+  // (machine swapped, agent restarted) heals itself with no reconnect fight —
+  // and a duplicate can never slip through the gap, because whichever copy of
+  // an utterance lands first takes ownership and mutes the rest.
+  streamOwner(ws) {
+    if (!ws) return true; // hub-generated (groq re-entry), already gated on the way in
+    const now = Date.now();
+    if (this.primaryCapture !== ws) {
+      const free =
+        !this.primaryCapture ||
+        this.primaryCapture.readyState !== 1 ||
+        now - this.primaryLastAt > PRIMARY_IDLE_MS;
+      if (!free) {
+        if (!ws._muted) {
+          ws._muted = true;
+          this.log(
+            `duplicate capture agent streaming (${this.captureSockets.size} connected) — ignoring its audio; ` +
+              `quit the extra copies of the Earshot app`
+          );
+          this.broadcast(this.status());
+        }
+        return false;
+      }
+      this.primaryCapture = ws;
+      ws._muted = false;
+      if (this.captureSockets.size > 1) this.log(`capture stream owner changed (${this.captureSockets.size} agents connected)`);
+      this.broadcast(this.status());
+    }
+    this.primaryLastAt = now;
+    return true;
+  }
+
   // ---- capture ingest ----
   handleCaptureEvent(ev, ws) {
     // capability + task events work regardless of recording: bubbles stay
@@ -492,6 +535,8 @@ class Tenant {
     }
     if (ev.type === "task_update" || ev.type === "task_done") return this.handleTaskEvent(ev);
     if (!this.recording) return; // not recording: nothing shown, saved, or sent to Groq
+    // audio/transcript/voice-profile events come from exactly one agent
+    if ((ev.type === "transcript" || ev.type === "audio" || ev.type === "speakers") && !this.streamOwner(ws)) return;
     if (ev.type === "speakers" && Array.isArray(ev.speakers)) {
       this.speakerProfiles = ev.speakers;
       persistSpeakers(this.sessionId, this.speakerProfiles, [...this.activeSpeakers]);
@@ -1023,6 +1068,7 @@ const server = http.createServer(async (req, res) => {
         agentAvailable: Boolean(t.agentSocket()),
         agentConnectors: t.agentConnectors(),
         captureConnected: t.captureSockets.size > 0,
+        captureAgents: t.captureSockets.size,
         claudeConnected: t.claudeConnected,
         googleConfigured,
         googleConnected: Boolean(user.googleTokenEnc),
@@ -1296,6 +1342,8 @@ wss.on("connection", (ws, req) => {
     });
     ws.on("close", () => {
       t.captureSockets.delete(ws);
+      // the stream owner left: the next agent to send audio takes over
+      if (t.primaryCapture === ws) t.primaryCapture = null;
       t.broadcast(t.status());
     });
   } else {

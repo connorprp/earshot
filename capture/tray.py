@@ -86,14 +86,46 @@ def http_json(url, payload=None):
         return json.loads(r.read())
 
 
+_INSTANCE_LOCK = None  # kept alive for the process lifetime; the OS frees it on exit
+
+
 def already_running():
-    """Single-instance guard: an earshot:// click while the app is already
-    capturing must not spawn a second pipeline fighting over the devices."""
-    if sys.platform != "win32":
-        return False
-    import ctypes
-    ctypes.windll.kernel32.CreateMutexW(None, False, "EarshotCaptureSingleton")
-    return ctypes.windll.kernel32.GetLastError() == 183  # ERROR_ALREADY_EXISTS
+    """Single-instance guard: a second copy would open the SAME microphone and
+    send every utterance twice (the hub mutes duplicates now, but the machine
+    still pays the CPU and the user still sees two tray icons).
+
+    Two layers, because neither covers everything: a named mutex on Windows
+    (immune to a lock file left behind by a hard kill) and an exclusive lock
+    file everywhere — which is the only guard that works on macOS, where this
+    used to return False and happily start a second capture pipeline.
+    """
+    global _INSTANCE_LOCK
+    if sys.platform == "win32":
+        # ctypes.windll does NOT preserve the Win32 last-error across the call;
+        # use_last_error + get_last_error() is the documented way to read it
+        import ctypes
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.CreateMutexW(None, False, "EarshotCaptureSingleton")
+        if ctypes.get_last_error() == 183:  # ERROR_ALREADY_EXISTS
+            return True
+    try:
+        os.makedirs(app_dir(), exist_ok=True)
+        _INSTANCE_LOCK = open(os.path.join(app_dir(), "instance.lock"), "a+")
+        _INSTANCE_LOCK.seek(0)
+        if sys.platform == "win32":
+            import msvcrt
+            msvcrt.locking(_INSTANCE_LOCK.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(_INSTANCE_LOCK, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return True  # someone else holds it
+    try:
+        _INSTANCE_LOCK.write(f"\n{os.getpid()}")
+        _INSTANCE_LOCK.flush()
+    except OSError:
+        pass
+    return False
 
 
 def register_protocol():
@@ -231,7 +263,14 @@ if __name__ == "__main__":
         sys.exit(0)
     setup_logging()
     if already_running():
+        # opening the dashboard makes the click DO something — a silent exit is
+        # why a user clicks again (and again): four agents on one account, every
+        # line captured four times, is exactly how this bug got reported
         print("[app] already running — exiting second instance")
+        try:
+            webbrowser.open((load_config() or {}).get("hub", DEFAULT_HUB))
+        except Exception as e:  # noqa: BLE001 — never let this block the exit
+            print(f"[app] could not open the dashboard: {e}")
         sys.exit(0)
     register_protocol()
     try:

@@ -422,6 +422,21 @@ Tier-1 calendar CONTEXT (the record-start fetch runs hub-side).
   needs `--collect-all faster_whisper` or every segment errors NO_SUCHFILE
   while the app looks perfectly connected (2026-08-05: shipped exe captured
   nothing for exactly this reason; CI smoke now asserts the asset exists).
+- **Two capture agents on one account = every line stored twice** (four = 4x).
+  They hear the same microphone, so duplication looks like an ASR bug but is a
+  process-count bug — the copies differ slightly ("it's not even, it's not." vs
+  "…, it's not, it's not.") because each segments independently. Diagnosed
+  2026-08-06 from a dupRatio of 1.6-1.8 on the day's sessions; cause was four
+  live EarshotCapture.exe instances, three of them an older download whose
+  single-instance guard predated the feature (a stale exe stays stale — after
+  changing capture code, CI builds it but `sync-apps.sh` on rusty is what
+  publishes it). Fixes: the hub now ingests stream events from ONE capture
+  socket per tenant (`Tenant.streamOwner`, ownership passes on close or 15s of
+  silence; extras stay connected for tasks/caps and cost zero Groq spend), the
+  dashboard shows a "⚠ N capture agents" chip, and tray.py's guard gained an
+  exclusive lock file (the mutex was Windows-only — macOS had NO guard at all)
+  plus it opens the dashboard when it exits as a second instance, so a click
+  that "does nothing" doesn't invite three more.
 - **Audio interfaces can idle above SPEECH_RMS** (Focusrite floor ~0.0135 vs
   0.010 threshold) → segmenter saw never-ending speech. Segmenter now tracks
   a per-stream noise floor (fast fall, slow rise) and requires

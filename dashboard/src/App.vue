@@ -53,6 +53,7 @@ function dismissPair() {
 }
 const me = ref(null);            // /me payload when the settings panel is open
 const captureConnected = ref(true); // optimistic until a status message says otherwise
+const captureAgents = ref(0);       // >1 = duplicate agents on the account (extras muted by the hub)
 const claudeConnected = ref(true);
 const googleConnected = ref(false);
 const asrOk = ref(true); // false = groq mode selected but the server has no GROQ_API_KEY
@@ -347,6 +348,7 @@ function connect() {
     else if (msg.type === "status") {
       const hadAgent = captureConnected.value;
       captureConnected.value = msg.captureConnected;
+      if (typeof msg.captureAgents === "number") captureAgents.value = msg.captureAgents;
       claudeConnected.value = msg.claudeConnected;
       googleConnected.value = msg.googleConnected;
       agentAvailable.value = Boolean(msg.agentAvailable);
@@ -542,6 +544,14 @@ onMounted(async () => {
       title="No capture agent is streaming audio for your account"
     >
       ⚠ no capture agent
+    </button>
+    <button
+      v-if="connected && captureAgents > 1"
+      class="warn-chip"
+      @click="openSettings"
+      title="More than one Earshot app is capturing for your account. They all hear the same microphone, so only one is used — quit the extras from the tray."
+    >
+      ⚠ {{ captureAgents }} capture agents
     </button>
     <button
       v-if="connected && !asrOk"
@@ -782,6 +792,11 @@ onMounted(async () => {
         <p>
           Audio is captured by the Earshot app on your computer. Download it, open it,
           and click <b>Allow this computer</b> when this page asks — that's the whole setup.
+        </p>
+        <p v-if="captureAgents > 1" class="signin-error">
+          ⚠ <b>{{ captureAgents }} copies of the app</b> are capturing for your account. They all hear
+          the same microphone, so Earshot uses one and ignores the rest — quit the extras
+          (tray icon → Quit) so nothing competes.
         </p>
         <div class="keyrow">
           <a class="mini dl" :href="`${HTTP_BASE}/installer/app/windows`">⬇ Earshot for Windows</a>

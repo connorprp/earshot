@@ -436,6 +436,44 @@ try {
   fs.writeFileSync(path.join(aliceOut, "ci-secret.md"), "alice's eyes only");
   check("alice can download her file", (await fetch(`${BASE}/files/ci-secret.md`, { headers: { cookie: alice } })).status === 200);
   check("bob cannot see alice's file", (await fetch(`${BASE}/files/ci-secret.md`, { headers: { cookie: bob } })).status === 404);
+
+  // ---- duplicate capture agents (the 4x-transcript bug) ----
+  // Two agents on one account hear the same mic; only the first to speak owns
+  // the stream, so a line must be ingested ONCE no matter how many are running.
+  await fetch(`${BASE}/record/start`, { method: "POST", headers: { cookie: alice } }); // lines are gated on recording
+  const dupA = new WebSocket(`ws://127.0.0.1:${PORT}/ingest?key=key-alice`);
+  const dupB = new WebSocket(`ws://127.0.0.1:${PORT}/ingest?key=key-alice`);
+  await Promise.all([dupA, dupB].map((w) => new Promise((r) => w.on("open", r))));
+  const dupDash = [];
+  const dupWs = await new Promise((resolve) => {
+    const ws = new WebSocket(`ws://127.0.0.1:${PORT}`, { headers: { cookie: alice } });
+    ws.on("message", (d) => dupDash.push(JSON.parse(d)));
+    ws.on("open", () => resolve(ws));
+  });
+  await sleep(200);
+  check("status reports how many capture agents are connected",
+    dupDash.some((m) => m.type === "status" && m.captureAgents >= 2));
+  const dupLine = (ws, text) =>
+    ws.send(JSON.stringify({ type: "transcript", source: "them", text, ts: Date.now() / 1000 }));
+  dupLine(dupA, "the quarterly numbers land on friday");
+  await sleep(120);
+  dupLine(dupB, "the quarterly numbers land on friday"); // same speech, second agent
+  dupLine(dupB, "the quarterly numbers land on friday.");
+  await sleep(400);
+  const dupSeen = dupDash.filter((m) => m.type === "transcript" && m.text.startsWith("the quarterly numbers"));
+  check("a line from two agents is ingested once", dupSeen.length === 1, `got ${dupSeen.length}`);
+  check("the hub logged the duplicate agent", log.includes("duplicate capture agent streaming"));
+  // ownership must survive the owner going quiet mid-conversation, then pass on close
+  dupA.close();
+  await sleep(300);
+  dupLine(dupB, "and the board meeting moves to tuesday");
+  await sleep(400);
+  check("the remaining agent takes over when the owner disconnects",
+    dupDash.some((m) => m.type === "transcript" && m.text.startsWith("and the board meeting")));
+  dupB.close(); dupWs.terminate();
+  await sleep(200);
+  // deliberately left recording: Stop would flush a distill against the fake CI
+  // Claude token and sit in SDK retries for minutes
 } finally {
   hub.kill();
 }
