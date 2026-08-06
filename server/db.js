@@ -24,6 +24,18 @@ function guarded(promise) {
   return promise.catch((e) => console.error("[db] write failed:", e.message));
 }
 
+// session ids arrive as ObjectIds from the live tenant and as strings from the
+// archive routes (an action clicked on a past session)
+function oid(v) {
+  if (!v) return null;
+  if (v instanceof ObjectId) return v;
+  try {
+    return new ObjectId(String(v));
+  } catch {
+    return null;
+  }
+}
+
 export async function initDb() {
   try {
     const client = new MongoClient(URI, { serverSelectionTimeoutMS: 8000 });
@@ -208,21 +220,23 @@ export function persistOps(userId, sessionId, ops) {
 }
 
 export function persistBubble(userId, sessionId, bubble) {
-  if (!db || !sessionId) return;
+  const _id = oid(sessionId);
+  if (!db || !_id) return;
   guarded(
     db.collection("bubbles").updateOne(
-      { sessionId, bubbleId: bubble.id },
-      { $set: { ...bubble, userId, sessionId, bubbleId: bubble.id, removed: false } },
+      { sessionId: _id, bubbleId: bubble.id },
+      { $set: { ...bubble, userId, sessionId: _id, bubbleId: bubble.id, removed: false } },
       { upsert: true }
     )
   );
 }
 
 export function persistRemoval(sessionId, bubbleId, reason) {
-  if (!db || !sessionId) return;
+  const _id = oid(sessionId);
+  if (!db || !_id) return;
   guarded(
     db.collection("bubbles").updateOne(
-      { sessionId, bubbleId },
+      { sessionId: _id, bubbleId },
       { $set: { removed: true, removedReason: reason, removedAt: new Date() } }
     )
   );
@@ -262,26 +276,149 @@ export async function saveSessionReport(sessionId, fields) {
 }
 
 // ---- read side (session browsing/export), always scoped to one user ----
-export async function listSessions(userId, limit = 20) {
+// Voice centroids (session.speakers) are big and useless to readers, so every
+// read path here projects them out.
+const NO_CENTROIDS = { speakers: 0 };
+
+function escRx(s) {
+  return String(s).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/**
+ * Session list for the sidebar / MCP list_sessions, newest first.
+ * opts: { q, limit } — q searches the closeout report (title, summary,
+ * decisions, open items, participants), the linked calendar event, AND every
+ * transcript line; sessions matched through their transcript carry
+ * { matches, snippet } so the UI can show why they hit.
+ */
+export async function listSessions(userId, opts = {}) {
   if (!db) return [];
-  return db.collection("sessions").find({ userId }, { sort: { startedAt: -1 }, limit }).toArray();
+  const { q = "", limit = 30 } = typeof opts === "number" ? { limit: opts } : opts;
+  const match = { userId };
+  let hits = new Map();
+
+  const query = String(q || "").trim();
+  if (query) {
+    const rx = { $regex: escRx(query), $options: "i" };
+    const rows = await db
+      .collection("transcripts")
+      .aggregate([
+        { $match: { userId, text: rx } },
+        { $sort: { ts: 1 } },
+        { $group: { _id: "$sessionId", matches: { $sum: 1 }, snippet: { $first: "$text" } } },
+        { $limit: 300 },
+      ])
+      .toArray()
+      .catch(() => []);
+    hits = new Map(rows.map((r) => [String(r._id), { matches: r.matches, snippet: r.snippet }]));
+    match.$or = [
+      { "report.title": rx },
+      { "report.summary": rx },
+      { "report.decisions": rx },
+      { "report.openItems": rx },
+      { "report.participants": rx },
+      { "calendarEvent.title": rx },
+      ...(hits.size ? [{ _id: { $in: rows.map((r) => r._id) } }] : []),
+    ];
+  }
+
+  const rows = await db
+    .collection("sessions")
+    .aggregate([
+      { $match: match },
+      { $sort: { startedAt: -1 } },
+      { $limit: Math.min(Number(limit) || 30, 200) },
+      // counts by lookup rather than a stored counter, so sessions recorded
+      // before this feature existed still show accurate numbers
+      { $lookup: { from: "transcripts", localField: "_id", foreignField: "sessionId", as: "lc", pipeline: [{ $count: "n" }] } },
+      { $lookup: { from: "bubbles", localField: "_id", foreignField: "sessionId", as: "bc", pipeline: [{ $match: { removed: { $ne: true } } }, { $count: "n" }] } },
+      {
+        $addFields: {
+          lineCount: { $ifNull: [{ $first: "$lc.n" }, 0] },
+          bubbleCount: { $ifNull: [{ $first: "$bc.n" }, 0] },
+        },
+      },
+      { $project: { ...NO_CENTROIDS, lc: 0, bc: 0 } },
+    ])
+    .toArray()
+    .catch((e) => {
+      console.error("[db] listSessions failed:", e.message);
+      return [];
+    });
+
+  return rows.map((r) => ({ ...r, ...(hits.get(String(r._id)) || {}) }));
 }
 
 export async function getSession(userId, id) {
   if (!db) return null;
   const _id = new ObjectId(id);
   const [session, transcript, bubbles] = await Promise.all([
-    db.collection("sessions").findOne({ _id, userId }),
-    db.collection("transcripts").find({ sessionId: _id }, { sort: { ts: 1 } }).toArray(),
-    db.collection("bubbles").find({ sessionId: _id }).toArray(),
+    db.collection("sessions").findOne({ _id, userId }, { projection: NO_CENTROIDS }),
+    db.collection("transcripts").find({ sessionId: _id, userId }, { sort: { ts: 1 } }).toArray(),
+    db.collection("bubbles").find({ sessionId: _id, userId }).toArray(),
   ]);
   return session ? { session, transcript, bubbles } : null;
+}
+
+// ---- archived-bubble actions (clicking a button on a past session) ----
+// One bubble out of a past session, shaped like a live board bubble.
+export async function getSessionBubble(userId, sessionId, bubbleId) {
+  if (!db) return null;
+  const _id = oid(sessionId);
+  if (!_id) return null;
+  return db
+    .collection("bubbles")
+    .findOne(
+      { sessionId: _id, bubbleId, userId },
+      { projection: { _id: 0, sessionId: 0, bubbleId: 0, userId: 0 } }
+    )
+    .catch(() => null);
+}
+
+// that session's own context for the task prompt: its last N lines + the names
+// its distiller inferred, so the agent never reads the LIVE conversation
+export async function getSessionTail(userId, sessionId, limit = 150) {
+  if (!db) return null;
+  const _id = oid(sessionId);
+  if (!_id) return null;
+  const session = await db
+    .collection("sessions")
+    .findOne(
+      { _id, userId },
+      { projection: { speakerNames: 1, startedAt: 1, endedAt: 1, report: 1, calendarEvent: 1 } }
+    )
+    .catch(() => null);
+  if (!session) return null;
+  const rows = await db
+    .collection("transcripts")
+    .find(
+      { sessionId: _id, userId },
+      { sort: { ts: -1 }, limit, projection: { _id: 0, text: 1, source: 1, speaker: 1, ts: 1 } }
+    )
+    .toArray()
+    .catch(() => []);
+  return { session, lines: rows.reverse() };
+}
+
+// targeted status write so a click on an archived bubble never rewrites (or
+// un-removes) the rest of the stored doc
+export function setBubbleActionStatus(userId, sessionId, bubbleId, actionId, status) {
+  if (!db) return;
+  const _id = oid(sessionId);
+  if (!_id) return;
+  guarded(
+    db.collection("bubbles").updateOne(
+      { sessionId: _id, bubbleId, userId },
+      { $set: { "actions.$[a].status": status, actionRunAt: new Date() } },
+      { arrayFilters: [{ "a.id": actionId }] }
+    )
+  );
 }
 
 // full-history text search for the MCP read side (regex, newest first)
 export async function searchTranscripts(userId, query, limit = 30) {
   if (!db) return [];
-  const esc = query.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const esc = escRx(query);
   return db
     .collection("transcripts")
     .find(

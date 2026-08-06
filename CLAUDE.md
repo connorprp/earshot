@@ -56,9 +56,12 @@ server/     Node ESM — ws hub (fan-in capture, fan-out dashboards), distill
             distill and sets endedAt; ingest lines are dropped while not
             recording. Hub restart < 30 min after last activity resumes an
             unfinished session (already recording) and restores the live
-            board; Mongo down = warn + memory-only, never crash. GET
-            /sessions and /sessions/:id serve the read side. Scripts run
+            board; Mongo down = warn + memory-only, never crash. Read side:
+            GET /sessions (searchable list), /sessions/:id, and
+            /sessions/:id/export (see "Session archive"). Scripts run
             node with --env-file-if-exists=server/.env.
+            export.js — one renderer for md / txt / json exports, shared by
+            the archive and the live board.
             Echo suppression, layer 2 (backstop): "me" lines wait in a 6s
             hold and are dropped when ≥62% of their tokens FUZZY-match (4-char
             prefix — mic-path ASR garbles word tails) one "them" line within
@@ -76,7 +79,8 @@ server/     Node ESM — ws hub (fan-in capture, fan-out dashboards), distill
             bubble (clears the flag), and bubbles still unconfirmed after 4
             distills are auto-archived (removedReason "stale-restore").
 dashboard/  Vue 3 + Vite — bubble grid (TransitionGroup morphing), transcript
-            ticker, action buttons POST /action, ✕ POSTs /dismiss.
+            ticker, action buttons POST /action, ✕ POSTs /dismiss, plus the
+            session sidebar (search + click-to-reopen) and Export menu.
 out/        action artifacts (.ics, .eml, .csv, *-brief.md, notes.md)
 scripts/    inject.js — fake-conversation replayer
 ```
@@ -121,6 +125,50 @@ that never recv are fine: their local transcripts are accepted regardless of
 asrMode (a user picking cloud with an old agent silently stays local).
 Settings surface: GET /me (asrMode/asrModel/asrModels/groqConfigured),
 POST /me/asr, "⚠ transcription offline" chip when groq mode lacks a key.
+
+## Session archive (searchable sidebar + export)
+
+Added 2026-08-06. Everything ever recorded is reachable from the dashboard, not
+just via MCP.
+
+- **Sidebar** (☰ in the topbar toggles it): "Live board" pinned at top, then
+  every session grouped by day (Today / Yesterday / weekday / date) with
+  title (closeout report title → calendar event title → start time), start
+  time, duration, line + concept counts, and flags (`open` = never stopped,
+  `continues` = chained conversationId, `on board` = the session whose
+  bubbles are currently live).
+- **Search** (debounced 250ms) hits BOTH sides in `db.listSessions`: session
+  fields (report title/summary/decisions/openItems/participants, calendar
+  event title) and every transcript line — transcript matches come back with
+  `{matches, snippet}` and the sidebar shows the matching line, so "what did
+  we say about the newsletter" finds the session by its words. Counts come
+  from `$lookup` (not a stored counter) so pre-feature sessions are accurate.
+  MCP `list_sessions` takes the same optional `query`.
+- **Reopening** a session renders it in place of the live board: closeout
+  report card (summary / participants / decisions / open items), its bubbles,
+  and its full transcript in the ticker with speaker names resolved. Live ws
+  updates keep flowing into the live refs behind it, so "← live board" is
+  instant; pressing Record snaps back automatically.
+- **Archived actions are real actions.** A click in the archive posts
+  `{bubbleId, actionId, sessionId}`; the hub loads that bubble from Mongo
+  (`getSessionBubble`) and builds the task prompt from THAT session's last 150
+  lines + its speaker names + its report (`getSessionTail`), never the live
+  conversation, with an explicit "this was recorded on <date>, resolve
+  relative dates against it" preamble. Routing is unchanged (user's Claude →
+  hub Google → artifact). Status is written with `setBubbleActionStatus`
+  (targeted `arrayFilters` update, so a stored doc is never rewritten or
+  un-removed) and the `task_done` broadcast carries bubbleId/actionId/
+  sessionId so the open archive view flips the button like a live one.
+  Bubbles keep no ✕ in the archive (history isn't dismissed after the fact).
+  Post-Stop clicks on the live board now persist too — that path used
+  `t.sessionId` (null after Stop) and now uses `boardSessionId()`.
+- **Export** (any view): `GET /sessions/:id/export?format=md|txt|json`,
+  `id=live` for the current board. md = report + concepts + full transcript,
+  txt = speaker-labeled transcript, json = everything machine-readable.
+  Downloads are cookie-authed and tenant-scoped; the live board works even
+  with Mongo down (memory fallback in the route).
+- Read paths project session.speakers (voice centroids) out — big and useless
+  to readers. `getPreviousSession` still gets them (closeout voice match).
 
 ## User's-own-Claude integration (device agent tasks + MCP)
 
@@ -398,6 +446,10 @@ resolves), spreadsheet action fired successfully.
 
 Persistence: DONE via MongoDB (see db.js above) — full transcripts, bubbles,
 ops, sessions; resume-on-restart verified.
+
+Session archive: DONE (2026-08-06) — searchable sidebar, click-to-reopen,
+md/txt/json export (see "Session archive" above). Verified against the real
+dev cluster + CI.
 
 Record/Stop: DONE — dashboard topbar button drives /record/start|stop;
 session boundaries are now manual (capture streams constantly, hub gates).

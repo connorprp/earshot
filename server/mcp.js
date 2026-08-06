@@ -13,10 +13,13 @@ const TOOLS = [
   {
     name: "list_sessions",
     description:
-      "List the user's recent Earshot recording sessions (most recent first): id, title, summary, when, participants.",
+      "List the user's recent Earshot recording sessions (most recent first): id, title, summary, when, participants. Pass query to keep only sessions whose report OR transcript mentions something.",
     inputSchema: {
       type: "object",
-      properties: { limit: { type: "number", description: "max sessions to return (default 20)" } },
+      properties: {
+        limit: { type: "number", description: "max sessions to return (default 20)" },
+        query: { type: "string", description: "optional text filter (searches reports and transcripts)" },
+      },
     },
   },
   {
@@ -89,8 +92,19 @@ async function callTool(tenant, name, args = {}) {
   const userId = tenant.userId;
   switch (name) {
     case "list_sessions": {
-      const rows = await listSessions(userId, Math.min(Number(args.limit) || 20, 100));
-      return text(rows.map(sessionLabel));
+      const rows = await listSessions(userId, {
+        q: String(args.query || ""),
+        limit: Math.min(Number(args.limit) || 20, 100),
+      });
+      return text(
+        rows.map((s) => ({
+          ...sessionLabel(s),
+          lineCount: s.lineCount,
+          // why this session matched a query, when it matched on transcript text
+          matchedLine: s.snippet || undefined,
+          matches: s.matches || undefined,
+        }))
+      );
     }
     case "get_session": {
       const data = await getSession(userId, String(args.id)).catch(() => null);

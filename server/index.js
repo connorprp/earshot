@@ -14,6 +14,7 @@ import { distill, applyOps } from "./distill.js";
 import { executeAction } from "./actions.js";
 import { closeoutSession } from "./closeout.js";
 import { handleMcp } from "./mcp.js";
+import { renderExport } from "./export.js";
 import {
   authEnabled,
   publicConfig,
@@ -54,6 +55,9 @@ import {
   persistRemoval,
   listSessions,
   getSession,
+  getSessionBubble,
+  getSessionTail,
+  setBubbleActionStatus,
   getPreviousSession,
 } from "./db.js";
 
@@ -104,6 +108,7 @@ class Tenant {
     this.speakerProfiles = []; // latest voice-cluster snapshot from capture
     this.activeSpeakers = new Set();
     this.sessionId = null;
+    this.lastSessionId = null;   // the stopped session still on the board (bubbles stay actionable)
     this.sessionStartedAt = null;
     this.distillNote = "";      // context prepended to distills while restored bubbles are unconfirmed
     this.restoreState = null;   // { distills } while provisionally-restored bubbles await confirmation
@@ -257,13 +262,23 @@ class Tenant {
     return p.brief || bubble.summary || "";
   }
 
-  buildTaskPrompt(bubble, action) {
+  // ctx lets an ARCHIVED bubble supply its own session's transcript/names/date
+  // instead of the live board's — running a past session's button must never
+  // read the conversation happening right now
+  buildTaskPrompt(bubble, action, ctx = null) {
     const p = action.payload || {};
-    const names = this.state.speakers || {};
+    const names = ctx ? ctx.speakerNames || {} : this.state.speakers || {};
     const who = (l) => (l.source === "me" ? "Me" : names[l.speaker] || l.speaker || "Them");
-    const transcript = this.transcript.slice(-150).map((l) => `[${who(l)}] ${l.text}`).join("\n");
+    const lines = ctx ? ctx.lines || [] : this.transcript.slice(-150);
+    const transcript = lines.map((l) => `[${who(l)}] ${l.text}`).join("\n");
+    const past = ctx
+      ? `This conversation is NOT happening right now: it was recorded${ctx.title ? ` as "${ctx.title}"` : ""}` +
+        `${ctx.startedAt ? ` on ${new Date(ctx.startedAt).toDateString()}` : ""}, and the user is acting on it after the fact. ` +
+        `Treat any relative dates spoken in it ("Thursday", "next week") relative to that recording date, and prefer explicit dates in what you produce.`
+      : "";
     return [
-      `You are completing a real-world task on behalf of the user ("Me"). It was identified during a live conversation captured by Earshot, an ambient meeting assistant. Work autonomously — nobody is available to answer questions.`,
+      `You are completing a real-world task on behalf of the user ("Me"). It was identified during a ${ctx ? "" : "live "}conversation captured by Earshot, an ambient meeting assistant. Work autonomously — nobody is available to answer questions.`,
+      ...(past ? [``, past] : []),
       ``,
       `# Task: ${p.title || p.subject || action.label || bubble.title}`,
       ``,
@@ -271,8 +286,9 @@ class Tenant {
       ``,
       `# The conversation concept this came from`,
       JSON.stringify({ title: bubble.title, summary: bubble.summary, details: bubble.details || [] }, null, 1),
+      ...(ctx?.report ? [``, `# Report from that session`, JSON.stringify(ctx.report, null, 1)] : []),
       ...(this.sessionContext ? [``, `# Context`, this.sessionContext] : []),
-      ...(transcript ? [``, `# Recent conversation transcript`, transcript] : []),
+      ...(transcript ? [``, `# ${ctx ? "Conversation transcript (that session)" : "Recent conversation transcript"}`, transcript] : []),
       ``,
       `Current datetime: ${new Date().toString()}`,
       ``,
@@ -285,8 +301,9 @@ class Tenant {
     ].join("\n");
   }
 
-  // returns the task if it was dispatched, null if no capable device agent
-  dispatchTask(bubble, action) {
+  // returns the task if it was dispatched, null if no capable device agent.
+  // opts.sessionId + opts.ctx mark it as an archived-session action.
+  dispatchTask(bubble, action, opts = {}) {
     const ws = this.agentSocket();
     if (!ws) return null;
     const id = `t-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
@@ -295,6 +312,7 @@ class Tenant {
       id,
       bubbleId: bubble.id,
       actionId: action.id,
+      sessionId: opts.sessionId || null, // set = the bubble lives in the archive, not on the board
       title: p.title || p.subject || action.label || bubble.title,
       status: "running",
       note: "sent to your device",
@@ -308,7 +326,9 @@ class Tenant {
         TASK_TIMEOUT_MS
       )
     );
-    ws.send(JSON.stringify({ type: "task", id, title: task.title, prompt: this.buildTaskPrompt(bubble, action) }));
+    ws.send(
+      JSON.stringify({ type: "task", id, title: task.title, prompt: this.buildTaskPrompt(bubble, action, opts.ctx || null) })
+    );
     this.log(`task ${id} -> device agent: ${task.title}`);
     this.broadcastTasks();
     return task;
@@ -328,14 +348,29 @@ class Tenant {
     task.note = String(ev.summary || "").slice(0, 600);
     task.files = Array.isArray(ev.files) ? ev.files.slice(0, 20).map(String) : [];
     task.endedAt = Date.now();
-    const bubble = this.state.bubbles.find((b) => b.id === task.bubbleId);
-    const action = bubble?.actions?.find((a) => a.id === task.actionId);
-    if (action) {
-      action.status = task.status;
-      persistBubble(this.userId, this.sessionId, bubble);
-      this.bumpAndBroadcast();
+    if (task.sessionId) {
+      // archived bubble: the board doesn't hold it, so the status goes straight
+      // to its stored doc and the dashboard patches the session it's viewing
+      setBubbleActionStatus(this.userId, task.sessionId, task.bubbleId, task.actionId, task.status);
+    } else {
+      const bubble = this.state.bubbles.find((b) => b.id === task.bubbleId);
+      const action = bubble?.actions?.find((a) => a.id === task.actionId);
+      if (action) {
+        action.status = task.status;
+        persistBubble(this.userId, this.boardSessionId(), bubble);
+        this.bumpAndBroadcast();
+      }
     }
-    this.broadcast({ type: "task_done", ok: ev.ok === true, title: task.title, summary: task.note, files: task.files });
+    this.broadcast({
+      type: "task_done",
+      ok: ev.ok === true,
+      title: task.title,
+      summary: task.note,
+      files: task.files,
+      bubbleId: task.bubbleId,
+      actionId: task.actionId,
+      sessionId: task.sessionId,
+    });
     this.broadcastTasks();
     this.log(`task ${task.id} ${task.status}: ${task.title}`);
     const timer = setTimeout(() => {
@@ -420,12 +455,19 @@ class Tenant {
     this.broadcast({ type: "state", state: this.state });
   }
 
+  // the session the board currently shows: the one recording, or (after Stop)
+  // the one whose bubbles are still up
+  boardSessionId() {
+    return this.sessionId || this.lastSessionId;
+  }
+
   async resume() {
     const r = await resumeSession(this.userId);
     if (!r) return;
     // hub died mid-recording (< 30 min ago): pick up where it left off
     this.recording = true;
     this.sessionId = r.sessionId;
+    this.lastSessionId = r.sessionId;
     this.sessionStartedAt = r.startedAt ? new Date(r.startedAt).getTime() : Date.now();
     this.state.bubbles = r.bubbles;
     this.state.speakers = r.speakerNames || {};
@@ -593,6 +635,7 @@ class Tenant {
     for (const h of [...this.heldMe]) clearTimeout(h.timer);
     this.heldMe.clear();
     this.sessionId = await startSession(this.userId);
+    this.lastSessionId = this.sessionId;
     await this.buildSessionContext();
     // provisional restore: recording again shortly after a stop is often the
     // same conversation resuming — bring the board back and let the distiller
@@ -1065,18 +1108,64 @@ const server = http.createServer(async (req, res) => {
     return res.end(JSON.stringify({ ok: true, recording: false }));
   }
 
-  if (req.method === "GET" && req.url === "/sessions") {
+  // ---- session archive (sidebar nav + export) ----
+  // The list is searchable: q matches closeout reports AND transcript text
+  // (db.listSessions), so "what did we say about pricing" finds the session.
+  if (req.method === "GET" && urlPath === "/sessions") {
+    const q = new URL(req.url, "http://x").searchParams;
+    const sessions = await listSessions(userId, {
+      q: q.get("q") || "",
+      limit: Number(q.get("limit")) || 40,
+    });
     res.setHeader("content-type", "application/json");
-    return res.end(JSON.stringify(await listSessions(userId)));
+    return res.end(
+      JSON.stringify({
+        sessions: sessions.map((s) => ({ ...s, id: String(s._id), _id: undefined })),
+        boardSessionId: t.boardSessionId() ? String(t.boardSessionId()) : null,
+        recording: t.recording,
+      })
+    );
   }
 
-  if (req.method === "GET" && req.url?.startsWith("/sessions/")) {
-    const data = await getSession(userId, req.url.split("/")[2]).catch(() => null);
-    res.setHeader("content-type", "application/json");
+  // id "live" = the session on the board right now. Mongo mirrors the board
+  // line-by-line, so the stored copy is preferred (it also carries the report);
+  // memory is the fallback that keeps export working with Mongo down.
+  if (req.method === "GET" && urlPath.startsWith("/sessions/")) {
+    const [, , id, sub] = urlPath.split("/");
+    const board = t.boardSessionId() ? String(t.boardSessionId()) : null;
+    const isLive = id === "live" || (board && id === board);
+    const lookupId = id === "live" ? board : id;
+    let data = lookupId ? await getSession(userId, lookupId).catch(() => null) : null;
+    if (!data && isLive) {
+      data = {
+        session: {
+          _id: board,
+          startedAt: t.sessionStartedAt ? new Date(t.sessionStartedAt) : null,
+          endedAt: null,
+          speakerNames: t.state.speakers || {},
+          live: true,
+        },
+        transcript: t.transcript,
+        bubbles: t.state.bubbles,
+      };
+    }
     if (!data) {
       res.statusCode = 404;
+      res.setHeader("content-type", "application/json");
       return res.end(JSON.stringify({ ok: false, message: "not found" }));
     }
+    if (sub === "export") {
+      const format = new URL(req.url, "http://x").searchParams.get("format") || "md";
+      const { body, contentType, filename } = renderExport(data, format);
+      res.setHeader("content-type", contentType);
+      res.setHeader("content-disposition", `attachment; filename="${filename}"`);
+      return res.end(body);
+    }
+    if (sub) {
+      res.statusCode = 404;
+      return res.end("not found");
+    }
+    res.setHeader("content-type", "application/json");
     return res.end(JSON.stringify(data));
   }
 
@@ -1094,15 +1183,36 @@ const server = http.createServer(async (req, res) => {
   if (req.method === "POST" && (req.url === "/action" || req.url === "/dismiss")) {
     let body = "";
     for await (const chunk of req) body += chunk;
-    const { bubbleId, actionId } = JSON.parse(body || "{}");
-    const bubble = t.state.bubbles.find((b) => b.id === bubbleId);
+    const { bubbleId, actionId, sessionId } = JSON.parse(body || "{}");
     res.setHeader("content-type", "application/json");
 
     if (req.url === "/dismiss") {
       t.state.bubbles = t.state.bubbles.filter((b) => b.id !== bubbleId);
-      persistRemoval(t.sessionId, bubbleId, "dismissed");
+      persistRemoval(t.boardSessionId(), bubbleId, "dismissed");
       t.bumpAndBroadcast();
       return res.end(JSON.stringify({ ok: true }));
+    }
+
+    // A bubble from a PAST session is just as clickable as a live one; it only
+    // changes where the bubble is read from, which conversation the agent gets
+    // as context, and where the resulting status is written.
+    const board = t.boardSessionId() ? String(t.boardSessionId()) : null;
+    const archivedId = sessionId && sessionId !== "live" && sessionId !== board ? String(sessionId) : null;
+    let bubble, ctx = null;
+    if (archivedId) {
+      bubble = await getSessionBubble(userId, archivedId, bubbleId).catch(() => null);
+      const tail = bubble ? await getSessionTail(userId, archivedId).catch(() => null) : null;
+      if (tail) {
+        ctx = {
+          lines: tail.lines,
+          speakerNames: tail.session.speakerNames || {},
+          startedAt: tail.session.startedAt,
+          title: tail.session.report?.title || tail.session.calendarEvent?.title || "",
+          report: tail.session.report || null,
+        };
+      }
+    } else {
+      bubble = t.state.bubbles.find((b) => b.id === bubbleId);
     }
 
     const action = bubble?.actions?.find((a) => a.id === actionId);
@@ -1117,11 +1227,15 @@ const server = http.createServer(async (req, res) => {
     // return its "edit the bubble first" message.
     const agentRoutable = action.type !== "calendar" || Boolean((action.payload || {}).start);
     if (agentRoutable) {
-      const task = t.dispatchTask(bubble, action);
+      const task = t.dispatchTask(bubble, action, archivedId ? { sessionId: archivedId, ctx } : {});
       if (task) {
         action.status = "running";
-        persistBubble(userId, t.sessionId, bubble);
-        t.bumpAndBroadcast();
+        if (archivedId) {
+          setBubbleActionStatus(userId, archivedId, bubbleId, actionId, "running");
+        } else {
+          persistBubble(userId, t.boardSessionId(), bubble);
+          t.bumpAndBroadcast();
+        }
         return res.end(
           JSON.stringify({ ok: true, status: "running", message: `Your Claude is on it: ${task.title}` })
         );
@@ -1136,8 +1250,12 @@ const server = http.createServer(async (req, res) => {
       result = { ok: false, message: String(e.message || e) };
     }
     action.status = result.ok ? "done" : "error";
-    persistBubble(userId, t.sessionId, bubble);
-    t.bumpAndBroadcast();
+    if (archivedId) {
+      setBubbleActionStatus(userId, archivedId, bubbleId, actionId, action.status);
+    } else {
+      persistBubble(userId, t.boardSessionId(), bubble);
+      t.bumpAndBroadcast();
+    }
     return res.end(JSON.stringify(result));
   }
 

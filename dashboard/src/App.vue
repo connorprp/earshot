@@ -1,5 +1,5 @@
 <script setup>
-import { ref, computed, onMounted, nextTick } from "vue";
+import { ref, computed, onMounted, nextTick, watch } from "vue";
 import Bubble from "./components/Bubble.vue";
 
 // vite dev (:5173) talks to a local hub; a built dashboard is served BY the
@@ -131,10 +131,141 @@ const speakerNames = computed(() => {
 
 const runningTasks = computed(() => tasks.value.filter((t) => t.status === "running"));
 
+// ---- session archive: searchable sidebar + export ----
+// viewing === null means the live board; otherwise it holds a loaded past
+// session ({session, transcript, bubbles}) and the board renders THAT, while
+// live ws updates keep flowing into the live refs behind it.
+const NARROW = 720; // below this the sidebar overlays the board instead of splitting it
+const sidebarOpen = ref(window.innerWidth > NARROW);
+const sessions = ref([]);
+const sessionSearch = ref("");
+const sessionsLoading = ref(false);
+const boardSessionId = ref(null); // the session the live board belongs to
+const viewing = ref(null);
+const viewLoading = ref(false);
+const showDismissed = ref(false);
+const showExport = ref(false);
+const tickerTall = ref(false); // a past session is read, not glanced at — its transcript gets room
+
+async function loadSessions() {
+  sessionsLoading.value = true;
+  try {
+    const q = sessionSearch.value.trim();
+    const res = await fetch(`${HTTP_BASE}/sessions?limit=60${q ? `&q=${encodeURIComponent(q)}` : ""}`);
+    if (!res.ok) return;
+    const data = await res.json();
+    sessions.value = data.sessions || [];
+    boardSessionId.value = data.boardSessionId || null;
+  } catch {
+    /* hub unreachable: keep the list we already have */
+  } finally {
+    sessionsLoading.value = false;
+  }
+}
+
+let searchTimer;
+watch(sessionSearch, () => {
+  clearTimeout(searchTimer);
+  searchTimer = setTimeout(loadSessions, 250);
+});
+
+function sessionTitle(s) {
+  if (!s) return "Session";
+  return (
+    s.report?.title ||
+    s.calendarEvent?.title ||
+    (s.startedAt ? `${new Date(s.startedAt).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" })} session` : "Untitled session")
+  );
+}
+
+function timeLabel(iso) {
+  return iso ? new Date(iso).toLocaleTimeString([], { hour: "numeric", minute: "2-digit" }) : "";
+}
+
+function fullStamp(iso) {
+  return iso ? new Date(iso).toLocaleString([], { dateStyle: "medium", timeStyle: "short" }) : "";
+}
+
+function dayLabel(iso) {
+  if (!iso) return "Undated";
+  const d = new Date(iso);
+  const midnight = (x) => new Date(x.getFullYear(), x.getMonth(), x.getDate()).getTime();
+  const days = Math.round((midnight(new Date()) - midnight(d)) / 86400000);
+  if (days === 0) return "Today";
+  if (days === 1) return "Yesterday";
+  if (days < 7) return d.toLocaleDateString([], { weekday: "long" });
+  return d.toLocaleDateString([], { month: "short", day: "numeric", year: d.getFullYear() === new Date().getFullYear() ? undefined : "numeric" });
+}
+
+function durationLabel(s) {
+  const end = s.endedAt || s.lastActivityAt;
+  if (!s.startedAt || !end) return "";
+  const min = Math.max(1, Math.round((new Date(end) - new Date(s.startedAt)) / 60000));
+  return min >= 60 ? `${Math.floor(min / 60)}h ${min % 60}m` : `${min}m`;
+}
+
+const groupedSessions = computed(() => {
+  const groups = [];
+  for (const s of sessions.value) {
+    const label = dayLabel(s.startedAt);
+    if (!groups.length || groups[groups.length - 1].label !== label) groups.push({ label, items: [] });
+    groups[groups.length - 1].items.push(s);
+  }
+  return groups;
+});
+
+async function openSession(s) {
+  if (s.id && s.id === boardSessionId.value) return backToLive(); // that session IS the board
+  viewLoading.value = true;
+  try {
+    const res = await fetch(`${HTTP_BASE}/sessions/${s.id}`);
+    if (!res.ok) return showToast("Couldn't open that session.");
+    const data = await res.json();
+    viewing.value = { id: s.id, meta: s, ...data };
+    showDismissed.value = false;
+    tickerTall.value = true;
+    if (window.innerWidth <= NARROW) sidebarOpen.value = false; // get out of the board's way
+    await nextTick();
+    tickerEl.value?.scrollTo({ top: 0 });
+  } catch (e) {
+    showToast(`Couldn't open that session: ${e.message}`);
+  } finally {
+    viewLoading.value = false;
+  }
+}
+
+function backToLive() {
+  viewing.value = null;
+  tickerTall.value = false;
+  if (window.innerWidth <= NARROW) sidebarOpen.value = false;
+  nextTick(() => tickerEl.value?.scrollTo({ top: tickerEl.value.scrollHeight }));
+}
+
+function exportSession(format) {
+  showExport.value = false;
+  // cookie-authed same-origin download; "live" = whatever is on the board now
+  window.open(`${HTTP_BASE}/sessions/${viewing.value?.id || "live"}/export?format=${format}`, "_blank");
+}
+
+// what the board + ticker actually render (live state, or the opened session)
+const viewBubbles = computed(() => {
+  if (!viewing.value) return bubbles.value;
+  const all = viewing.value.bubbles || [];
+  return showDismissed.value ? all : all.filter((b) => !b.removed);
+});
+const dismissedCount = computed(() =>
+  viewing.value ? (viewing.value.bubbles || []).filter((b) => b.removed).length : 0
+);
+const viewLines = computed(() => (viewing.value ? viewing.value.transcript || [] : lines.value));
+const viewSpeakerNames = computed(() =>
+  viewing.value ? viewing.value.session?.speakerNames || {} : speakerNames.value
+);
+const viewReport = computed(() => (viewing.value ? viewing.value.session?.report || null : null));
+
 function whoLabel(line) {
   if (line.source === "me") return "You";
   if (!line.speaker) return "Them";
-  return speakerNames.value[line.speaker] || `Them ${line.speaker.replace("them-", "")}`;
+  return viewSpeakerNames.value[line.speaker] || `Them ${line.speaker.replace("them-", "")}`;
 }
 
 let toastTimer;
@@ -209,7 +340,10 @@ function connect() {
     const msg = JSON.parse(e.data);
     if (msg.type === "state") applyState(msg.state);
     else if (msg.type === "distilling") distilling.value = msg.value;
-    else if (msg.type === "recording") recording.value = msg.value;
+    else if (msg.type === "recording") {
+      recording.value = msg.value;
+      loadSessions(); // a session just opened (or closed) — refresh the sidebar
+    }
     else if (msg.type === "status") {
       const hadAgent = captureConnected.value;
       captureConnected.value = msg.captureConnected;
@@ -226,16 +360,27 @@ function connect() {
       }
     } else if (msg.type === "closeout") closingOut.value = msg.value;
     else if (msg.type === "tasks") tasks.value = msg.tasks;
-    else if (msg.type === "task_done")
+    else if (msg.type === "task_done") {
+      // an archived bubble isn't in the broadcast state — patch the open
+      // session's copy so its button flips to done/error like a live one
+      if (msg.sessionId && msg.sessionId === viewing.value?.id) {
+        const b = (viewing.value.bubbles || []).find((x) => x.id === msg.bubbleId);
+        const a = b?.actions?.find((x) => x.id === msg.actionId);
+        if (a) a.status = msg.ok ? "done" : "error";
+      }
       showToast(
         msg.ok
           ? `✓ Your Claude finished: ${msg.title}${msg.files?.length ? ` (${msg.files.length} file${msg.files.length > 1 ? "s" : ""} on your device)` : ""}`
           : `Your Claude couldn't finish "${msg.title}": ${(msg.summary || "").slice(0, 140)}`
       );
-    else if (msg.type === "report") showToast(`Session report saved: ${msg.report?.title || "untitled"}`);
-    else if (msg.type === "transcript") {
+    }
+    else if (msg.type === "report") {
+      showToast(`Session report saved: ${msg.report?.title || "untitled"}`);
+      loadSessions(); // the closeout just gave the session its title
+    } else if (msg.type === "transcript") {
       lines.value.push(msg);
       if (lines.value.length > 200) lines.value.shift();
+      if (viewing.value) return; // reading a past session — don't yank the ticker
       await nextTick();
       tickerEl.value?.scrollTo({ top: tickerEl.value.scrollHeight });
     }
@@ -245,7 +390,10 @@ function connect() {
 async function setRecording(target) {
   recPending.value = true;
   try {
-    if (target === "start") lines.value = []; // fresh ticker for a fresh session
+    if (target === "start") {
+      lines.value = []; // fresh ticker for a fresh session
+      viewing.value = null; // recording means attention is on the live board
+    }
     const res = await fetch(`${HTTP_BASE}/record/${target}`, { method: "POST" });
     const result = await res.json();
     recording.value = result.recording;
@@ -298,7 +446,9 @@ async function runAction(bubble, action) {
     const res = await fetch(`${HTTP_BASE}/action`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ bubbleId: bubble.id, actionId: action.id }),
+      // sessionId present = a bubble from the archive: the hub reads it from
+      // Mongo and gives the agent THAT session's transcript as context
+      body: JSON.stringify({ bubbleId: bubble.id, actionId: action.id, sessionId: viewing.value?.id }),
     });
     const result = await res.json();
     // agent actions come back "running": the device agent will flip them to
@@ -324,9 +474,16 @@ async function dismiss(bubble) {
 }
 
 onMounted(async () => {
+  document.addEventListener("click", (e) => {
+    if (!e.target.closest?.(".export-wrap")) showExport.value = false;
+  });
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape") showExport.value = false;
+  });
   if (await ensureSignedIn()) {
     connect();
     loadPairInfo();
+    loadSessions();
     if (new URLSearchParams(location.search).get("google") === "connected") {
       showToast("Google connected — calendar context and real actions are live.");
       history.replaceState(null, "", location.pathname);
@@ -337,6 +494,14 @@ onMounted(async () => {
 
 <template>
   <div class="topbar">
+    <button
+      class="gear"
+      :class="{ on: sidebarOpen }"
+      :title="sidebarOpen ? 'Hide sessions' : 'Show sessions'"
+      @click="sidebarOpen = !sidebarOpen"
+    >
+      ☰
+    </button>
     <div class="status-dot" :class="{ live: connected }"></div>
     <h1>EARSHOT</h1>
     <div class="pulse">
@@ -397,27 +562,149 @@ onMounted(async () => {
     <button class="gear" @click="openSettings" title="Settings">⚙</button>
   </div>
 
-  <TransitionGroup tag="div" name="bubbles" class="grid">
-    <Bubble
-      v-for="b in bubbles"
-      :key="b.id"
-      :bubble="b"
-      :flash="flashIds.has(b.id)"
-      @action="runAction(b, $event)"
-      @dismiss="dismiss(b)"
-    />
-    <div v-if="bubbles.length === 0" key="__empty" class="empty">
-      {{
-        recording
-          ? "Nothing distilled yet — start talking (or play something) and concepts will appear here."
-          : "Not recording — press Record to start a session."
-      }}
-    </div>
-  </TransitionGroup>
+  <div class="body">
+    <aside v-if="sidebarOpen" class="sidebar">
+      <div class="side-head">
+        <input
+          class="side-search"
+          v-model="sessionSearch"
+          type="search"
+          placeholder="Search sessions + transcripts"
+        />
+        <button class="mini" :disabled="sessionsLoading" title="Refresh" @click="loadSessions">⟳</button>
+      </div>
 
-  <div class="ticker" ref="tickerEl">
-    <div v-for="(l, i) in lines" :key="i" class="line">
-      <span class="who" :class="l.source">{{ whoLabel(l) }}</span>{{ l.text }}
+      <button class="side-item board-item" :class="{ sel: !viewing }" @click="backToLive">
+        <span class="side-title">
+          <span class="side-dot" :class="{ rec: recording }"></span> Live board
+        </span>
+        <span class="side-meta">
+          {{ recording ? "recording now" : "current board" }} · {{ bubbles.length }} concept{{ bubbles.length === 1 ? "" : "s" }}
+        </span>
+      </button>
+
+      <div class="side-list">
+        <div v-if="!sessions.length" class="side-empty">
+          {{
+            sessionsLoading
+              ? "loading…"
+              : sessionSearch
+                ? "Nothing matches that."
+                : "No recorded sessions yet."
+          }}
+        </div>
+        <template v-for="g in groupedSessions" :key="g.label">
+          <div class="side-day">{{ g.label }}</div>
+          <button
+            v-for="s in g.items"
+            :key="s.id"
+            class="side-item"
+            :class="{ sel: viewing?.id === s.id, current: s.id === boardSessionId }"
+            @click="openSession(s)"
+          >
+            <span class="side-title">{{ sessionTitle(s) }}</span>
+            <span class="side-meta">
+              {{ timeLabel(s.startedAt) }}<template v-if="durationLabel(s)"> · {{ durationLabel(s) }}</template>
+              · {{ s.lineCount }} lines · {{ s.bubbleCount }} concepts
+            </span>
+            <span v-if="s.snippet" class="side-snip"
+              >“{{ s.snippet }}”<template v-if="s.matches > 1"> · {{ s.matches }} hits</template></span
+            >
+            <span v-if="!s.endedAt" class="side-flag open">open</span>
+            <span v-else-if="s.continuesSession" class="side-flag" title="Continues the previous session"
+              >continues</span
+            >
+          </button>
+        </template>
+      </div>
+    </aside>
+
+    <div class="main">
+      <div class="viewbar">
+        <template v-if="viewing">
+          <span class="vb-title">{{ sessionTitle(viewing.meta || viewing.session) }}</span>
+          <span class="vb-meta">
+            {{ fullStamp(viewing.session?.startedAt) }} · {{ (viewing.transcript || []).length }} lines
+            <template v-if="!viewing.session?.endedAt"> · still open</template>
+          </span>
+          <button v-if="dismissedCount" class="mini" @click="showDismissed = !showDismissed">
+            {{ showDismissed ? "hide" : "show" }} {{ dismissedCount }} dismissed
+          </button>
+          <button class="mini" @click="tickerTall = !tickerTall">
+            {{ tickerTall ? "shrink transcript" : "expand transcript" }}
+          </button>
+          <button class="mini" @click="backToLive">← live board</button>
+        </template>
+        <template v-else>
+          <span class="vb-title">Live board</span>
+          <span class="vb-meta">{{ recording ? "recording" : "not recording" }}</span>
+          <button v-if="lines.length" class="mini" @click="tickerTall = !tickerTall">
+            {{ tickerTall ? "shrink transcript" : "expand transcript" }}
+          </button>
+        </template>
+        <div class="export-wrap">
+          <button class="mini" @click="showExport = !showExport">⬇ Export</button>
+          <div v-if="showExport" class="export-menu">
+            <button class="mini" @click="exportSession('md')">Markdown — report + transcript</button>
+            <button class="mini" @click="exportSession('txt')">Transcript only (.txt)</button>
+            <button class="mini" @click="exportSession('json')">JSON — everything</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="board" :class="{ dim: viewLoading }">
+        <div v-if="viewReport" class="report-card">
+          <p v-if="viewReport.summary" class="summary">{{ viewReport.summary }}</p>
+          <div class="report-cols">
+            <div v-if="viewReport.participants?.length">
+              <h4>Participants</h4>
+              <ul class="details">
+                <li v-for="(p, i) in viewReport.participants" :key="i">{{ p }}</li>
+              </ul>
+            </div>
+            <div v-if="viewReport.decisions?.length">
+              <h4>Decisions</h4>
+              <ul class="details">
+                <li v-for="(d, i) in viewReport.decisions" :key="i">{{ d }}</li>
+              </ul>
+            </div>
+            <div v-if="viewReport.openItems?.length">
+              <h4>Open items</h4>
+              <ul class="details">
+                <li v-for="(o, i) in viewReport.openItems" :key="i">{{ o }}</li>
+              </ul>
+            </div>
+          </div>
+        </div>
+
+        <TransitionGroup tag="div" name="bubbles" class="grid">
+          <Bubble
+            v-for="b in viewBubbles"
+            :key="`${viewing?.id || 'live'}:${b.id}`"
+            :bubble="b"
+            :flash="!viewing && flashIds.has(b.id)"
+            :archived="Boolean(viewing)"
+            @action="runAction(b, $event)"
+            @dismiss="dismiss(b)"
+          />
+          <div v-if="viewBubbles.length === 0" key="__empty" class="empty">
+            {{
+              viewing
+                ? "This session has no saved concepts — its transcript is below."
+                : recording
+                  ? "Nothing distilled yet — start talking (or play something) and concepts will appear here."
+                  : "Not recording — press Record to start a session."
+            }}
+          </div>
+        </TransitionGroup>
+      </div>
+
+      <div class="ticker" :class="{ tall: tickerTall }" ref="tickerEl">
+        <div v-for="(l, i) in viewLines" :key="i" class="line">
+          <span class="who" :class="l.source">{{ whoLabel(l) }}</span>{{ l.text }}
+        </div>
+        <div v-if="!viewLines.length" class="line">(no transcript)</div>
+      </div>
     </div>
   </div>
 

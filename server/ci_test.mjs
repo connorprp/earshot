@@ -343,6 +343,54 @@ try {
   check("mcp is tenant-scoped (bob never sees alice's bubbles)",
     !(mcpBoardBob.result?.content?.[0]?.text || "").includes("John Smith support"));
 
+  // ---- session archive: searchable list + export ----
+  // Mongo is down in CI, so the archive itself is empty; what must still work
+  // is the envelope, the LIVE board view, and every export format.
+  check("sessions list gated", (await fetch(`${BASE}/sessions`)).status === 401);
+  const sessList = await (await fetch(`${BASE}/sessions?q=pricing&limit=5`, { headers: { cookie: alice } })).json();
+  check("sessions list returns the archive envelope",
+    Array.isArray(sessList.sessions) && "boardSessionId" in sessList && "recording" in sessList);
+  check("session export gated", (await fetch(`${BASE}/sessions/live/export`)).status === 401);
+  const liveView = await (await fetch(`${BASE}/sessions/live`, { headers: { cookie: alice } })).json();
+  check("live session view returns board + transcript",
+    liveView.bubbles?.some((b) => b.id === "b-task") && Array.isArray(liveView.transcript));
+  const expRes = await fetch(`${BASE}/sessions/live/export?format=md`, { headers: { cookie: alice } });
+  const expMd = await expRes.text();
+  check("export comes back as a markdown download",
+    expRes.status === 200 && /attachment; filename=".+\.md"/.test(expRes.headers.get("content-disposition") || ""));
+  check("markdown export carries concepts + transcript",
+    expMd.includes("John Smith support") && expMd.includes("## Transcript"));
+  const expJson = await (await fetch(`${BASE}/sessions/live/export?format=json`, { headers: { cookie: alice } })).json();
+  check("json export carries bubbles + transcript arrays",
+    Array.isArray(expJson.transcript) && expJson.bubbles?.some((b) => b.title === "John Smith support"));
+  const expTxt = await (await fetch(`${BASE}/sessions/live/export?format=txt`, { headers: { cookie: alice } })).text();
+  check("txt export is the speaker-labeled transcript", /\[(Me|Them|them-\d+)\]/.test(expTxt));
+  const expBob = await (await fetch(`${BASE}/sessions/live/export?format=md`, { headers: { cookie: bob } })).text();
+  check("export is tenant-scoped (bob's export has no alice concepts)",
+    expBob.includes("Bob fallback test") && !expBob.includes("John Smith support"));
+  // archived-session actions: the bubble is looked up in Mongo, so with Mongo
+  // down the click must 404 cleanly (the real path is verified against a live
+  // cluster — see HANDOFF). sessionId "live" must behave like no sessionId.
+  check("action on a nonexistent archived session 404s",
+    (await fetch(`${BASE}/action`, {
+      method: "POST", headers: { cookie: alice, "content-type": "application/json" },
+      body: JSON.stringify({ bubbleId: "b-task", actionId: "a1", sessionId: "64b7f0000000000000000000" }),
+    })).status === 404);
+  check("action with a garbage sessionId 404s rather than 500s",
+    (await fetch(`${BASE}/action`, {
+      method: "POST", headers: { cookie: alice, "content-type": "application/json" },
+      body: JSON.stringify({ bubbleId: "b-task", actionId: "a1", sessionId: "not-an-id" }),
+    })).status === 404);
+  const liveIdAct = await (await fetch(`${BASE}/action`, {
+    method: "POST", headers: { cookie: alice, "content-type": "application/json" },
+    body: JSON.stringify({ bubbleId: "b-task", actionId: "a1", sessionId: "live" }),
+  })).json();
+  check("sessionId 'live' routes to the board's bubble", liveIdAct.ok === true);
+  check("unknown session id 404s",
+    (await fetch(`${BASE}/sessions/64b7f0000000000000000000`, { headers: { cookie: alice } })).status === 404);
+  check("garbage session id 404s rather than 500s",
+    (await fetch(`${BASE}/sessions/not-an-id`, { headers: { cookie: alice } })).status === 404);
+
   // ---- google integration routes ----
   check("google connect gated", (await fetch(`${BASE}/google/connect`)).status === 401);
   check("google connect 503 when unconfigured", (await fetch(`${BASE}/google/connect`, { headers: { cookie: alice } })).status === 503);
