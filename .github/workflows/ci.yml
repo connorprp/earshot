@@ -24,6 +24,8 @@ jobs:
       - run: cd capture && python ci_test_mac.py
       # deliverable links + the guardrails on opening them (posix branch)
       - run: python capture/test_links.py
+      # the BlackHole pin: hash guardrails + "the url still serves those bytes"
+      - run: python capture/test_blackhole.py
 
   hub-auth:
     runs-on: ubuntu-latest
@@ -83,7 +85,8 @@ jobs:
           pyinstaller --noconfirm --windowed --name "Earshot Capture"
           --paths capture
           --hidden-import main --hidden-import speakers --hidden-import echo_gate
-          --hidden-import mac_audio --hidden-import pystray._darwin
+          --hidden-import mac_audio --hidden-import mac_blackhole
+          --hidden-import pystray._darwin
           --collect-all ctranslate2 --collect-all sherpa_onnx --collect-all tokenizers
           --collect-all faster_whisper
           capture/tray.py

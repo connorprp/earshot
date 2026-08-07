@@ -817,9 +817,9 @@ onMounted(async () => {
           <a class="mini dl" :href="`${HTTP_BASE}/installer/app/mac`">⬇ Earshot for Mac</a>
         </div>
         <p>
-          Mac only: also install the
-          <a href="https://existential.audio/blackhole/" target="_blank">BlackHole 2ch</a> audio
-          driver and route sound through it (the app walks you through it).
+          Mac only: to hear the other side of calls you also need the BlackHole audio driver —
+          the app downloads and installs it for you on first run, then walks you through routing
+          sound to it. Your mic works without it.
         </p>
         <details class="advanced">
           <summary>advanced: script installers + manual setup values</summary>

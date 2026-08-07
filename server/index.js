@@ -998,7 +998,8 @@ function serveFile(res, file, download) {
 // it serves needs zero questions: download, double-click, done.
 const CAPTURE_FILES = [
   "main.py", "speakers.py", "echo_gate.py", "cuda_paths.py", "mac_audio.py",
-  "list_devices.py", "requirements-mac.txt", "requirements-win-cpu.txt",
+  "mac_blackhole.py", "list_devices.py",
+  "requirements-mac.txt", "requirements-win-cpu.txt",
 ];
 let captureBundle = null;
 function getCaptureBundle() {

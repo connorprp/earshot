@@ -249,6 +249,7 @@ def smoke():
     if sys.platform == "darwin":
         import sounddevice  # noqa: F401
         import mac_audio  # noqa: F401
+        import mac_blackhole  # noqa: F401
     elif sys.platform == "win32":
         import pyaudiowpatch  # noqa: F401
     import echo_gate  # noqa: F401
@@ -280,6 +281,17 @@ if __name__ == "__main__":
             cfg = pair()
             save_config(cfg)
             print("[app] paired.")
+        # macOS hears the other side of a call through a virtual audio driver.
+        # Offer it once — nagging every launch is worse than mic-only capture,
+        # and the user can re-run the app after installing it.
+        if sys.platform == "darwin" and not cfg.get("blackholePrompted"):
+            try:
+                import mac_blackhole
+                if not mac_blackhole.offer_install():
+                    cfg["blackholePrompted"] = True
+                    save_config(cfg)
+            except Exception as e:  # noqa: BLE001 — never block capture on this
+                print(f"[app] blackhole check failed: {e}")
         main_mod = start_pipeline(cfg)
     except Exception:
         import traceback

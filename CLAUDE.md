@@ -382,8 +382,8 @@ user's server URL + capture key substituted — zero questions during install,
 auto-starts capture, Desktop launcher for next time. Code ships via public
 GET /installer/capture.tgz (pure-node ustar+gzip — platform tar is quirky:
 MSYS tar on Windows treats C:\ paths as remote hosts). Windows installer
-auto-installs Python via winget; mac one auto-downloads the BlackHole pkg
-from GitHub releases. Verified E2E on real Windows: generated bat → deps →
+auto-installs Python via winget; mac one installs BlackHole via
+capture/mac_blackhole.py. Verified E2E on real Windows: generated bat → deps →
 config → agent connected+authed to the hub. Unsigned scripts = one
 SmartScreen/Gatekeeper "run anyway" click; signed native apps are the next
 tier if that's still too much friction.
@@ -409,7 +409,19 @@ tier if that's still too much friction.
   .env.example.
 - Mac capture: capture/mac_audio.py (sounddevice; system audio via BlackHole
   2ch + Multi-Output Device), platform switches in main.py (cpu/small.en
-  defaults on darwin). mac/ has a click-only installer (`Install
+  defaults on darwin). **BlackHole is installed FOR the user**
+  (capture/mac_blackhole.py, offered once on the app's first run and by the
+  script installer): existential.audio gates its download behind an
+  email/donate form and BlackHole's GitHub releases are SOURCE ONLY — there
+  has never been a .pkg asset, so the old "grep the latest release" installer
+  step produced an empty URL and killed the install under `set -e`. We fetch
+  the direct pkg URL Homebrew's cask uses, pinned with its sha256 (their host
+  406s a default urllib User-Agent — send a browser one), verify before
+  handing it to Apple's Installer, and continue mic-only if anything fails.
+  Bump URL + hash together; capture/test_blackhole.py asserts the live file
+  still matches (mac CI). Killing the driver entirely means CoreAudio process
+  taps (14.4+), which only prompt for the "System Audio Recording" permission
+  on a SIGNED app — blocked on the Apple Developer Program. mac/ has a click-only installer (`Install
   Earshot.command`, GUI dialogs, venv + model download + Desktop launcher),
   SETUP-MAC.md for the coworker, and `Connect Claude.command` (guided
   setup-token). ⚠ UNTESTED on real Mac hardware — verify once before

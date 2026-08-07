@@ -1,9 +1,11 @@
 """macOS audio backend (UNTESTED on real hardware — verify on a Mac).
 
-Windows gets loopback for free via WASAPI; macOS has no native equivalent, so
-system audio ("them") comes through BlackHole (https://existential.audio/blackhole/),
-a free virtual output device. The user plays call/video audio to a Multi-Output
-Device (real speakers + BlackHole) and we record BlackHole's input side.
+Windows gets loopback for free via WASAPI; macOS has no equivalent before the
+CoreAudio process-tap API (14.4+, needs a SIGNED app), so system audio ("them")
+comes through BlackHole, a free virtual output device — installed for the user
+by mac_blackhole.py, no donation form. The user plays call/video audio to a
+Multi-Output Device (real speakers + BlackHole) and we record BlackHole's
+input side.
 
   mic  ("me")   -> default input device via sounddevice
   them          -> the BlackHole input device, if present (mic-only otherwise)

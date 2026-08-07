@@ -9,19 +9,7 @@ note() { echo; echo "==> $1"; }
 
 echo "=== Earshot setup ==="
 
-# 1. BlackHole (lets Earshot hear your calls) — auto-download, Apple's
-#    installer GUI opens; user clicks through it once, then re-runs this file.
-if ! ls /Library/Audio/Plug-Ins/HAL/ 2>/dev/null | grep -qi blackhole; then
-  note "One-time step: installing the BlackHole audio driver."
-  PKG_URL=$(curl -s https://api.github.com/repos/ExistentialAudio/BlackHole/releases/latest \
-    | grep -o 'https://[^"]*BlackHole2ch[^"]*\.pkg' | head -1)
-  curl -sL -o /tmp/BlackHole2ch.pkg "$PKG_URL"
-  open /tmp/BlackHole2ch.pkg
-  osascript -e 'display dialog "Click through the BlackHole installer that just opened (it asks for your Mac password once).\n\nWhen it finishes, double-click the Earshot installer again to continue." buttons {"OK"} default button "OK" with title "Earshot Setup"' >/dev/null || true
-  exit 0
-fi
-
-# 2. Python (macOS offers a GUI install of its developer tools if missing)
+# 1. Python (macOS offers a GUI install of its developer tools if missing)
 if ! /usr/bin/python3 -c "import venv" >/dev/null 2>&1; then
   note "macOS needs its developer tools (one-time Apple download)."
   osascript -e 'display dialog "Click Install in the Apple dialog that appears, then double-click the Earshot installer again." buttons {"OK"} default button "OK" with title "Earshot Setup"' >/dev/null || true
@@ -34,6 +22,16 @@ mkdir -p "$APP_DIR/models"
 cd "$APP_DIR"
 curl -sL -o capture.tgz "{{HTTP_URL}}/installer/capture.tgz"
 tar -xzf capture.tgz && rm capture.tgz
+
+# 2. BlackHole — the driver that lets Earshot hear the OTHER side of a call.
+#    capture/mac_blackhole.py owns the pinned URL + hash (stdlib only, so the
+#    system python runs it before the venv exists). Apple's installer opens
+#    for the user to click through; we keep going either way, because mic-only
+#    capture is a working install, not a failed one.
+if ! /usr/bin/python3 mac_blackhole.py --check >/dev/null 2>&1; then
+  note "Installing the BlackHole audio driver..."
+  /usr/bin/python3 mac_blackhole.py || true
+fi
 
 note "Setting up the speech engine (a few minutes)..."
 [ -d venv ] || /usr/bin/python3 -m venv venv

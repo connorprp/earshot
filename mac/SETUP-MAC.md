@@ -5,10 +5,16 @@ double-click or a dialog box.
 
 ## 1. Install BlackHole (lets Earshot hear your calls)
 
-1. Open <https://existential.audio/blackhole/> and get **BlackHole 2ch**
-   (free — they email you the download link).
-2. Double-click the downloaded `.pkg` and click through the installer
-   (it will ask for your Mac password once).
+**Earshot does this for you** — the app (and the script installer) downloads
+the driver itself and opens Apple's installer; you click through it and enter
+your Mac password once. Don't use existential.audio's download form; it wants
+an email address or a Discord join, and the file is the same one.
+
+Doing it by hand instead: `brew install blackhole-2ch`, or run
+`python3 capture/mac_blackhole.py` from the capture folder.
+
+Skipping this step is allowed — your microphone still records, you just won't
+capture the other side of calls.
 
 ## 2. Route your sound through it (one-time)
 
