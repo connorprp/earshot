@@ -481,7 +481,40 @@ browsers can only capture tab audio anyway. Capture agents connect to
 wss://earshot.rustycloud.dev/ingest?key=<theirs>; Connor's own Windows agent
 has capture/cloud.env (gitignored) + `npm run capture:cloud`.
 
-**Packaged desktop app (the real ship vehicle for non-technical users):**
+**One-line install (2026-08-11 — the path friends actually use):**
+`curl -fsSL {hub}/install/mac | bash` / `irm {hub}/install/windows | iex`
+(served public+generic from mac/install.sh + windows/install.ps1, hub URL
+substituted; short aliases /mac and /win). This exists because **code signing
+became mandatory in practice**: since macOS Tahoe an unsigned app that arrived
+through a browser is quarantined and blocked in EVERY condition — the dialog
+offers only "Move to Trash", and neither right-click-Open nor Privacy & Security
+helps. A piped script is never quarantined, and neither is anything it curls, so
+this path meets no Gatekeeper and no SmartScreen at all. What it does: bootstraps
+Python with `uv` (no Xcode CLT prompt), unpacks the capture tarball into
+`<app-data>/src`, pip-installs requirements (+ requirements-agent.txt for the
+optional tray icon — tray.py falls back to headless), runs `tray.py --pair-only`
+in the FOREGROUND (pairing, BlackHole offer, voice model, and the mic permission
+prompt all happen where the user can see them), then installs a LaunchAgent
+(KeepAlive/SuccessfulExit=false) or a hidden pythonw Startup shortcut, plus an
+`earshot` command (status/log/restart/update/version/dash).
+**Self-update (capture/updater.py):** the version IS the sha256 of
+`/installer/capture.tgz`, published at `/installer/capture.json` and pushed in the
+`{type:"config"}` downlink; a source install compares, downloads, verifies the
+hash, swaps `src/` atomically (keeping `src.old`) and re-execs. So **`git push
+rusty main` updates every friend's agent** on its next connect — no CI app build,
+no re-download, no signing. `POST /me/agent-update` (Settings "update now") pushes
+`{type:"update"}` for an immediate pull; caps carry `version`/`selfUpdating` so the
+topbar can say "⚠ N agents out of date". Hard-won, both found by testing on real
+Windows: (1) Windows can't rename a directory that is a running process's CWD, so
+the agent runs with cwd = app-data ROOT and the updater chdir's out before the
+swap; (2) a detached re-exec inherits no stdio, so restart() points the child at
+capture.log or everything after the first update vanishes. Also: `apply()` refuses
+to run where there is no existing `src/main.py`, so it can never grow a phantom
+source tree next to the packaged app (that happened once, in the real app-data
+dir). EARSHOT_APPDIR gives a second install its own everything (config, models,
+src, singleton) — that's how the CI install jobs and local testing work.
+
+**Packaged desktop app (kept as a fallback; needs signing to be usable):**
 capture/tray.py — PyInstaller-frozen tray app (Windows onefile .exe ~105MB,
 Mac .app zip ~83MB), built by CI jobs app-windows/app-mac on every main push
 and synced onto rusty by ~/earshot/deploy/sync-apps.sh into deploy/downloads/
@@ -497,7 +530,7 @@ CI rebuilds the apps; run sync-apps.sh on rusty to publish them. Unsigned:
 Windows = one SmartScreen click; macOS Sequoia = Privacy & Security "Open
 Anyway" (clean fix = Apple Developer ID $99/yr + notarize step in CI).
 
-**One-click installers (script tier, kept as fallback):** the hub serves PERSONALIZED installers (Settings ⚙
+**One-click installers (older script tier, kept as fallback):** the hub serves PERSONALIZED installers (Settings ⚙
 → download buttons): GET /installer/windows|mac templates
 windows/installer-template.bat / mac/installer-template.command with the
 user's server URL + capture key substituted — zero questions during install,
@@ -674,6 +707,12 @@ resolves), spreadsheet action fired successfully.
 
 Persistence: DONE via MongoDB (see db.js above) — full transcripts, bubbles,
 ops, sessions; resume-on-restart verified.
+
+Distribution: DONE (2026-08-11) — one-line piped installers that never meet
+Gatekeeper/SmartScreen, plus agent self-update from the hub (see "One-line
+install" above). Verified end-to-end on real Windows including four consecutive
+push-and-update cycles; the macOS half is covered by a CI job that installs from
+a real hub on Apple hardware. ⚠ Not yet run on a real Mac by a person.
 
 Ask Claude / authoritative user edits: DONE (2026-08-11) — per-concept + global
 button, MCP write tools, pinned notes and voices, in-flight distill guard. See

@@ -1,0 +1,5 @@
+# Extras for the SOURCE install (curl|bash / irm|iex): the tray / menu-bar icon.
+# Installed best-effort — tray.py falls back to running headless if these are
+# missing, so a machine where Pillow won't build still captures.
+pystray
+pillow

@@ -56,6 +56,7 @@ function dismissPair() {
 const me = ref(null);            // /me payload when the settings panel is open
 const captureConnected = ref(true); // optimistic until a status message says otherwise
 const captureAgents = ref(0);       // >1 = duplicate agents on the account (extras muted by the hub)
+const agentsOutdated = ref(0);      // agents running older code than this hub serves
 const claudeConnected = ref(true);
 const googleConnected = ref(false);
 const asrOk = ref(true); // false = groq mode selected but the server has no GROQ_API_KEY
@@ -86,6 +87,32 @@ async function openSettings() {
 async function copyKey() {
   await navigator.clipboard.writeText(me.value.captureKey);
   showToast("Capture key copied.");
+}
+
+// ---- one-line install (no Gatekeeper/SmartScreen) + push updates ----
+// A file a browser downloads is quarantined; a script piped into a shell isn't.
+// Since macOS Tahoe that difference is the whole ballgame — an unsigned app that
+// arrived through Chrome can't be opened at all.
+const installLines = computed(() =>
+  me.value
+    ? {
+        mac: `curl -fsSL ${me.value.installUrl}/mac | bash`,
+        windows: `irm ${me.value.installUrl}/windows | iex`,
+      }
+    : { mac: "", windows: "" }
+);
+
+async function copyInstall(os) {
+  await navigator.clipboard.writeText(installLines.value[os]);
+  showToast(`${os === "mac" ? "Mac" : "Windows"} install command copied — paste it in a ${os === "mac" ? "Terminal" : "PowerShell"} window.`);
+}
+
+const outdatedAgents = computed(() => (me.value?.agents || []).filter((a) => !a.current).length);
+
+async function updateAgents() {
+  const r = await (await fetch(`${HTTP_BASE}/me/agent-update`, { method: "POST" })).json();
+  showToast(r.message);
+  setTimeout(openSettings, 4000); // agents restart, then report their new version
 }
 
 // one-liner that registers this Earshot account as an MCP server in the
@@ -406,6 +433,7 @@ function connect() {
       const hadAgent = captureConnected.value;
       captureConnected.value = msg.captureConnected;
       if (typeof msg.captureAgents === "number") captureAgents.value = msg.captureAgents;
+      if (typeof msg.agentsOutdated === "number") agentsOutdated.value = msg.agentsOutdated;
       claudeConnected.value = msg.claudeConnected;
       googleConnected.value = msg.googleConnected;
       agentAvailable.value = Boolean(msg.agentAvailable);
@@ -614,6 +642,14 @@ onMounted(async () => {
       title="No capture agent is streaming audio for your account"
     >
       ⚠ no capture agent
+    </button>
+    <button
+      v-if="connected && agentsOutdated"
+      class="warn-chip"
+      @click="openSettings"
+      title="A capture agent is running older code than this server. Source installs update themselves; open Settings to push it now."
+    >
+      ⚠ {{ agentsOutdated }} agent{{ agentsOutdated === 1 ? "" : "s" }} out of date
     </button>
     <button
       v-if="connected && captureAgents > 1"
@@ -918,25 +954,51 @@ onMounted(async () => {
       <div v-if="me" class="settings-block">
         <h3>1 · Capture agent <span :class="captureConnected ? 'ok' : 'bad'">{{ captureConnected ? "connected" : "not connected" }}</span></h3>
         <p>
-          Audio is captured by the Earshot app on your computer. Download it, open it,
-          and click <b>Allow this computer</b> when this page asks — that's the whole setup.
+          Audio is captured by a small agent on your computer. Paste one line in a
+          terminal, click <b>Allow this computer</b> when this page asks, done — and it
+          updates itself from then on.
+        </p>
+        <label>macOS — paste in Terminal</label>
+        <div class="keyrow">
+          <code class="code-wrap">{{ installLines.mac }}</code>
+          <button class="mini" @click="copyInstall('mac')">copy</button>
+        </div>
+        <label>Windows — paste in PowerShell</label>
+        <div class="keyrow">
+          <code class="code-wrap">{{ installLines.windows }}</code>
+          <button class="mini" @click="copyInstall('windows')">copy</button>
+        </div>
+        <p v-if="me.agents?.length">
+          Running:
+          <b>{{ me.agents.length }} agent{{ me.agents.length === 1 ? "" : "s" }}</b>
+          <template v-if="outdatedAgents">
+            — {{ outdatedAgents }} on older code
+            <button class="mini" @click="updateAgents">update now</button>
+          </template>
+          <template v-else> · up to date ({{ (me.captureVersion || "").slice(0, 7) }})</template>
         </p>
         <p v-if="captureAgents > 1" class="signin-error">
           ⚠ <b>{{ captureAgents }} copies of the app</b> are capturing for your account. They all hear
           the same microphone, so Earshot uses one and ignores the rest — quit the extras
           (tray icon → Quit) so nothing competes.
         </p>
-        <div class="keyrow">
-          <a class="mini dl" :href="`${HTTP_BASE}/installer/app/windows`">⬇ Earshot for Windows</a>
-          <a class="mini dl" :href="`${HTTP_BASE}/installer/app/mac`">⬇ Earshot for Mac</a>
-        </div>
         <p>
           Mac only: to hear the other side of calls you also need the BlackHole audio driver —
-          the app downloads and installs it for you on first run, then walks you through routing
-          sound to it. Your mic works without it.
+          the installer offers it for you, then walks you through routing sound to it. Your
+          mic works without it.
         </p>
         <details class="advanced">
-          <summary>advanced: script installers + manual setup values</summary>
+          <summary>other ways to install (packaged apps, script installers, manual values)</summary>
+          <p>
+            The packaged apps are double-clickable but <b>unsigned</b>: Windows shows a
+            SmartScreen warning, and macOS Tahoe refuses to open them at all once a browser
+            has downloaded them. Kept for when they're signed.
+          </p>
+          <div class="keyrow">
+            <a class="mini dl" :href="`${HTTP_BASE}/installer/app/windows`">⬇ app (Windows)</a>
+            <a class="mini dl" :href="`${HTTP_BASE}/installer/app/mac`">⬇ app (Mac)</a>
+          </div>
+          <p>Personalized script installers (your key baked in; download, then run from a terminal):</p>
           <div class="keyrow">
             <a class="mini" :href="`${HTTP_BASE}/installer/windows`">script installer (Win)</a>
             <a class="mini" :href="`${HTTP_BASE}/installer/mac`">script installer (Mac)</a>

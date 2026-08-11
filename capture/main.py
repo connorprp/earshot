@@ -108,6 +108,29 @@ def apply_config(msg: dict):
     if msg.get("asrModel"):  # null/absent = keep the platform/env default
         ASR_MODEL = msg["asrModel"]
     CONFIG_READY.set()
+    # the hub tells every agent which code it is serving; a source install
+    # (curl|bash) picks up a push on its own, so Connor's friends never
+    # re-download anything — see updater.py
+    if msg.get("captureVersion"):
+        _maybe_update(msg["captureVersion"])
+
+
+def _maybe_update(hub_version: str):
+    """Called from the config downlink (and by the hub's explicit "update now").
+    Runs on the ws thread, so keep the fast path to a string compare."""
+    try:
+        import updater
+        if not updater.is_source_install() or hub_version == updater.current_version():
+            return
+        print(f"[update] hub is serving {hub_version[:12]}, we run {updater.current_version()[:12] or 'unknown'}")
+        release = None
+        if "tray" in sys.modules:  # the successor needs the single-instance lock
+            release = getattr(sys.modules["tray"], "release_instance_lock", None)
+        threading.Thread(
+            target=updater.update_and_restart, args=(_hub_http_base(),), kwargs={"release_lock": release}, daemon=True
+        ).start()
+    except Exception as e:  # noqa: BLE001 — never let an update attempt kill capture
+        print(f"[update] check failed: {e}")
 
 
 class Segmenter:
@@ -407,11 +430,20 @@ def _probe_connectors():
 
 
 def _caps_msg() -> dict:
-    return {
+    caps = {
         "type": "caps",
         "claude": _find_claude() is not None,
         "connectors": _CONNECTORS or [],
     }
+    # what code this agent is running, so the dashboard can say "1 agent out of
+    # date" instead of leaving Connor guessing which friend has which build
+    try:
+        import updater
+        caps["version"] = updater.current_version()
+        caps["selfUpdating"] = updater.is_source_install()
+    except Exception:  # noqa: BLE001
+        pass
+    return caps
 
 
 def _find_claude() -> str | None:
@@ -719,6 +751,10 @@ def _handle_downlink(msg: dict):
         threading.Thread(target=_run_task, args=(msg,), daemon=True).start()
     elif msg.get("type") == "task_cancel":
         _cancel_task(str(msg.get("id") or ""))
+    elif msg.get("type") == "update":
+        # "Update agents now" in Settings: same path as the version mismatch,
+        # minus waiting for the next connect
+        _maybe_update(str(msg.get("version") or "force"))
     elif msg.get("type") == "open":
         _open_path(str(msg.get("threadId") or ""), str(msg.get("file") or ""))
     elif msg.get("type") == "transcript" and msg.get("text"):

@@ -773,6 +773,56 @@ try {
     method: "POST", body: JSON.stringify({ code: "x", host: "h" }),
   })).status === 400);
 
+  // ---- one-line install + agent self-update ----
+  // The piped installers must be PUBLIC (a friend hasn't signed in yet) and must
+  // carry this hub's address, since that's where the agent pairs and updates from.
+  for (const p of ["/install/mac", "/mac"]) {
+    const r = await fetch(`${BASE}${p}`);
+    const body = await r.text();
+    check(`${p} is public and personalized to this hub`,
+      r.status === 200 && body.includes(`127.0.0.1:${PORT}`) && !body.includes("{{HTTP_URL}}"),
+      `${r.status} ${body.slice(0, 80)}`);
+  }
+  const winInstall = await (await fetch(`${BASE}/install/windows`)).text();
+  // generic on purpose: the friend running it isn't signed in, so identity comes
+  // from device pairing rather than a key we'd have to personalize (or leak)
+  check("the windows one-liner pairs instead of baking in a capture key",
+    winInstall.includes("--pair-only") && !/[0-9a-f]{40,}/.test(winInstall) &&
+    !winInstall.includes("EARSHOT_KEY") && !winInstall.includes("{{HTTP_URL}}"));
+  const capJson = await (await fetch(`${BASE}/installer/capture.json`)).json();
+  check("the hub publishes the version of the code it serves",
+    /^[0-9a-f]{64}$/.test(capJson.version) && capJson.files.includes("updater.py") &&
+    capJson.files.includes("tray.py"), JSON.stringify(capJson).slice(0, 120));
+  const tgz = await (await fetch(`${BASE}/installer/capture.tgz`)).arrayBuffer();
+  const { createHash } = await import("node:crypto");
+  check("the published version IS the tarball's hash (so an agent can verify its download)",
+    createHash("sha256").update(Buffer.from(tgz)).digest("hex") === capJson.version);
+  // agents report what they run; the hub compares and can push an update
+  const upCap = new WebSocket(`ws://127.0.0.1:${PORT}/ingest?key=key-alice`);
+  const upDown = [];
+  upCap.on("message", (d) => upDown.push(JSON.parse(d)));
+  await new Promise((r) => upCap.on("open", r));
+  await sleep(400);
+  check("the config downlink tells agents which code the hub serves",
+    upDown.some((m) => m.type === "config" && m.captureVersion === capJson.version));
+  upCap.send(JSON.stringify({ type: "caps", claude: false, version: "stale-version", selfUpdating: true }));
+  await sleep(300);
+  const meUp = await (await fetch(`${BASE}/me`, { headers: { cookie: alice } })).json();
+  check("/me lists each agent's version and flags the stale one",
+    meUp.agents?.length === 1 && meUp.agents[0].current === false && meUp.agents[0].selfUpdating === true,
+    JSON.stringify(meUp.agents));
+  check("the install one-liners are advertised to the dashboard", (meUp.installUrl || "").endsWith("/install"));
+  const pushed = await (await fetch(`${BASE}/me/agent-update`, { method: "POST", headers: { cookie: alice } })).json();
+  await sleep(300);
+  check("\"update now\" reaches the agent as an update downlink",
+    pushed.ok === true && pushed.agents === 1 &&
+    upDown.some((m) => m.type === "update" && m.version === capJson.version));
+  upCap.send(JSON.stringify({ type: "caps", claude: false, version: capJson.version, selfUpdating: true }));
+  await sleep(300);
+  check("an updated agent stops being reported as stale",
+    (await (await fetch(`${BASE}/me`, { headers: { cookie: alice } })).json()).agents[0].current === true);
+  upCap.terminate();
+
   // ---- personalized installers ----
   check("capture bundle is public", (await fetch(`${BASE}/installer/capture.tgz`)).status === 200);
   check("installer gated without cookie", (await fetch(`${BASE}/installer/windows`)).status === 401);

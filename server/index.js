@@ -5,6 +5,7 @@
 // echo suppression, sessions, artifact files — so users never see each other's
 // data. Local mode (no EARSHOT_GOOGLE_CLIENT_ID) runs a single "local" tenant.
 import http from "node:http";
+import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import zlib from "node:zlib";
@@ -174,6 +175,9 @@ class Tenant {
       asrOk: this.asrMode !== "groq" || groqConfigured,
       agentAvailable: Boolean(this.agentSocket()),
       agentConnectors: this.agentConnectors(),
+      // a friend running yesterday's code shows up in the topbar rather than as
+      // a mystery ("why doesn't it do the thing you just shipped?")
+      agentsOutdated: this.agentVersions().filter((a) => !a.current).length,
     };
   }
 
@@ -711,12 +715,46 @@ class Tenant {
   // downlink to capture agents: which ASR mode to run and (local mode) which
   // whisper model; sent on /ingest connect and on every settings change
   configMsg() {
-    return { type: "config", asrMode: this.asrMode, asrModel: this.asrModel };
+    return {
+      type: "config",
+      asrMode: this.asrMode,
+      asrModel: this.asrModel,
+      // what code this hub is serving: a source install compares it with its own
+      // and updates itself, so a `git push` reaches every friend's machine
+      // without anyone re-downloading anything (capture/updater.py)
+      captureVersion: getCaptureVersion(),
+    };
   }
 
   pushConfig() {
     const msg = JSON.stringify(this.configMsg());
     for (const ws of this.captureSockets) if (ws.readyState === 1) ws.send(msg);
+  }
+
+  // "Update agents now" in Settings: ask every connected agent to pull the
+  // current code immediately instead of waiting for its next connect
+  pushUpdate() {
+    const msg = JSON.stringify({ type: "update", version: getCaptureVersion() });
+    let sent = 0;
+    for (const ws of this.captureSockets)
+      if (ws.readyState === 1) {
+        ws.send(msg);
+        sent++;
+      }
+    return sent;
+  }
+
+  // agents that can't self-update (a packaged .exe/.app) or are behind
+  agentVersions() {
+    const out = [];
+    for (const ws of this.captureSockets)
+      if (ws.readyState === 1 && ws._caps)
+        out.push({
+          version: ws._caps.version || "",
+          selfUpdating: Boolean(ws._caps.selfUpdating),
+          current: !ws._caps.version || ws._caps.version === getCaptureVersion(),
+        });
+    return out;
   }
 
   async loadStoredToken() {
@@ -851,6 +889,8 @@ class Tenant {
       ws._caps = {
         claude: Boolean(ev.claude),
         connectors: Array.isArray(ev.connectors) ? ev.connectors.slice(0, 40).map(String) : [],
+        version: String(ev.version || "").slice(0, 64),
+        selfUpdating: Boolean(ev.selfUpdating),
       };
       this.log(
         `capture caps: claude ${ws._caps.claude ? "available" : "not found"}` +
@@ -1166,11 +1206,12 @@ function serveFile(res, file, download) {
 // The hub knows each user's server address and capture key, so the installer
 // it serves needs zero questions: download, double-click, done.
 const CAPTURE_FILES = [
-  "main.py", "speakers.py", "echo_gate.py", "cuda_paths.py", "mac_audio.py",
-  "mac_blackhole.py", "list_devices.py",
-  "requirements-mac.txt", "requirements-win-cpu.txt",
+  "main.py", "tray.py", "updater.py", "speakers.py", "echo_gate.py", "cuda_paths.py",
+  "mac_audio.py", "mac_blackhole.py", "list_devices.py",
+  "requirements-mac.txt", "requirements-win-cpu.txt", "requirements-agent.txt",
 ];
 let captureBundle = null;
+let captureVersion = ""; // sha256 of the bundle = what a source install compares against
 function getCaptureBundle() {
   if (!captureBundle) {
     // minimal ustar writer (avoids platform tar quirks; extracts with any tar)
@@ -1195,8 +1236,18 @@ function getCaptureBundle() {
     }
     blocks.push(Buffer.alloc(1024)); // end-of-archive
     captureBundle = zlib.gzipSync(Buffer.concat(blocks));
+    captureVersion = crypto.createHash("sha256").update(captureBundle).digest("hex");
+    console.log(`[hub] capture bundle ${captureVersion.slice(0, 12)} (${captureBundle.length} bytes)`);
   }
   return captureBundle;
+}
+
+// The version a source install checks itself against. Deliberately the tarball's
+// own hash: no number to bump, and it doubles as an integrity check on the
+// download (see capture/updater.py). Built lazily, like the bundle.
+function getCaptureVersion() {
+  getCaptureBundle();
+  return captureVersion;
 }
 
 function personalizedInstaller(osName, req, captureKey) {
@@ -1375,6 +1426,32 @@ const server = http.createServer(async (req, res) => {
     }
   }
 
+  // ---- one-line install (the path that dodges Gatekeeper/SmartScreen) ----
+  // A file a BROWSER downloads is quarantined; on macOS Tahoe an unsigned
+  // quarantined app is blocked outright, with only "Move to Trash" offered.
+  // A script piped straight into a shell is never quarantined, so:
+  //   curl -fsSL https://<hub>/install/mac | bash
+  //   irm https://<hub>/install/windows | iex
+  // Public and generic on purpose — no capture key is baked in; the agent pairs
+  // itself through /pair/start like the packaged app does.
+  if (req.method === "GET" && /^\/(install\/(mac|windows)|mac|win)$/.test(urlPath)) {
+    const mac = urlPath === "/mac" || urlPath === "/install/mac";
+    const file = path.join(ROOT, "..", mac ? "mac" : "windows", mac ? "install.sh" : "install.ps1");
+    const https = (req.headers["x-forwarded-proto"] || "") === "https";
+    res.setHeader("content-type", "text/plain; charset=utf-8");
+    return res.end(
+      fs.readFileSync(file, "utf8").replaceAll("{{HTTP_URL}}", `${https ? "https" : "http"}://${req.headers.host}`)
+    );
+  }
+
+  // what code the hub is serving; an installed agent polls this to self-update
+  if (req.method === "GET" && urlPath === "/installer/capture.json") {
+    res.setHeader("content-type", "application/json");
+    return res.end(
+      JSON.stringify({ version: getCaptureVersion(), bytes: getCaptureBundle().length, files: CAPTURE_FILES })
+    );
+  }
+
   if (req.method === "GET" && urlPath === "/installer/capture.tgz") {
     // public: just the open-source capture code, no secrets — the installer
     // scripts fetch it outside any browser session
@@ -1487,6 +1564,10 @@ const server = http.createServer(async (req, res) => {
         agentConnectors: t.agentConnectors(),
         captureConnected: t.captureSockets.size > 0,
         captureAgents: t.captureSockets.size,
+        // one-line installs + who's running what (see capture/updater.py)
+        installUrl: `${https ? "https" : "http"}://${req.headers.host}/install`,
+        captureVersion: getCaptureVersion(),
+        agents: t.agentVersions(),
         claudeConnected: t.claudeConnected,
         googleConfigured,
         googleConnected: Boolean(user.googleTokenEnc),
@@ -1539,6 +1620,22 @@ const server = http.createServer(async (req, res) => {
     t.pushConfig(); // connected capture agents switch live
     return res.end(JSON.stringify({ ok: true, asrMode: t.asrMode, asrModel: t.asrModel }));
   }
+  // push the current code to this user's connected agents right now
+  if (req.method === "POST" && req.url === "/me/agent-update") {
+    const sent = t.pushUpdate();
+    res.setHeader("content-type", "application/json");
+    return res.end(
+      JSON.stringify({
+        ok: true,
+        agents: sent,
+        version: getCaptureVersion(),
+        message: sent
+          ? `Told ${sent} agent${sent === 1 ? "" : "s"} to update — they restart themselves in a few seconds.`
+          : "No capture agent is connected right now. They update on their own the next time they connect.",
+      })
+    );
+  }
+
   if (req.method === "POST" && req.url === "/me/capture-key/rotate") {
     const captureKey = await rotateCaptureKey(userId);
     res.setHeader("content-type", "application/json");
