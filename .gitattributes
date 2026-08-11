@@ -1,0 +1,13 @@
+# This repo is edited on Windows and deployed on Linux, and some of its files
+# are RUN by an interpreter that cares. A shell script with CRLF line endings
+# fails with "command not found" on the shebang line, and the hub serves
+# mac/install.sh straight from the working tree — so a Windows checkout would
+# hand a Mac friend a broken installer. Pin the ones that matter to LF.
+*.sh text eol=lf
+*.command text eol=lf
+capture/*.py text eol=lf
+mac/install.sh text eol=lf
+
+# PowerShell is happy with CRLF; leave Windows files alone.
+*.ps1 text eol=crlf
+*.bat text eol=crlf

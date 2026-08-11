@@ -783,6 +783,9 @@ try {
       r.status === 200 && body.includes(`127.0.0.1:${PORT}`) && !body.includes("{{HTTP_URL}}"),
       `${r.status} ${body.slice(0, 80)}`);
   }
+  // a CRLF shell script dies on its own shebang; a Windows checkout can produce one
+  check("the mac installer is served with unix line endings",
+    !(await (await fetch(`${BASE}/install/mac`)).text()).includes("\r\n"));
   const winInstall = await (await fetch(`${BASE}/install/windows`)).text();
   // generic on purpose: the friend running it isn't signed in, so identity comes
   // from device pairing rather than a key we'd have to personalize (or leak)

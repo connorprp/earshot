@@ -1439,9 +1439,15 @@ const server = http.createServer(async (req, res) => {
     const file = path.join(ROOT, "..", mac ? "mac" : "windows", mac ? "install.sh" : "install.ps1");
     const https = (req.headers["x-forwarded-proto"] || "") === "https";
     res.setHeader("content-type", "text/plain; charset=utf-8");
-    return res.end(
-      fs.readFileSync(file, "utf8").replaceAll("{{HTTP_URL}}", `${https ? "https" : "http"}://${req.headers.host}`)
+    let body = fs.readFileSync(file, "utf8").replaceAll(
+      "{{HTTP_URL}}",
+      `${https ? "https" : "http"}://${req.headers.host}`
     );
+    // bash fails on CRLF ("command not found" on the shebang), and a Windows
+    // checkout of this repo can have it. .gitattributes pins the file, but the
+    // hub reads the working tree, so normalize here too and stop caring.
+    if (mac) body = body.replace(/\r\n/g, "\n");
+    return res.end(body);
   }
 
   // what code the hub is serving; an installed agent polls this to self-update
