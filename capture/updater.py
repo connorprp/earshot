@@ -49,6 +49,35 @@ def src_dir(root: Path | None = None) -> Path:
     return (root or app_root()) / "src"
 
 
+# ---- device identity ----
+# Lives here because both main.py and tray.py need it and neither can import the
+# other. An account can have several machines (a desktop that is always on and a
+# laptop you actually sit at); without an id the hub could only ever route work
+# to "whichever agent connected first", which sent tasks to the wrong computer.
+def device_name() -> str:
+    import socket
+    return (socket.gethostname() or "").split(".")[0] or "this computer"
+
+
+def device_id(root: Path | None = None) -> str:
+    """Stable per install: survives self-updates, re-pairing and restarts."""
+    path = (root or app_root()) / "device.json"
+    try:
+        got = json.loads(path.read_text(encoding="utf-8")).get("deviceId")
+        if got:
+            return str(got)
+    except (OSError, ValueError):
+        pass
+    import uuid
+    made = uuid.uuid4().hex[:16]
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps({"deviceId": made, "name": device_name()}), encoding="utf-8")
+    except OSError as e:
+        print(f"[device] could not persist an id ({e}) — using a temporary one")
+    return made
+
+
 def is_source_install(root: Path | None = None) -> bool:
     """True when this process is running from a self-updatable source tree.
     A frozen bundle updates by being re-downloaded, so it must never try."""

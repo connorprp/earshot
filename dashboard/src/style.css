@@ -368,6 +368,21 @@ body {
 .settings-block code.code-wrap {
   white-space: pre-wrap; word-break: break-all; line-height: 1.6;
 }
+/* one row per computer on the account (Settings) */
+.device {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  border: 1px solid var(--border); border-radius: 8px; padding: 7px 10px;
+  background: var(--bg);
+}
+.dev-name { font-size: 12.5px; font-weight: 600; display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.dev-meta { font-size: 10.5px; color: var(--dim); margin-left: auto; }
+.dev-tag {
+  font-size: 9.5px; font-weight: 400; text-transform: uppercase; letter-spacing: 0.5px;
+  color: var(--dim); border: 1px solid var(--border); border-radius: 99px; padding: 1px 6px;
+}
+.dev-tag.on { color: #3fb950; border-color: #3fb950; }
+.dev-tag.bad { color: #d29922; border-color: #d29922; }
+
 .keyrow { display: flex; gap: 6px; align-items: center; }
 .keyrow code, .keyrow input { flex: 1; min-width: 0; }
 .keyrow input {

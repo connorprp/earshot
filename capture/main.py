@@ -434,16 +434,44 @@ def _caps_msg() -> dict:
         "type": "caps",
         "claude": _find_claude() is not None,
         "connectors": _CONNECTORS or [],
+        "platform": "mac" if IS_MAC else ("windows" if sys.platform == "win32" else "linux"),
     }
-    # what code this agent is running, so the dashboard can say "1 agent out of
-    # date" instead of leaving Connor guessing which friend has which build
+    # WHICH computer this is: an account can have several, and work has to run on
+    # the one the user is actually sitting at (see updater.device_id)
     try:
         import updater
+        caps["deviceId"] = updater.device_id()
+        caps["deviceName"] = updater.device_name()
         caps["version"] = updater.current_version()
         caps["selfUpdating"] = updater.is_source_install()
     except Exception:  # noqa: BLE001
         pass
     return caps
+
+
+def _recheck_caps():
+    """Re-probe what this machine can do and tell the hub.
+
+    The onboarding flow leans on this: someone installs Claude Code *after* the
+    agent is already running, and without a re-probe the dashboard would keep
+    saying "no Claude on this computer" until they restarted it.
+    """
+    global _CONNECTORS
+    found = _find_claude()
+    print(f"[caps] recheck: claude {'available' if found else 'not found'}")
+    out_queue.put(_caps_msg())
+    if found and _CONNECTORS is None:
+        threading.Thread(target=_probe_connectors, daemon=True).start()
+
+
+def _watch_for_claude():
+    """No Claude CLI at startup: look again every minute for half an hour, so an
+    install during onboarding lights the dashboard up on its own."""
+    for _ in range(30):
+        time.sleep(60)
+        if _find_claude():
+            _recheck_caps()
+            return
 
 
 def _find_claude() -> str | None:
@@ -751,6 +779,9 @@ def _handle_downlink(msg: dict):
         threading.Thread(target=_run_task, args=(msg,), daemon=True).start()
     elif msg.get("type") == "task_cancel":
         _cancel_task(str(msg.get("id") or ""))
+    elif msg.get("type") == "recheck":
+        # the dashboard's "I've installed it now, check again" button
+        threading.Thread(target=_recheck_caps, daemon=True).start()
     elif msg.get("type") == "update":
         # "Update agents now" in Settings: same path as the version mismatch,
         # minus waiting for the next connect
@@ -825,6 +856,8 @@ def main():
     threading.Thread(target=asr_worker, daemon=True).start()
     threading.Thread(target=ws_sender, daemon=True).start()
     threading.Thread(target=_probe_connectors, daemon=True).start()
+    if not _find_claude():
+        threading.Thread(target=_watch_for_claude, daemon=True).start()
 
     if IS_MAC:
         import mac_audio

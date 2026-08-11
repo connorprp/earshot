@@ -481,6 +481,49 @@ browsers can only capture tab audio anyway. Capture agents connect to
 wss://earshot.rustycloud.dev/ingest?key=<theirs>; Connor's own Windows agent
 has capture/cloud.env (gitignored) + `npm run capture:cloud`.
 
+## Devices: one account, several computers (2026-08-11)
+
+Reported live: a click in the LAPTOP's browser ran on the desktop. Cause was
+`agentSocket()` returning the first Claude-capable socket in a Set — insertion
+order — so the always-on machine won every dispatch, wrote its files there, and
+left the thread's Claude session on the wrong computer. Work is now routed to a
+DEVICE, not just an account.
+
+- **Identity:** `updater.device_id()` persists a uuid in `<app-data>/device.json`
+  (survives self-updates and re-pairing); caps carry `deviceId`, `deviceName`
+  (hostname), `platform`.
+- **How a browser knows which computer it is on:** nothing in the web platform
+  can tell it, so we take the one moment it is knowable — the pairing page is
+  opened BY the agent on that machine, so `/pair/approve` returns the deviceId
+  and the dashboard stores it in `localStorage` (`earshot.deviceId`). Browsers
+  paired before this exists can claim one in Settings ("I'm on this one").
+- **Routing** (`agentSocket(preferred)`): the asked-for device → the device
+  currently being listened to → any capable agent. `/action`, `/ask`,
+  `/action/preview`, `/thread/reply` and `/thread/open` all pass it, and the
+  sheets say "Runs on <name>" before you click.
+- **Threads are pinned:** `thread.deviceId` is set on first dispatch, because
+  `claude -p --resume <sid>` only works on the machine that holds that session —
+  a follow-up to a machine that's gone now refuses by name instead of silently
+  starting unrelated work. A device disconnecting also fails its running tasks
+  (`deviceGone`), so a button can't spin forever.
+- **Audio, same bug:** two agents raced for the stream (first to speak owned it),
+  so recording on the laptop could capture the desktop's room. Settings pins a
+  listening device (`POST /me/capture-device`, persisted as `users.captureDevice`,
+  enforced in `streamOwner`); a pinned device that is offline falls back to the
+  race rather than leaving the user with no capture. Topbar shows "🎧 <name>".
+- **Claude CLI gate:** `claudeMissing` (agents connected, none Claude-capable) is
+  distinct from "no agent" everywhere — topbar chip, Settings, both sheets, and
+  the /ask error. Capture re-probes on `{type:"recheck"}` (Settings "check
+  again", `POST /me/agent-recheck`) and by itself every minute for 30 min when no
+  CLI was found at startup, so installing Claude Code lights the UI up without a
+  restart. Fixed alongside: `tray.start_pipeline` never started
+  `_probe_connectors`, so the packaged app always reported zero connectors.
+- **First-run walkthrough** (`dashboard/src/components/Onboarding.vue`): shown
+  until `users.onboarded`, re-openable from Settings. Step 1 = the install
+  one-liner for the detected OS, step 2 = the Claude Code gate, plus a Mac-only
+  BlackHole note. Both steps tick themselves green off live hub status rather
+  than asking the user to confirm anything.
+
 **One-line install (2026-08-11 — the path friends actually use):**
 `curl -fsSL {hub}/install/mac | bash` / `irm {hub}/install/windows | iex`
 (served public+generic from mac/install.sh + windows/install.ps1, hub URL

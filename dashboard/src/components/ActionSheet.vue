@@ -15,6 +15,9 @@ const props = defineProps({
   sessionId: { type: String, default: undefined },
   // latest {type:"thread"} ws message; we take the ones addressed to us
   feed: { type: Object, default: null },
+  // which computer this browser belongs to, so the work runs there (and its
+  // files land there) rather than on whichever agent connected first
+  deviceId: { type: String, default: "" },
 });
 // "ran" = the action itself was dispatched (the button's status follows it);
 // "toast" = just tell the user something, the button is unaffected
@@ -63,6 +66,7 @@ async function loadPreview() {
         bubbleId: props.bubble.id,
         actionId: props.action.id,
         sessionId: props.sessionId,
+        deviceId: props.deviceId,
         notes: draft.value,
       }),
     });
@@ -142,6 +146,7 @@ async function send() {
           bubbleId: props.bubble.id,
           actionId: props.action.id,
           sessionId: props.sessionId,
+          deviceId: props.deviceId,
           notes: text,
         }),
       })
@@ -214,7 +219,13 @@ onBeforeUnmount(() => {
 
       <p v-else class="route">
         <template v-if="preview?.route === 'agent'">
-          Runs on <b>your Claude</b>, on your computer — you'll see it work here, and you can keep talking to it.
+          Runs on <b>your Claude</b>{{ preview.device ? `, on ${preview.device}` : ", on your computer" }} —
+          you'll see it work here, and you can keep talking to it.
+        </template>
+        <template v-else-if="preview?.route === 'hub' && preview.claudeMissing">
+          <b>Claude Code isn't installed</b> on the computer running Earshot, so this will
+          produce a file instead of doing the work —
+          <a href="https://claude.com/claude-code" target="_blank" rel="noopener">get it here</a>.
         </template>
         <template v-else-if="preview?.route === 'hub'">
           No Claude agent is reachable — Earshot will produce the file itself, and

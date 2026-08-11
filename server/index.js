@@ -138,6 +138,7 @@ class Tenant {
     this.googleConnected = false;
     this.asrMode = defaultAsrMode(); // "local" | "groq"; user pref overrides on hydration
     this.asrModel = null;            // local-mode whisper model; null = agent's platform default
+    this.captureDevice = null;       // pinned listening device (null = whichever agent is active)
     this.groqChain = Promise.resolve(); // serializes Groq calls per tenant (transcript order)
     this.tasks = new Map();      // device-agent tasks: id -> {id, bubbleId, actionId, title, status, note}
     this.threads = new Map();    // agent conversations: threadId -> {bubbleId, actionId, claudeSessionId, messages[]}
@@ -178,6 +179,11 @@ class Tenant {
       // a friend running yesterday's code shows up in the topbar rather than as
       // a mystery ("why doesn't it do the thing you just shipped?")
       agentsOutdated: this.agentVersions().filter((a) => !a.current).length,
+      // which computers are on, which one is being heard, and whether any of
+      // them can actually run Claude
+      devices: this.devices(),
+      listeningOn: this.listeningSocket()?._caps?.deviceName || "",
+      claudeMissing: this.claudeMissing(),
     };
   }
 
@@ -187,9 +193,51 @@ class Tenant {
   // capture agent spawns the user's own Claude Code (their login, their
   // billing) to do the real work. The hub's contribution is context: it holds
   // the transcript, bubble, and session context the local agent can't see.
-  agentSocket() {
-    for (const ws of this.captureSockets) if (ws.readyState === 1 && ws._caps?.claude) return ws;
-    return null;
+  // Which computer runs a piece of work. An account can have several agents (a
+  // desktop that is always on, a laptop you actually sit at), and this used to
+  // return whichever connected FIRST — so a click in the laptop's browser ran on
+  // the desktop, wrote its files there, and left the thread's Claude session on
+  // the wrong machine. Preference order:
+  //   1. the device asked for (the browser's own, or the thread's pinned one)
+  //   2. the device currently being listened to (you are probably at it)
+  //   3. any Claude-capable agent (better than refusing)
+  agentSocket(preferredDeviceId = null) {
+    const capable = [...this.captureSockets].filter((ws) => ws.readyState === 1 && ws._caps?.claude);
+    if (!capable.length) return null;
+    if (preferredDeviceId) {
+      const exact = capable.find((ws) => ws._caps.deviceId === preferredDeviceId);
+      if (exact) return exact;
+    }
+    if (this.primaryCapture && capable.includes(this.primaryCapture)) return this.primaryCapture;
+    return capable[0];
+  }
+
+  // every connected agent, for the Settings device list and the topbar
+  devices() {
+    const listening = this.listeningSocket();
+    return [...this.captureSockets]
+      .filter((ws) => ws.readyState === 1)
+      .map((ws) => ({
+        deviceId: ws._caps?.deviceId || "",
+        name: ws._caps?.deviceName || "unnamed computer",
+        platform: ws._caps?.platform || "",
+        claude: Boolean(ws._caps?.claude),
+        connectors: ws._caps?.connectors || [],
+        version: ws._caps?.version || "",
+        selfUpdating: Boolean(ws._caps?.selfUpdating),
+        current: !ws._caps?.version || ws._caps.version === getCaptureVersion(),
+        listening: ws === listening,
+      }));
+  }
+
+  deviceName(deviceId) {
+    return this.devices().find((d) => d.deviceId === deviceId)?.name || "";
+  }
+
+  // agents are connected but none of them can run Claude Code: the dashboard
+  // says so precisely instead of "no agent", and onboarding can gate on it
+  claudeMissing() {
+    return this.captureSockets.size > 0 && !this.agentSocket();
   }
 
   // apps connected to the user's own Claude (claude.ai connectors), as
@@ -418,7 +466,9 @@ class Tenant {
   // opts.thread attaches it to a concept's conversation (opts.prompt +
   // opts.resume = a follow-up turn continuing that same Claude session).
   dispatchTask(bubble, action, opts = {}) {
-    const ws = this.agentSocket();
+    // opts.deviceId: the browser's own computer, or the device a thread is
+    // pinned to (a follow-up MUST resume where that Claude session lives)
+    const ws = this.agentSocket(opts.deviceId || opts.thread?.deviceId || null);
     if (!ws) return null;
     const id = `t-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
     const p = action.payload || {};
@@ -428,11 +478,19 @@ class Tenant {
       actionId: action.id,
       sessionId: opts.sessionId || null, // set = the bubble lives in the archive, not on the board
       threadId: opts.thread?.id || null,
+      deviceId: ws._caps?.deviceId || "",
+      deviceName: ws._caps?.deviceName || "",
       title: p.title || p.subject || action.label || bubble.title,
       status: "running",
       note: "sent to your device",
       startedAt: Date.now(),
     };
+    // the conversation belongs to the machine that started it, forever
+    if (opts.thread && !opts.thread.deviceId && task.deviceId) {
+      opts.thread.deviceId = task.deviceId;
+      opts.thread.deviceName = task.deviceName;
+      saveThread(opts.thread);
+    }
     this.tasks.set(id, task);
     this.taskTimers.set(
       id,
@@ -453,7 +511,9 @@ class Tenant {
         resume: opts.resume || null,
       })
     );
-    this.log(`task ${id} -> device agent: ${task.title}${opts.resume ? " (follow-up)" : ""}`);
+    this.log(
+      `task ${id} -> ${task.deviceName || "device agent"}: ${task.title}${opts.resume ? " (follow-up)" : ""}`
+    );
     this.broadcastTasks();
     return task;
   }
@@ -707,6 +767,25 @@ class Tenant {
     return true;
   }
 
+  // A computer went away mid-task. Its work can never report back, so finish it
+  // now instead of leaving the button spinning until the 15-minute timeout — and
+  // leaving the thread refusing follow-ups because "your Claude is still working".
+  deviceGone(ws) {
+    const id = ws._caps?.deviceId || "";
+    const name = ws._caps?.deviceName || "That computer";
+    const orphaned = [...this.tasks.values()].filter(
+      (t) => t.status === "running" && (id ? t.deviceId === id : this.captureSockets.size === 0)
+    );
+    for (const task of orphaned)
+      this.handleTaskEvent({
+        type: "task_done",
+        id: task.id,
+        ok: false,
+        summary: `${name} disconnected before this finished.`,
+      });
+    if (orphaned.length) this.log(`${name} left with ${orphaned.length} task(s) running — marked them failed`);
+  }
+
   runningTaskForThread(threadId) {
     for (const t of this.tasks.values()) if (t.threadId === threadId && t.status === "running") return t;
     return null;
@@ -761,6 +840,7 @@ class Tenant {
     const user = await getOrCreateUser(this.userId);
     if (user.asrMode === "local" || user.asrMode === "groq") this.asrMode = user.asrMode;
     if (user.asrModel && ASR_MODELS.includes(user.asrModel)) this.asrModel = user.asrModel;
+    if (user.captureDevice) this.captureDevice = String(user.captureDevice);
     if (!authEnabled || this.userId === "local") return;
     this.googleConnected = Boolean(user.googleTokenEnc);
     if (user.claudeTokenEnc) {
@@ -853,8 +933,37 @@ class Tenant {
   // (machine swapped, agent restarted) heals itself with no reconnect fight —
   // and a duplicate can never slip through the gap, because whichever copy of
   // an utterance lands first takes ownership and mutes the rest.
+  // the socket whose audio we are actually ingesting (for the UI)
+  listeningSocket() {
+    if (this.captureDevice) {
+      const pinned = [...this.captureSockets].find(
+        (ws) => ws.readyState === 1 && ws._caps?.deviceId === this.captureDevice
+      );
+      if (pinned) return pinned;
+    }
+    return this.primaryCapture?.readyState === 1 ? this.primaryCapture : null;
+  }
+
   streamOwner(ws) {
     if (!ws) return true; // hub-generated (groq re-entry), already gated on the way in
+    // The user pinned a device in Settings: only that machine's audio counts.
+    // Two agents on one account otherwise race — whichever mic speaks first owns
+    // the stream — so recording on the laptop could capture the desktop's room.
+    // A pinned device that ISN'T connected falls through to the race rather than
+    // leaving the user with no capture at all.
+    if (this.captureDevice && ws._caps?.deviceId && ws._caps.deviceId !== this.captureDevice) {
+      const pinnedHere = [...this.captureSockets].some(
+        (s) => s.readyState === 1 && s._caps?.deviceId === this.captureDevice
+      );
+      if (pinnedHere) {
+        if (!ws._muted) {
+          ws._muted = true;
+          this.log(`ignoring audio from "${ws._caps.deviceName || "an agent"}" — Settings listens to "${this.deviceName(this.captureDevice)}"`);
+          this.broadcast(this.status());
+        }
+        return false;
+      }
+    }
     const now = Date.now();
     if (this.primaryCapture !== ws) {
       const free =
@@ -891,9 +1000,14 @@ class Tenant {
         connectors: Array.isArray(ev.connectors) ? ev.connectors.slice(0, 40).map(String) : [],
         version: String(ev.version || "").slice(0, 64),
         selfUpdating: Boolean(ev.selfUpdating),
+        // which computer this is (updater.device_id): the whole point of routing
+        deviceId: String(ev.deviceId || "").slice(0, 64),
+        deviceName: String(ev.deviceName || "").slice(0, 60),
+        platform: String(ev.platform || "").slice(0, 16),
       };
       this.log(
-        `capture caps: claude ${ws._caps.claude ? "available" : "not found"}` +
+        `capture caps${ws._caps.deviceName ? ` [${ws._caps.deviceName}]` : ""}: claude ` +
+          `${ws._caps.claude ? "available" : "not found"}` +
           (ws._caps.connectors.length ? ` (${ws._caps.connectors.join(", ")})` : "")
       );
       this.broadcast(this.status());
@@ -992,6 +1106,13 @@ class Tenant {
 
   async runDistill() {
     if (this.distilling || this.pending.length === 0) return;
+    // CI has no usable Claude credential, so a flush on Stop would sit in SDK
+    // retries for minutes and make the suite look hung (it did). Tests seed
+    // bubbles directly (/test/seed-bubble) and never assert on distill output.
+    if (process.env.EARSHOT_TEST_NO_DISTILL === "1") {
+      this.pending = [];
+      return;
+    }
     const lines = this.pending;
     this.pending = [];
     this.distilling = true;
@@ -1369,7 +1490,7 @@ const server = http.createServer(async (req, res) => {
   if (req.method === "POST" && urlPath === "/pair/start") {
     let body = "";
     for await (const chunk of req) body += chunk;
-    const { code, host } = JSON.parse(body || "{}");
+    const { code, host, deviceId, platform } = JSON.parse(body || "{}");
     res.setHeader("content-type", "application/json");
     if (!/^[A-Z0-9]{6,12}$/.test(code || "")) {
       res.statusCode = 400;
@@ -1380,7 +1501,15 @@ const server = http.createServer(async (req, res) => {
       res.statusCode = 429;
       return res.end(JSON.stringify({ ok: false, message: "too many pending pairings" }));
     }
-    pairings.set(code, { host: String(host || "computer").slice(0, 60), userId: null, expiresAt: Date.now() + 10 * 60_000 });
+    pairings.set(code, {
+      host: String(host || "computer").slice(0, 60),
+      // the approving browser runs ON this machine, so approval is how a browser
+      // learns which computer it is sitting at (see /pair/approve)
+      deviceId: String(deviceId || "").slice(0, 64),
+      platform: String(platform || "").slice(0, 16),
+      userId: null,
+      expiresAt: Date.now() + 10 * 60_000,
+    });
     return res.end(JSON.stringify({ ok: true }));
   }
   if (req.method === "GET" && urlPath === "/pair/claim") {
@@ -1513,8 +1642,10 @@ const server = http.createServer(async (req, res) => {
       return res.end(JSON.stringify({ ok: false, message: "Pairing code expired or unknown — restart the app and try again." }));
     }
     p.userId = userId;
-    console.log(`[pair] ${userId} approved "${p.host}"`);
-    return res.end(JSON.stringify({ ok: true, host: p.host }));
+    console.log(`[pair] ${userId} approved "${p.host}"${p.deviceId ? ` (device ${p.deviceId.slice(0, 8)})` : ""}`);
+    // the dashboard stores deviceId locally: this browser is on that computer,
+    // so its clicks should run there
+    return res.end(JSON.stringify({ ok: true, host: p.host, deviceId: p.deviceId, platform: p.platform }));
   }
   if (req.method === "GET" && urlPath === "/pair/info") {
     const code = new URL(req.url, "http://x").searchParams.get("code") || "";
@@ -1574,6 +1705,10 @@ const server = http.createServer(async (req, res) => {
         installUrl: `${https ? "https" : "http"}://${req.headers.host}/install`,
         captureVersion: getCaptureVersion(),
         agents: t.agentVersions(),
+        devices: t.devices(),
+        captureDevice: t.captureDevice,
+        claudeMissing: t.claudeMissing(),
+        onboarded: Boolean(user.onboarded),
         claudeConnected: t.claudeConnected,
         googleConfigured,
         googleConnected: Boolean(user.googleTokenEnc),
@@ -1626,6 +1761,49 @@ const server = http.createServer(async (req, res) => {
     t.pushConfig(); // connected capture agents switch live
     return res.end(JSON.stringify({ ok: true, asrMode: t.asrMode, asrModel: t.asrModel }));
   }
+  // which computer Earshot listens to. null = whichever agent is speaking
+  // (today's behavior); a pinned device stops two machines racing for the stream.
+  if (req.method === "POST" && req.url === "/me/capture-device") {
+    let body = "";
+    for await (const chunk of req) body += chunk;
+    const { deviceId } = JSON.parse(body || "{}");
+    res.setHeader("content-type", "application/json");
+    t.captureDevice = deviceId ? String(deviceId).slice(0, 64) : null;
+    for (const ws of t.captureSockets) ws._muted = false; // re-judge on the next segment
+    await setUserField(userId, { captureDevice: t.captureDevice });
+    t.broadcast(t.status());
+    return res.end(
+      JSON.stringify({
+        ok: true,
+        captureDevice: t.captureDevice,
+        message: t.captureDevice
+          ? `Now listening to ${t.deviceName(t.captureDevice) || "that computer"} only.`
+          : "Listening to whichever computer is active.",
+      })
+    );
+  }
+
+  // "I've installed Claude Code now" — ask the agents to look again
+  if (req.method === "POST" && req.url === "/me/agent-recheck") {
+    const msg = JSON.stringify({ type: "recheck" });
+    let sent = 0;
+    for (const ws of t.captureSockets)
+      if (ws.readyState === 1) {
+        ws.send(msg);
+        sent++;
+      }
+    res.setHeader("content-type", "application/json");
+    return res.end(JSON.stringify({ ok: true, agents: sent }));
+  }
+
+  // the first-run walkthrough is shown until it has been completed once
+  if (req.method === "POST" && req.url === "/me/onboarded") {
+    t.log("setup walkthrough completed");
+    await setUserField(userId, { onboarded: true });
+    res.setHeader("content-type", "application/json");
+    return res.end(JSON.stringify({ ok: true }));
+  }
+
   // push the current code to this user's connected agents right now
   if (req.method === "POST" && req.url === "/me/agent-update") {
     const sent = t.pushUpdate();
@@ -1776,15 +1954,18 @@ const server = http.createServer(async (req, res) => {
   if (req.method === "POST" && urlPath === "/ask") {
     let body = "";
     for await (const chunk of req) body += chunk;
-    const { text, bubbleId, sessionId } = JSON.parse(body || "{}");
+    const { text, bubbleId, sessionId, deviceId } = JSON.parse(body || "{}");
     res.setHeader("content-type", "application/json");
     const message = cleanNotes(text);
     if (!message) return res.end(JSON.stringify({ ok: false, message: "Type something first." }));
-    if (!t.agentSocket())
+    if (!t.agentSocket(deviceId))
       return res.end(
         JSON.stringify({
           ok: false,
-          message: "Your Claude agent isn't connected on this computer — open the Earshot app and sign in to Claude Code.",
+          claudeMissing: t.claudeMissing(),
+          message: t.claudeMissing()
+            ? "Claude Code isn't installed on the computer running Earshot — install it, then press \"check again\" in Settings."
+            : "No Earshot agent is connected — open Earshot on your computer (or install it from Settings).",
         })
       );
     const board = t.boardSessionId() ? String(t.boardSessionId()) : null;
@@ -1805,7 +1986,7 @@ const server = http.createServer(async (req, res) => {
     const task = t.dispatchTask(
       bubble || { id: BOARD_BUBBLE, title: "the whole board" },
       { id: ASK_ACTION, label: "Ask Claude", type: "ask", payload: { title: thread.title } },
-      { thread, prompt: t.buildAskPrompt(message, { bubble, ctx }), ...(archivedId ? { sessionId: archivedId } : {}) }
+      { thread, deviceId, prompt: t.buildAskPrompt(message, { bubble, ctx }), ...(archivedId ? { sessionId: archivedId } : {}) }
     );
     if (!task) return res.end(JSON.stringify({ ok: false, message: "Your Claude agent isn't connected on this computer." }));
     t.appendThread(thread, [{ role: "user", text: message }], { status: "running", lastTaskId: task.id });
@@ -1817,7 +1998,9 @@ const server = http.createServer(async (req, res) => {
       persistBubble(userId, t.boardSessionId(), bubble);
       t.bumpAndBroadcast();
     }
-    return res.end(JSON.stringify({ ok: true, status: "running", threadId: thread.id }));
+    return res.end(
+      JSON.stringify({ ok: true, status: "running", threadId: thread.id, device: task.deviceName })
+    );
   }
 
   // Standing notes, by hand: the same list the agent writes with add_note, so a
@@ -1864,6 +2047,17 @@ const server = http.createServer(async (req, res) => {
       return res.end(
         JSON.stringify({ ok: false, message: "That session can't be resumed — run the action again to start a new one." })
       );
+    // The Claude session being resumed exists on ONE machine. If that machine is
+    // gone, say so instead of resuming a session id on a computer that has never
+    // heard of it (which silently starts unrelated work).
+    const target = t.agentSocket(thread.deviceId);
+    if (thread.deviceId && target?._caps?.deviceId !== thread.deviceId)
+      return res.end(
+        JSON.stringify({
+          ok: false,
+          message: `This conversation lives on ${thread.deviceName || "another computer"} — open Earshot there to continue it, or run the action again here to start a fresh one.`,
+        })
+      );
     // a follow-up carries no mission or transcript: the resumed session on the
     // user's machine still holds all of it
     const task = t.dispatchTask(
@@ -1890,10 +2084,15 @@ const server = http.createServer(async (req, res) => {
       res.statusCode = 404;
       return res.end(JSON.stringify({ ok: false, message: "not found" }));
     }
-    const ws = t.agentSocket();
-    if (!ws)
+    // the file is on the machine that ran the task, so ask THAT one — not
+    // whichever agent happens to be first in the list
+    const ws = t.agentSocket(thread.deviceId);
+    if (!ws || (thread.deviceId && ws._caps?.deviceId !== thread.deviceId))
       return res.end(
-        JSON.stringify({ ok: false, message: "That file is on the computer that ran the task — start Earshot there to open it." })
+        JSON.stringify({
+          ok: false,
+          message: `That file is on ${thread.deviceName || "the computer that ran the task"} — open Earshot there to get at it.`,
+        })
       );
     // a name, never a path: the agent re-checks this against its task folder
     const name = String(file || "").replace(/[\\/]/g, "").slice(0, 200);
@@ -1932,7 +2131,10 @@ const server = http.createServer(async (req, res) => {
         title: p.title || p.subject || action.label || bubble.title,
         type: action.type,
         // routing the click will actually take, so the sheet can say so
-        route: agentRoutable && t.agentSocket() ? "agent" : "hub",
+        route: agentRoutable && t.agentSocket(req_.deviceId) ? "agent" : "hub",
+        // the sheet says which computer this will run on before you click
+        device: agentRoutable ? t.agentSocket(req_.deviceId)?._caps?.deviceName || "" : "",
+        claudeMissing: t.claudeMissing(),
         prompt: agentRoutable
           ? t.buildTaskPrompt(bubble, action, ctx, cleanNotes(req_.notes))
           : "",
@@ -1943,7 +2145,7 @@ const server = http.createServer(async (req, res) => {
   if (req.method === "POST" && (req.url === "/action" || req.url === "/dismiss")) {
     let body = "";
     for await (const chunk of req) body += chunk;
-    const { bubbleId, actionId, sessionId, notes } = JSON.parse(body || "{}");
+    const { bubbleId, actionId, sessionId, notes, deviceId } = JSON.parse(body || "{}");
     res.setHeader("content-type", "application/json");
 
     if (req.url === "/dismiss") {
@@ -1976,10 +2178,11 @@ const server = http.createServer(async (req, res) => {
     if (agentRoutable) {
       // the click opens a CONVERSATION with the user's Claude, kept under the
       // concept it came from; follow-ups (POST /thread/reply) resume it
-      const thread = t.agentSocket() ? t.newThread(threadSessionKey(t, archivedId), bubble, action) : null;
+      const thread = t.agentSocket(deviceId) ? t.newThread(threadSessionKey(t, archivedId), bubble, action) : null;
       const task = t.dispatchTask(bubble, action, {
         notes: userNotes,
         thread,
+        deviceId, // the browser's own computer, when it knows which one it is
         ...(archivedId ? { sessionId: archivedId, ctx } : {}),
       });
       if (task) {
@@ -2000,7 +2203,12 @@ const server = http.createServer(async (req, res) => {
           t.bumpAndBroadcast();
         }
         return res.end(
-          JSON.stringify({ ok: true, status: "running", message: `Your Claude is on it: ${task.title}` })
+          JSON.stringify({
+            ok: true,
+            status: "running",
+            device: task.deviceName,
+            message: `Your Claude is on it${task.deviceName ? ` (on ${task.deviceName})` : ""}: ${task.title}`,
+          })
         );
       }
     }
@@ -2063,6 +2271,7 @@ wss.on("connection", (ws, req) => {
       t.captureSockets.delete(ws);
       // the stream owner left: the next agent to send audio takes over
       if (t.primaryCapture === ws) t.primaryCapture = null;
+      t.deviceGone(ws); // its running tasks can never report back
       t.broadcast(t.status());
     });
   } else {

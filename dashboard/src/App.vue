@@ -3,6 +3,7 @@ import { ref, computed, onMounted, nextTick, watch } from "vue";
 import Bubble from "./components/Bubble.vue";
 import ActionSheet from "./components/ActionSheet.vue";
 import AskSheet from "./components/AskSheet.vue";
+import Onboarding from "./components/Onboarding.vue";
 
 // vite dev (:5173) talks to a local hub; a built dashboard is served BY the
 // hub, so everything is same-origin (and wss behind https)
@@ -15,6 +16,18 @@ const WS_URL = DEV
 const needSignIn = ref(false);
 const signInError = ref("");
 const gsiButton = ref(null);
+
+// ---- which computer is this browser on? ----
+// Nothing in the web platform can tell us, so we learn it the one moment it is
+// knowable: the pairing page is opened BY the agent on that machine, so whatever
+// device approves a pairing here is this browser's device. Everything the user
+// clicks then runs THERE rather than on whichever agent connected first.
+const myDeviceId = ref(localStorage.getItem("earshot.deviceId") || "");
+function rememberDevice(deviceId) {
+  if (!deviceId) return;
+  myDeviceId.value = deviceId;
+  localStorage.setItem("earshot.deviceId", deviceId);
+}
 
 const showSettings = ref(false);
 const pairCode = ref(new URLSearchParams(location.search).get("pair") || "");
@@ -43,6 +56,7 @@ async function approvePair() {
   const result = await r.json();
   if (result.ok) {
     pairDone.value = true;
+    rememberDevice(result.deviceId); // this browser is on the computer it just approved
     history.replaceState(null, "", location.pathname); // drop ?pair from the URL
   } else {
     pairError.value = result.message || "Approval failed.";
@@ -57,6 +71,9 @@ const me = ref(null);            // /me payload when the settings panel is open
 const captureConnected = ref(true); // optimistic until a status message says otherwise
 const captureAgents = ref(0);       // >1 = duplicate agents on the account (extras muted by the hub)
 const agentsOutdated = ref(0);      // agents running older code than this hub serves
+const devices = ref([]);            // every connected agent: name, platform, claude, listening
+const listeningOn = ref("");        // the device whose audio is being ingested
+const claudeMissing = ref(false);   // an agent is connected but has no Claude CLI
 const claudeConnected = ref(true);
 const googleConnected = ref(false);
 const asrOk = ref(true); // false = groq mode selected but the server has no GROQ_API_KEY
@@ -82,6 +99,20 @@ async function saveAsr(asrMode, asrModel) {
 async function openSettings() {
   showSettings.value = true;
   me.value = await (await fetch(`${HTTP_BASE}/me`)).json();
+}
+
+// ---- first run: walk the setup instead of hiding it in Settings ----
+// Shown until it has been completed once (users.onboarded), and re-openable.
+const showOnboarding = ref(false);
+
+async function maybeOnboard() {
+  me.value = await (await fetch(`${HTTP_BASE}/me`)).json();
+  if (!me.value.onboarded && !pairCode.value) showOnboarding.value = true;
+}
+
+function openOnboarding() {
+  showSettings.value = false;
+  showOnboarding.value = true;
 }
 
 async function copyKey() {
@@ -113,6 +144,44 @@ async function updateAgents() {
   const r = await (await fetch(`${HTTP_BASE}/me/agent-update`, { method: "POST" })).json();
   showToast(r.message);
   setTimeout(openSettings, 4000); // agents restart, then report their new version
+}
+
+// ---- devices ----
+// The name of the computer this browser belongs to, and whether the hub can see
+// it. "this computer" in the UI means exactly that device, not the account.
+const myDevice = computed(() => devices.value.find((d) => d.deviceId === myDeviceId.value) || null);
+const runsOn = computed(() => {
+  if (myDevice.value?.claude) return myDevice.value.name;
+  const fallback = devices.value.find((d) => d.claude);
+  return fallback ? fallback.name : "";
+});
+
+// "I'm on this one": this browser remembers which computer it is sitting at, so
+// clicks run there. Normally learned at pairing; this is the manual path for a
+// browser that was paired before device routing existed.
+function claimDevice(d) {
+  rememberDevice(d.deviceId);
+  showToast(`This browser now runs its buttons on ${d.name}.`);
+}
+
+async function pinCaptureDevice(deviceId) {
+  const r = await (
+    await fetch(`${HTTP_BASE}/me/capture-device`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ deviceId }),
+    })
+  ).json();
+  if (me.value) me.value.captureDevice = r.captureDevice;
+  showToast(r.message);
+}
+
+// "I installed Claude Code just now" — the agents re-probe and re-send caps
+async function recheckAgents() {
+  const r = await (await fetch(`${HTTP_BASE}/me/agent-recheck`, { method: "POST" })).json();
+  if (!r.agents) return showToast("No Earshot agent is connected to ask.");
+  showToast("Checking your computer again…");
+  setTimeout(() => me.value && openSettings(), 3000);
 }
 
 // one-liner that registers this Earshot account as an MCP server in the
@@ -434,6 +503,9 @@ function connect() {
       captureConnected.value = msg.captureConnected;
       if (typeof msg.captureAgents === "number") captureAgents.value = msg.captureAgents;
       if (typeof msg.agentsOutdated === "number") agentsOutdated.value = msg.agentsOutdated;
+      if (Array.isArray(msg.devices)) devices.value = msg.devices;
+      if (typeof msg.listeningOn === "string") listeningOn.value = msg.listeningOn;
+      claudeMissing.value = Boolean(msg.claudeMissing);
       claudeConnected.value = msg.claudeConnected;
       googleConnected.value = msg.googleConnected;
       agentAvailable.value = Boolean(msg.agentAvailable);
@@ -584,6 +656,7 @@ onMounted(async () => {
     connect();
     loadPairInfo();
     loadSessions();
+    maybeOnboard();
     if (new URLSearchParams(location.search).get("google") === "connected") {
       showToast("Google connected — calendar context and real actions are live.");
       history.replaceState(null, "", location.pathname);
@@ -652,12 +725,20 @@ onMounted(async () => {
       ⚠ {{ agentsOutdated }} agent{{ agentsOutdated === 1 ? "" : "s" }} out of date
     </button>
     <button
+      v-if="connected && claudeMissing"
+      class="warn-chip"
+      @click="openSettings"
+      title="Earshot is running on your computer but Claude Code isn't installed there, so action buttons fall back to writing files"
+    >
+      ⚠ no Claude on your computer
+    </button>
+    <button
       v-if="connected && captureAgents > 1"
       class="warn-chip"
       @click="openSettings"
-      title="More than one Earshot app is capturing for your account. They all hear the same microphone, so only one is used — quit the extras from the tray."
+      :title="`Several computers are capturing for your account. Earshot is listening to ${listeningOn || 'whichever is active'} — pick one in Settings.`"
     >
-      ⚠ {{ captureAgents }} capture agents
+      🎧 {{ listeningOn || `${captureAgents} computers` }}
     </button>
     <button
       v-if="connected && !asrOk"
@@ -920,6 +1001,19 @@ onMounted(async () => {
     </div>
   </div>
 
+  <Onboarding
+    v-if="showOnboarding"
+    :http-base="HTTP_BASE"
+    :me="me"
+    :capture-connected="captureConnected && devices.length > 0"
+    :devices="devices"
+    :claude-missing="claudeMissing"
+    :agent-available="agentAvailable"
+    @done="showOnboarding = false"
+    @settings="showOnboarding = false; openSettings()"
+    @toast="showToast"
+  />
+
   <AskSheet
     v-if="askTarget"
     :key="`ask:${askTarget.sessionId || 'live'}:${askTarget.bubble?.id || 'board'}`"
@@ -928,6 +1022,9 @@ onMounted(async () => {
     :session-id="askTarget.sessionId"
     :feed="threadFeed"
     :agent-available="agentAvailable"
+    :device-id="myDeviceId"
+    :device-name="runsOn"
+    :claude-missing="claudeMissing"
     @toast="showToast"
     @close="askTarget = null"
   />
@@ -940,6 +1037,7 @@ onMounted(async () => {
     :action="pendingAction.action"
     :session-id="pendingAction.sessionId"
     :feed="threadFeed"
+    :device-id="myDeviceId"
     @sending="pendingAction.action.status = 'busy'"
     @ran="onActionRan"
     @toast="showToast"
@@ -968,19 +1066,63 @@ onMounted(async () => {
           <code class="code-wrap">{{ installLines.windows }}</code>
           <button class="mini" @click="copyInstall('windows')">copy</button>
         </div>
-        <p v-if="me.agents?.length">
-          Running:
-          <b>{{ me.agents.length }} agent{{ me.agents.length === 1 ? "" : "s" }}</b>
-          <template v-if="outdatedAgents">
-            — {{ outdatedAgents }} on older code
-            <button class="mini" @click="updateAgents">update now</button>
-          </template>
-          <template v-else> · up to date ({{ (me.captureVersion || "").slice(0, 7) }})</template>
+        <!-- one row per computer: an account can have several, and which one
+             does the work is no longer "whichever connected first" -->
+        <template v-if="devices.length">
+          <label>Your computers</label>
+          <div v-for="d in devices" :key="d.deviceId || d.name" class="device">
+            <span class="dev-name">
+              {{ d.name }}
+              <span v-if="d.deviceId === myDeviceId" class="dev-tag">this one</span>
+              <span v-if="d.listening" class="dev-tag on">listening</span>
+              <span v-if="!d.claude" class="dev-tag bad">no Claude</span>
+              <span v-if="!d.current" class="dev-tag bad">old code</span>
+            </span>
+            <span class="dev-meta">
+              {{ d.platform || "?" }}<template v-if="d.connectors?.length"> · {{ d.connectors.join(", ") }}</template>
+            </span>
+            <!-- a browser paired before device routing existed has no stored
+                 device, so let it claim one without re-pairing -->
+            <button
+              v-if="d.deviceId && d.deviceId !== myDeviceId"
+              class="mini"
+              title="Run buttons clicked in THIS browser on that computer"
+              @click="claimDevice(d)"
+            >
+              I'm on this one
+            </button>
+            <button
+              v-if="!d.listening"
+              class="mini"
+              title="Capture audio from this computer only"
+              @click="pinCaptureDevice(d.deviceId)"
+            >
+              listen here
+            </button>
+          </div>
+          <div class="keyrow">
+            <button class="mini" :class="{ sel: !me.captureDevice }" @click="pinCaptureDevice(null)">
+              listen to whichever is active
+            </button>
+            <button v-if="outdatedAgents" class="mini" @click="updateAgents">update {{ outdatedAgents }} agent(s)</button>
+            <button v-if="claudeMissing" class="mini" @click="recheckAgents">check for Claude again</button>
+          </div>
+          <p v-if="devices.length > 1">
+            Buttons you click here run on <b>{{ runsOn || "whichever computer is available" }}</b> — the
+            computer this browser was paired from.
+          </p>
+        </template>
+        <!-- more than one computer is a normal setup now; only the audio has to
+             be pinned to one of them, and that's the picker above -->
+        <p v-if="devices.length > 1">
+          Earshot only listens to one computer at a time —
+          <b>{{ listeningOn || "whichever speaks first" }}</b> right now. Use
+          <b>listen here</b> on the machine you're actually in the room with.
         </p>
-        <p v-if="captureAgents > 1" class="signin-error">
-          ⚠ <b>{{ captureAgents }} copies of the app</b> are capturing for your account. They all hear
-          the same microphone, so Earshot uses one and ignores the rest — quit the extras
-          (tray icon → Quit) so nothing competes.
+        <p v-else-if="captureAgents > 1" class="signin-error">
+          ⚠ <b>{{ captureAgents }} copies</b> of the agent are running on the same computer.
+          They hear the same microphone, so Earshot uses one and ignores the rest — quit the
+          extras (tray icon → Quit).
         </p>
         <p>
           Mac only: to hear the other side of calls you also need the BlackHole audio driver —
@@ -1055,10 +1197,25 @@ onMounted(async () => {
         <h3>3 · Your Claude <span :class="(me.agentAvailable || agentAvailable) ? 'ok' : 'bad'">{{ (me.agentAvailable || agentAvailable) ? "agent ready" : "no agent" }}</span></h3>
         <p>
           Every bubble button runs on <b>your own Claude</b>, on your computer, using the
-          apps you've already connected to it — install
-          <a href="https://claude.com/claude-code" target="_blank">Claude Code</a>, sign in
-          once, and the Earshot app does the rest. Watch the topbar while a task runs.
+          apps you've already connected to it. Watch the topbar while a task runs.
         </p>
+        <!-- the gate: an agent is connected but there's no CLI for it to run -->
+        <template v-if="claudeMissing">
+          <p class="signin-error">
+            Earshot is running on
+            <b>{{ devices.map((d) => d.name).join(", ") || "your computer" }}</b>, but
+            <b>Claude Code isn't installed there</b> — so buttons fall back to writing files
+            instead of doing the work.
+          </p>
+          <div class="keyrow">
+            <a class="mini dl" href="https://claude.com/claude-code" target="_blank" rel="noopener">Get Claude Code ↗</a>
+            <button class="mini" @click="recheckAgents">I've installed it — check again</button>
+          </div>
+          <label>Or paste this on that computer, then sign in with <code>claude</code></label>
+          <div class="keyrow">
+            <code class="code-wrap">npm install -g @anthropic-ai/claude-code</code>
+          </div>
+        </template>
         <p v-if="agentConnectors.length || me.agentConnectors?.length">
           Working through your Claude:
           <b>{{ (agentConnectors.length ? agentConnectors : me.agentConnectors).join(", ") }}</b>
@@ -1088,6 +1245,9 @@ onMounted(async () => {
         </div>
       </div>
 
+      <div class="keyrow">
+        <button class="mini" @click="openOnboarding">↻ setup walkthrough</button>
+      </div>
       <button class="mini close" @click="showSettings = false">close</button>
     </div>
   </div>

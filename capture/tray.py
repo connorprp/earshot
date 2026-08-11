@@ -191,9 +191,24 @@ def register_protocol():
 
 
 def pair():
-    """Device pairing: returns {wsUrl, captureKey} once the user approves."""
+    """Device pairing: returns {wsUrl, captureKey} once the user approves.
+
+    The deviceId rides along because the browser that approves this is, by
+    construction, running ON this machine — so the dashboard can remember which
+    computer it belongs to and route work here instead of to whichever agent
+    happened to connect first.
+    """
+    import updater
     code = "".join(secrets.choice(string.ascii_uppercase + string.digits) for _ in range(8))
-    http_json(f"{DEFAULT_HUB}/pair/start", {"code": code, "host": socket.gethostname()})
+    http_json(
+        f"{DEFAULT_HUB}/pair/start",
+        {
+            "code": code,
+            "host": updater.device_name(),
+            "deviceId": updater.device_id(),
+            "platform": "mac" if sys.platform == "darwin" else ("windows" if sys.platform == "win32" else "linux"),
+        },
+    )
     webbrowser.open(f"{DEFAULT_HUB}/?pair={code}")
     deadline = time.time() + 10 * 60
     while time.time() < deadline:
@@ -229,6 +244,13 @@ def start_pipeline(cfg):
 
     threading.Thread(target=main.asr_worker, daemon=True).start()
     threading.Thread(target=main.ws_sender, daemon=True).start()
+    # main.main() starts these; this path builds its threads by hand and used to
+    # skip them, so the packaged app reported NO connected apps (which steers
+    # both the distill's action buttons and each task's tool allowlist) and never
+    # noticed a Claude CLI installed after launch
+    threading.Thread(target=main._probe_connectors, daemon=True).start()
+    if not main._find_claude():
+        threading.Thread(target=main._watch_for_claude, daemon=True).start()
     if sys.platform == "darwin":
         import mac_audio
         streams = mac_audio.start_streams(main.Segmenter)  # noqa: F841

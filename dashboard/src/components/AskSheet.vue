@@ -17,6 +17,11 @@ const props = defineProps({
   // latest {type:"thread"} ws message; we take the ones addressed to us
   feed: { type: Object, default: null },
   agentAvailable: { type: Boolean, default: true },
+  // WHICH computer this browser belongs to (learned at pairing) and its name —
+  // without this the hub runs the work on whichever agent connected first
+  deviceId: { type: String, default: "" },
+  deviceName: { type: String, default: "" },
+  claudeMissing: { type: Boolean, default: false },
 });
 const emit = defineEmits(["toast", "close"]);
 
@@ -87,7 +92,7 @@ async function send() {
         body: JSON.stringify(
           resuming
             ? { threadId: thread.value.id, text }
-            : { text, bubbleId: props.bubble?.id, sessionId: props.sessionId }
+            : { text, bubbleId: props.bubble?.id, sessionId: props.sessionId, deviceId: props.deviceId }
         ),
       })
     ).json();
@@ -177,10 +182,16 @@ onBeforeUnmount(() => window.removeEventListener("keydown", onKey));
           split or dropped — and shows up on every screen at once. It can also just do the
           work: research, drafts, files, and anything your connected apps make real.
         </p>
-        <p v-if="!agentAvailable" class="signin-error small">
-          No Claude agent is connected on this computer, so there's nothing to ask yet —
-          open the Earshot app and make sure Claude Code is signed in.
+        <p v-if="claudeMissing" class="signin-error small">
+          Earshot is running on your computer, but <b>Claude Code isn't installed there</b> —
+          <a href="https://claude.com/claude-code" target="_blank" rel="noopener">get it here</a>,
+          then reopen this.
         </p>
+        <p v-else-if="!agentAvailable" class="signin-error small">
+          No Earshot agent is connected, so there's nothing to ask yet — open Earshot on your
+          computer (Settings ⚙ has the one-line installer).
+        </p>
+        <p v-else-if="deviceName" class="route">Runs on <b>{{ deviceName }}</b>.</p>
         <div class="examples">
           <button v-for="e in EXAMPLES" :key="e" class="mini ex" @click="draft = e">{{ e }}</button>
         </div>

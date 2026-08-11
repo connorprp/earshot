@@ -19,6 +19,9 @@ Object.assign(process.env, {
   GROQ_API_KEY: "ci-groq-key",
   EARSHOT_GROQ_URL: `http://127.0.0.1:${PORT + 1}`, // local stub below, not the real Groq
   EARSHOT_TEST_SEED: "1", // enables POST /test/seed-bubble (bubbles need no LLM in CI)
+  // Stop flushes a distill; with no real Claude credential the SDK retries for
+  // minutes and the suite looks hung. Nothing here asserts on distill output.
+  EARSHOT_TEST_NO_DISTILL: "1",
 });
 const env = { ...process.env };
 
@@ -825,6 +828,132 @@ try {
   check("an updated agent stops being reported as stale",
     (await (await fetch(`${BASE}/me`, { headers: { cookie: alice } })).json()).agents[0].current === true);
   upCap.terminate();
+
+  // ---- two computers on one account: work must run on the RIGHT one ----
+  // The bug this covers: agentSocket() returned whichever agent connected first,
+  // so a click in the laptop's browser ran on the always-on desktop, wrote its
+  // files there, and left the thread's Claude session on the wrong machine.
+  const agent = async (name, deviceId, claude = true) => {
+    const ws = new WebSocket(`ws://127.0.0.1:${PORT}/ingest?key=key-alice`);
+    const seen = [];
+    ws.on("message", (d) => seen.push(JSON.parse(d)));
+    await new Promise((r) => ws.on("open", r));
+    ws.send(JSON.stringify({ type: "caps", claude, connectors: [], deviceId, deviceName: name, platform: "windows" }));
+    await sleep(250);
+    return { ws, seen };
+  };
+  const desktop = await agent("RustyDesktop", "dev-desktop"); // connects FIRST, as it would
+  const laptop = await agent("MacBook", "dev-laptop");
+  await sleep(300);
+  const meDev = await (await fetch(`${BASE}/me`, { headers: { cookie: alice } })).json();
+  check("both computers are listed with their names",
+    meDev.devices?.length === 2 && meDev.devices.map((d) => d.name).sort().join(",") === "MacBook,RustyDesktop",
+    JSON.stringify(meDev.devices?.map((d) => d.name)));
+  await fetch(`${BASE}/test/seed-bubble`, {
+    method: "POST", headers: { cookie: alice, "content-type": "application/json" },
+    body: JSON.stringify({
+      id: "b-dev", title: "Device routing", summary: "s",
+      actions: [{ id: "a1", type: "agent", label: "Do it", status: "idle", payload: { title: "Device work", brief: "b" } }],
+    }),
+  });
+  // no deviceId = old browser: falls back to any capable agent (desktop, first in)
+  await fetch(`${BASE}/action`, {
+    method: "POST", headers: { cookie: alice, "content-type": "application/json" },
+    body: JSON.stringify({ bubbleId: "b-dev", actionId: "a1" }),
+  });
+  await sleep(300);
+  check("without a device preference the work still goes somewhere",
+    desktop.seen.some((m) => m.type === "task") || laptop.seen.some((m) => m.type === "task"));
+  // the laptop's browser says which computer it is
+  const laptopRun = await (await fetch(`${BASE}/action`, {
+    method: "POST", headers: { cookie: alice, "content-type": "application/json" },
+    body: JSON.stringify({ bubbleId: "b-dev", actionId: "a1", deviceId: "dev-laptop" }),
+  })).json();
+  await sleep(300);
+  const laptopTask = laptop.seen.filter((m) => m.type === "task").at(-1);
+  check("a click from the laptop's browser runs on the LAPTOP",
+    laptopRun.device === "MacBook" && !!laptopTask, `${laptopRun.device} / ${!!laptopTask}`);
+  check("...and not on the desktop that connected first",
+    desktop.seen.filter((m) => m.type === "task").length === 1);
+  // the thread is pinned to that machine: a follow-up resumes where the session is
+  const thDev = await (await fetch(`${BASE}/thread?bubbleId=b-dev&actionId=a1`, { headers: { cookie: alice } })).json();
+  check("the conversation records which computer owns it",
+    thDev.thread?.deviceId === "dev-laptop" && thDev.thread.deviceName === "MacBook");
+  laptop.ws.send(JSON.stringify({ type: "task_session", id: laptopTask.id, threadId: laptopTask.threadId, sessionId: "claude-on-laptop" }));
+  laptop.ws.send(JSON.stringify({ type: "task_done", id: laptopTask.id, ok: true, summary: "done", files: ["out.md"] }));
+  await sleep(300);
+  const replyOk = await (await fetch(`${BASE}/thread/reply`, {
+    method: "POST", headers: { cookie: alice, "content-type": "application/json" },
+    body: JSON.stringify({ threadId: laptopTask.threadId, text: "one more thing" }),
+  })).json();
+  await sleep(300);
+  check("a follow-up resumes on the machine that holds the Claude session",
+    replyOk.ok === true && laptop.seen.filter((m) => m.type === "task").at(-1).resume === "claude-on-laptop" &&
+    desktop.seen.filter((m) => m.type === "task").length === 1);
+  // deliverables live on that machine too
+  const openOn = await (await fetch(`${BASE}/thread/open`, {
+    method: "POST", headers: { cookie: alice, "content-type": "application/json" },
+    body: JSON.stringify({ threadId: laptopTask.threadId, file: "out.md" }),
+  })).json();
+  await sleep(200);
+  check("opening a deliverable asks the computer that made it",
+    openOn.ok === true && laptop.seen.some((m) => m.type === "open" && m.file === "out.md") &&
+    !desktop.seen.some((m) => m.type === "open"));
+  // that machine goes away: say so rather than resuming a session id elsewhere
+  laptop.ws.terminate();
+  await sleep(400);
+  const orphan = await (await fetch(`${BASE}/thread/reply`, {
+    method: "POST", headers: { cookie: alice, "content-type": "application/json" },
+    body: JSON.stringify({ threadId: laptopTask.threadId, text: "still there?" }),
+  })).json();
+  check("a follow-up refuses (with the computer's name) when that machine is gone",
+    orphan.ok === false && orphan.message.includes("MacBook"), orphan.message);
+
+  // pinning which computer Earshot LISTENS to (the audio half of the same bug)
+  const laptop2 = await agent("MacBook", "dev-laptop");
+  await fetch(`${BASE}/record/start`, { method: "POST", headers: { cookie: alice } });
+  const pin = await (await fetch(`${BASE}/me/capture-device`, {
+    method: "POST", headers: { cookie: alice, "content-type": "application/json" },
+    body: JSON.stringify({ deviceId: "dev-laptop" }),
+  })).json();
+  check("a listening device can be pinned", pin.ok === true && pin.message.includes("MacBook"));
+  const heard = [];
+  const devDash = await new Promise((resolve) => {
+    const ws = new WebSocket(`ws://127.0.0.1:${PORT}`, { headers: { cookie: alice } });
+    ws.on("message", (d) => { const m = JSON.parse(d); if (m.type === "transcript") heard.push(m.text); });
+    ws.on("open", () => resolve(ws));
+  });
+  await sleep(200);
+  desktop.ws.send(JSON.stringify({ type: "transcript", source: "them", text: "desktop room noise", ts: Date.now() / 1000 }));
+  await sleep(300);
+  laptop2.ws.send(JSON.stringify({ type: "transcript", source: "them", text: "the meeting on the laptop", ts: Date.now() / 1000 }));
+  await sleep(400);
+  check("audio from the pinned computer is kept",
+    heard.some((t) => t.startsWith("the meeting on the laptop")));
+  check("audio from the other computer is ignored",
+    !heard.some((t) => t.startsWith("desktop room noise")), heard.join(" | "));
+  await fetch(`${BASE}/me/capture-device`, {
+    method: "POST", headers: { cookie: alice, "content-type": "application/json" },
+    body: JSON.stringify({ deviceId: null }),
+  });
+  await fetch(`${BASE}/record/stop`, { method: "POST", headers: { cookie: alice } });
+  devDash.terminate();
+
+  // an agent with no Claude CLI is a different problem from no agent at all
+  const bare = await agent("BareBox", "dev-bare", false);
+  const meBare = await (await fetch(`${BASE}/me`, { headers: { cookie: bob } })).json();
+  check("a connected agent without Claude Code is reported as such, not as absent",
+    meBare.claudeMissing === false); // bob has no agents at all -> not "missing", just none
+  await sleep(200);
+  const recheck = await (await fetch(`${BASE}/me/agent-recheck`, { method: "POST", headers: { cookie: alice } })).json();
+  await sleep(300);
+  check("\"check again\" asks every agent to re-probe for the CLI",
+    recheck.ok === true && bare.seen.some((m) => m.type === "recheck"));
+  const onb = await (await fetch(`${BASE}/me/onboarded`, { method: "POST", headers: { cookie: alice } })).json();
+  check("finishing the walkthrough is remembered",
+    onb.ok === true && (await (await fetch(`${BASE}/me`, { headers: { cookie: alice } })).json()).onboarded === true);
+  bare.ws.terminate(); laptop2.ws.terminate(); desktop.ws.terminate();
+  await sleep(200);
 
   // ---- personalized installers ----
   check("capture bundle is public", (await fetch(`${BASE}/installer/capture.tgz`)).status === 200);
