@@ -93,35 +93,46 @@ jobs:
       - uses: actions/setup-node@v4
         with: { node-version: 22 }
       - run: cd server && npm ci
-      - name: Start a hub
-        shell: pwsh
-        run: |
-          $env:EARSHOT_MONGO = "mongodb://127.0.0.1:1/?serverSelectionTimeoutMS=300&connectTimeoutMS=300"
-          Start-Process -WindowStyle Hidden node -ArgumentList "index.js" -WorkingDirectory server -RedirectStandardOutput "$env:RUNNER_TEMP\hub.log" -RedirectStandardError "$env:RUNNER_TEMP\hub.err"
-          foreach ($i in 1..40) { if ((Get-Content "$env:RUNNER_TEMP\hub.log" -ErrorAction SilentlyContinue) -match "listening on") { break }; Start-Sleep 1 }
-          if (-not ((Get-Content "$env:RUNNER_TEMP\hub.log") -match "listening on")) { Get-Content "$env:RUNNER_TEMP\hub.err"; exit 1 }
-      # Windows PowerShell 5.1, not pwsh: it is what a friend actually pastes
-      # into, and its native-stderr handling has broken this script before
-      - name: Install via the piped one-liner
+      # One step, deliberately: a Windows runner kills the step's process tree,
+      # so a hub started in an earlier step is gone by the next one (POSIX
+      # backgrounding survives, which is why install-mac can split them).
+      # shell: powershell = Windows PowerShell 5.1, what a friend actually pastes
+      # into — and whose native-stderr handling has broken this script before.
+      - name: Install via the piped one-liner, against a real hub
         shell: powershell
         run: |
+          $ErrorActionPreference = 'Stop'
+          $env:EARSHOT_MONGO = "mongodb://127.0.0.1:1/?serverSelectionTimeoutMS=300&connectTimeoutMS=300"
+          $hubOut = "$env:RUNNER_TEMP\hub.log"
+          Start-Process -WindowStyle Hidden node -ArgumentList "index.js" -WorkingDirectory server `
+            -RedirectStandardOutput $hubOut -RedirectStandardError "$env:RUNNER_TEMP\hub.err"
+          foreach ($i in 1..40) {
+            if ((Get-Content $hubOut -ErrorAction SilentlyContinue) -match "listening on") { break }
+            Start-Sleep 1
+          }
+          if (-not ((Get-Content $hubOut -ErrorAction SilentlyContinue) -match "listening on")) {
+            Get-Content "$env:RUNNER_TEMP\hub.err" -ErrorAction SilentlyContinue
+            throw "hub never started"
+          }
+
           $env:EARSHOT_HUB = "http://127.0.0.1:7071"
-          $env:EARSHOT_APPDIR = "$env:RUNNER_TEMP\earshot"
+          $root = "$env:RUNNER_TEMP\earshot"
+          $env:EARSHOT_APPDIR = $root
           $env:EARSHOT_INSTALL_DRY = "1"
           irm "$env:EARSHOT_HUB/install/windows" | iex
-      - name: Check what it installed
-        shell: pwsh
-        run: |
-          $root = "$env:RUNNER_TEMP\earshot"
+
+          # ---- what it should have installed ----
           if (-not (Test-Path "$root\src\main.py")) { throw "no source tree" }
           if (-not (Test-Path "$root\start-agent.vbs")) { throw "no autostart script" }
           if (-not (Test-Path (Join-Path ([Environment]::GetFolderPath('Startup')) 'Earshot.lnk'))) { throw "no startup shortcut" }
           if (-not (Test-Path "$env:USERPROFILE\.local\bin\earshot.cmd")) { throw "no earshot command" }
-          $want = (Invoke-RestMethod http://127.0.0.1:7071/installer/capture.json).version
+          $want = (Invoke-RestMethod "$env:EARSHOT_HUB/installer/capture.json").version
           if ((Get-Content "$root\version.txt") -ne $want) { throw "version.txt is not what the hub serves" }
+          # the venv can actually run the agent, and a second update is a no-op
           & "$root\venv\Scripts\python.exe" -c "import sys; sys.path.insert(0, r'$root\src'); import main, tray, updater; print('agent imports OK')"
-          $env:EARSHOT_APPDIR = $root
-          & "$root\venv\Scripts\python.exe" -c "import sys; sys.path.insert(0, r'$root\src'); import updater; print('re-update:', updater.apply('http://127.0.0.1:7071') or 'already current')"
+          if ($LASTEXITCODE -ne 0) { throw "the installed agent cannot import" }
+          & "$root\venv\Scripts\python.exe" -c "import sys; sys.path.insert(0, r'$root\src'); import updater; print('re-update:', updater.apply('$env:EARSHOT_HUB') or 'already current')"
+          if ($LASTEXITCODE -ne 0) { throw "updater failed on a second pass" }
 
   # ---- packaged desktop apps (tray + pairing; no terminal for end users) ----
   app-windows:
