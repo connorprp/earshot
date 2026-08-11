@@ -6,7 +6,11 @@ segments with faster-whisper on the GPU, and ships transcript events to the
 Node hub over websocket:
 
     {"type": "transcript", "source": "me"|"them", "text": "...", "ts": 1723...,
-     "speaker": "them-2"}   # loopback voices only, via speakers.py; absent if unknown
+     "speaker": "me"|"them-2"}   # voice identity via speakers.py; absent if unknown.
+                                 # "source" is the CHANNEL (mic vs loopback) —
+                                 # both echo layers key off it — while "speaker"
+                                 # is WHO: the mic can carry other people too
+                                 # (speakerphone, someone in the room).
 
 plus periodic {"type": "speakers", "speakers": [{id, centroid, seconds}]}
 snapshots so the hub can persist voice profiles per session.
@@ -244,7 +248,7 @@ _me_overlap: dict[float, float] = {}
 
 def asr_worker():
     labeler = SpeakerLabeler()
-    known_speakers = 0
+    known_rev = 0
     last_snapshot = 0.0
     first = True
     while True:
@@ -266,6 +270,16 @@ def asr_worker():
             if overlap >= echo_gate.GATE_OVERLAP and echo_gate.gate_engaged():
                 print(f"[echo] mic segment dropped ({overlap:.0%} inside loopback speech)")
                 continue
+        # Voice identity for BOTH channels: the mic is not one person (a
+        # speakerphone call or a coworker at the desk lands there too), so who
+        # spoke comes from the embedding, not from which stream it arrived on.
+        speaker = labeler.label(audio, source)
+        if source == "me" and speaker and speaker != "me" and overlap >= 0.3 and labeler.is_loopback_voice(speaker):
+            # voice-level echo evidence: the mic just heard a voice we know
+            # mostly from loopback, while loopback was playing. Evidence only —
+            # layers 1 and 2 still decide what actually gets dropped.
+            echo_gate.record_hit()
+            print(f"[echo] mic segment carries loopback voice {speaker} (evidence)")
         if ASR_MODE == "groq":
             event = {
                 "type": "audio",
@@ -275,15 +289,13 @@ def asr_worker():
                 "format": "wav",
                 "data": _wav_b64(audio),
             }
+            if speaker:
+                event["speaker"] = speaker
             if source == "me":
                 now = time.time()
                 for k in [k for k in _me_overlap if now - k > 90]:
                     del _me_overlap[k]
                 _me_overlap[start_ts] = overlap
-            else:
-                speaker = labeler.label(audio)
-                if speaker:
-                    event["speaker"] = speaker
             print(f"  [{event.get('speaker', source)}] {len(audio) / TARGET_RATE:.1f}s -> hub")
             out_queue.put(event)
         else:
@@ -310,16 +322,16 @@ def asr_worker():
                     print(f"[echo] mic line dropped (reads like loopback, match {match:.2f})")
                     continue
             event = {"type": "transcript", "source": source, "text": text, "ts": start_ts}
+            if speaker:
+                event["speaker"] = speaker
             if source == "them":
                 echo_gate.note_them_text(start_ts, text)
-                speaker = labeler.label(audio)
-                if speaker:
-                    event["speaker"] = speaker
             print(f"  [{event.get('speaker', source)}] {text}")
             out_queue.put(event)
-        # centroid snapshot: on a new voice, else at most every 20s
-        if labeler.clusters and (len(labeler.clusters) != known_speakers or time.time() - last_snapshot > 20):
-            known_speakers = len(labeler.clusters)
+        # centroid snapshot: whenever the label set changed (new voice, or the
+        # owner moved — which renames clusters without adding one), else 20s
+        if labeler.clusters and (labeler.rev != known_rev or time.time() - last_snapshot > 20):
+            known_rev = labeler.rev
             last_snapshot = time.time()
             out_queue.put({"type": "speakers", "speakers": labeler.snapshot()})
 
@@ -596,8 +608,15 @@ def _run_task(msg: dict):
     tdir.mkdir(parents=True, exist_ok=True)
     before = {p.name for p in tdir.iterdir() if p.is_file()}
     mcp = {"mcpServers": {"earshot": {"type": "http", "url": _hub_http_base() + "/mcp"}}}
+    headers = {}
     if CAPTURE_KEY:
-        mcp["mcpServers"]["earshot"]["headers"] = {"Authorization": "Bearer " + CAPTURE_KEY}
+        headers["Authorization"] = "Bearer " + CAPTURE_KEY
+    # which conversation is calling: the hub needs it to apply the earshot write
+    # tools (edit_notes & co) to the right board and to show "✎ …" in this chat
+    if thread_id:
+        headers["X-Earshot-Thread"] = thread_id
+    if headers:
+        mcp["mcpServers"]["earshot"]["headers"] = headers
     (tdir / "mcp.json").write_text(json.dumps(mcp))
     # no --strict-mcp-config: the user's own MCP config (incl. claude.ai
     # connectors) loads alongside the earshot server from mcp.json; only the

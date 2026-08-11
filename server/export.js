@@ -16,10 +16,16 @@ export function exportFileName(session, ext) {
   return `${safeName(sessionTitle(session))}.${ext}`;
 }
 
-function who(line, names = {}) {
-  if (line.source === "me") return "Me";
-  return names[line.speaker] || line.speaker || "Them";
+// Who said a line. The VOICE tag wins ("me" = the device owner, "them-N" =
+// anyone else, on EITHER channel — the mic carries speakerphone calls and
+// people in the room too); the raw channel is only the fallback for lines that
+// carry no tag (short segments, no embedding model, older capture agents).
+export function speakerLabel(line, names = {}, self = "Me") {
+  if (line.speaker) return line.speaker === "me" ? self : names[line.speaker] || line.speaker;
+  return line.source === "me" ? self : "Them";
 }
+
+const who = speakerLabel;
 
 function stamp(v) {
   return v ? new Date(v).toLocaleString() : "";
@@ -63,6 +69,11 @@ export function renderSessionMarkdown({ session = {}, transcript = [], bubbles =
     section("Open items", report.openItems);
   } else {
     out.push(`_No session report yet — the closeout pass runs when the recording stops._`, ``);
+  }
+
+  // the user's own standing corrections (pinned by hand or through their Claude)
+  if (session.boardNotes?.length) {
+    out.push(`## Your notes`, ``, ...session.boardNotes.map((n) => `- ${n.text}`), ``);
   }
 
   out.push(`## Concepts`, ``);
@@ -109,6 +120,8 @@ export function renderExport(data, format) {
           report: session.report || null,
           calendarEvent: session.calendarEvent || null,
           speakerNames: session.speakerNames || {},
+          speakerPins: session.speakerPins || [],
+          boardNotes: session.boardNotes || [],
           bubbles: data.bubbles || [],
           transcript: (data.transcript || []).map(({ _id, userId, sessionId, ...l }) => l),
         },

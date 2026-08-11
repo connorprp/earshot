@@ -22,6 +22,8 @@ jobs:
           curl -sL -o capture/models/nemo_en_titanet_small.onnx \
             https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/nemo_en_titanet_small.onnx
       - run: cd capture && python ci_test_mac.py
+      # owner election + voiceprint persistence (who on the mic is "me")
+      - run: python capture/test_speakers.py
       # deliverable links + the guardrails on opening them (posix branch)
       - run: python capture/test_links.py
       # the BlackHole pin: hash guardrails + "the url still serves those bytes"
@@ -53,6 +55,8 @@ jobs:
       # deliverable links + the guardrails on opening them (windows branch:
       # os.startfile, and the executable extensions that matter most here)
       - run: python capture/test_links.py
+      # owner election + voiceprint persistence (windows app-data store path)
+      - run: python capture/test_speakers.py
       - name: Build
         run: >
           pyinstaller --noconfirm --onefile --windowed --name EarshotCapture

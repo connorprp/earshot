@@ -9,7 +9,7 @@ const props = defineProps({
   // dismissed after the fact.
   archived: { type: Boolean, default: false },
 });
-defineEmits(["action", "dismiss"]);
+defineEmits(["action", "ask", "dismiss"]);
 
 const accent = computed(() => `var(--accent-${props.bubble.kind || "discussion"}, var(--dim))`);
 const askedFor = computed(() => (props.bubble.actions || []).filter((a) => a.userNotes));
@@ -20,6 +20,9 @@ const askedFor = computed(() => (props.bubble.actions || []).filter((a) => a.use
     <div class="bubble-head">
       <span class="kind">{{ bubble.kind }}</span>
       <h3>{{ bubble.title }}</h3>
+      <!-- you (or your Claude) rewrote this card: the distiller is told not to
+           argue with it, so it's worth showing -->
+      <span v-if="bubble.userEdited" class="kind edited" title="Edited by you — the automatic distiller won't revert it">✎ yours</span>
       <span v-if="bubble.removed" class="kind" :title="bubble.removedReason">dismissed</span>
       <button v-if="!archived" class="dismiss" title="Ignore" @click="$emit('dismiss')">✕</button>
     </div>
@@ -27,9 +30,23 @@ const askedFor = computed(() => (props.bubble.actions || []).filter((a) => a.use
     <ul v-if="bubble.details?.length" class="details">
       <li v-for="(d, i) in bubble.details" :key="i">{{ d }}</li>
     </ul>
-    <div v-if="bubble.actions?.length" class="actions">
+    <div class="actions">
+      <!-- always present, and not one of the model's hedged bets: whatever the
+           user wants done with this concept, including correcting the card
+           itself (their Claude edits the board live) -->
       <button
-        v-for="a in bubble.actions"
+        class="action ask"
+        :title="
+          bubble.askThreadId
+            ? 'Open the Claude conversation about this concept'
+            : 'Ask your Claude anything about this — or tell it what to fix'
+        "
+        @click="$emit('ask')"
+      >
+        ✦ Ask Claude<span v-if="bubble.askThreadId" class="thread-dot">💬</span>
+      </button>
+      <button
+        v-for="a in bubble.actions || []"
         :key="a.id"
         class="action"
         :class="a.status"

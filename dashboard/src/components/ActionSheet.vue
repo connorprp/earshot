@@ -1,5 +1,6 @@
 <script setup>
-import { ref, computed, watch, nextTick, onMounted, onBeforeUnmount } from "vue";
+import { ref, computed, watch, onMounted, onBeforeUnmount } from "vue";
+import ThreadLog from "./ThreadLog.vue";
 
 // The Claude session behind a concept. Clicking an action opens this: type
 // instructions, watch your own Claude work (the same text a terminal would
@@ -21,7 +22,6 @@ const emit = defineEmits(["sending", "ran", "toast", "close"]);
 
 const draft = ref(props.action.userNotes || "");
 const box = ref(null);
-const log = ref(null);
 const thread = ref(null);
 const messages = ref([]);
 const running = ref(false);
@@ -47,7 +47,6 @@ async function loadThread() {
     thread.value = data.thread;
     messages.value = data.thread.messages || [];
     running.value = data.running;
-    scrollDown();
   } catch {
     /* no thread yet is the normal case */
   }
@@ -88,12 +87,6 @@ function togglePreview(e) {
   if (previewOpen.value) loadPreview();
 }
 
-function scrollDown() {
-  nextTick(() => {
-    if (log.value) log.value.scrollTop = log.value.scrollHeight;
-  });
-}
-
 // live stream from the hub: appends addressed to this thread (or, right after
 // the first send, to this bubble+action before we know the thread id)
 watch(
@@ -109,7 +102,6 @@ watch(
     messages.value = messages.value.concat(msg.messages || []);
     running.value = msg.status === "running";
     if (!running.value) loadThread(); // picks up claudeSessionId so replies can resume
-    scrollDown();
   }
 );
 
@@ -218,41 +210,7 @@ onBeforeUnmount(() => {
       <p class="concept">on “{{ bubble.title }}”</p>
 
       <!-- the session itself: what your Claude said and did, as it happens -->
-      <div v-if="started" ref="log" class="log">
-        <div v-for="(m, i) in messages" :key="i" class="msg" :class="m.role">
-          <template v-if="m.role === 'user'">
-            <span class="caret">❯</span><span class="msg-text">{{ m.text }}</span>
-          </template>
-          <template v-else-if="m.role === 'tool'">
-            <span class="tool-name">⚒ {{ m.name }}</span>
-            <span v-if="m.text" class="tool-arg">{{ m.text }}</span>
-          </template>
-          <template v-else-if="m.role === 'tool_result'">
-            <pre class="tool-out" :class="{ bad: m.ok === false }">{{ m.text }}</pre>
-          </template>
-          <template v-else-if="m.role === 'result'">
-            <div class="result" :class="{ bad: m.ok === false }">
-              <b>{{ m.ok === false ? "✗ didn't finish" : "✓ done" }}</b>
-              <span class="msg-text">{{ m.text }}</span>
-              <!-- what it made, as things you can actually open: a url goes to
-                   the browser, a file opens on the computer that ran the task -->
-              <div v-if="m.links?.length || m.files?.length" class="deliverables">
-                <template v-for="(l, j) in m.links || []" :key="j">
-                  <a v-if="l.url" class="mini dl" :href="l.url" target="_blank" rel="noopener">↗ {{ l.label }}</a>
-                  <button v-else class="mini dl" @click="openFile(l.file)">📄 {{ l.label }}</button>
-                </template>
-                <button v-if="m.files?.length" class="mini" @click="openFile('')">open the folder</button>
-              </div>
-              <p v-if="m.files?.length" class="files">on your computer: {{ m.files.join(", ") }}</p>
-            </div>
-          </template>
-          <template v-else-if="m.role === 'system'">
-            <em class="sys">{{ m.text }}</em>
-          </template>
-          <span v-else class="msg-text">{{ m.text }}</span>
-        </div>
-        <div v-if="running" class="msg working"><span class="btn-spinner"></span> your Claude is working…</div>
-      </div>
+      <ThreadLog v-if="started" ref="log" :messages="messages" :running="running" @open="openFile" />
 
       <p v-else class="route">
         <template v-if="preview?.route === 'agent'">
@@ -326,37 +284,7 @@ onBeforeUnmount(() => {
 .route { font-size: 12px; color: var(--dim); margin: 0; }
 label { font-size: 11px; color: var(--dim); }
 
-/* the session log — terminal-ish, but readable */
-.log {
-  flex: 1; min-height: 140px; max-height: 46vh; overflow-y: auto;
-  background: var(--bg); border: 1px solid var(--border); border-radius: 10px;
-  padding: 12px; display: flex; flex-direction: column; gap: 10px;
-  font-size: 12.5px; line-height: 1.6;
-}
-.msg { display: flex; gap: 6px; align-items: baseline; }
-.msg-text { white-space: pre-wrap; word-break: break-word; }
-.msg.user { color: var(--text); }
-.msg.user .caret { color: var(--accent-decision); font-weight: 700; flex: none; }
-.msg.assistant { display: block; white-space: pre-wrap; word-break: break-word; }
-.msg.tool { font-size: 11px; color: var(--dim); flex-wrap: wrap; }
-.tool-name { color: var(--accent-scheduling); flex: none; }
-.tool-arg { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.tool-out {
-  margin: 0; font-size: 11px; color: var(--dim); white-space: pre-wrap;
-  word-break: break-word; max-height: 7em; overflow-y: auto;
-  border-left: 2px solid var(--border); padding-left: 8px; width: 100%;
-}
-.tool-out.bad { border-left-color: #f85149; }
-.result {
-  border: 1px solid #3fb950; border-radius: 8px; padding: 8px 10px;
-  display: flex; flex-direction: column; gap: 4px; width: 100%;
-}
-.result.bad { border-color: #f85149; }
-.result .files { margin: 0; font-size: 11px; color: var(--dim); }
-.deliverables { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 2px; }
-.deliverables .mini { text-decoration: none; }
-.sys { color: var(--dim); font-size: 11px; }
-.working { color: var(--dim); font-size: 11px; align-items: center; }
+/* the session log itself lives in ThreadLog.vue (shared with AskSheet) */
 
 textarea {
   background: var(--bg); border: 1px solid var(--border); color: var(--text);

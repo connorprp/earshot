@@ -6,11 +6,12 @@ const LLM_MODEL = process.env.EARSHOT_LLM || "sonnet";
 
 const SYSTEM = `You are the distillation engine of "Earshot", a live ambient dashboard.
 You receive the CURRENT dashboard state (concept bubbles) and NEW transcript lines
-from an ongoing real-world conversation ("me" = the user speaking, "them" = audio
-from the user's speakers: the other person on a call, a video, etc.).
-
-"them" lines may carry a voice tag like [them:them-2]: the same tag is always the
-same voice (anonymous voice matching), so different tags are different people.
+from an ongoing real-world conversation. Every line is prefixed with WHO said it,
+identified by VOICE: [me] is the user; [them-1], [them-2], ... are other people.
+The same tag is always the same voice (anonymous voice matching), so different
+tags are different people. A tagged voice may be on a call, in a video, on a
+phone's speaker, or physically in the room with the user — do not assume a
+remote call. A bare [them] is a voice that could not be placed.
 When 2+ distinct voices appear, maintain ONE bubble of kind "contact" titled
 "Participants" mapping voices to likely identities inferred from context —
 introductions, being addressed by name ("thanks, Dave"), roles, who runs the
@@ -31,7 +32,7 @@ Respond with ONLY a JSON array of patch operations, no prose:
       // name a voice (or revise a name) — introductions, "thanks, Dave", roles.
       // "Name?" = tentative. Merged into known names; send only what changed.
       // Emit this even when nothing else changed (alongside an otherwise empty
-      // patch). Never invent names.
+      // patch). Never invent names, and never map "me" (that is the user).
 
 Bubble shape:
 {
@@ -81,6 +82,15 @@ Rules:
   ALREADY DONE as proposed/claimed ("posters proposed") unless other lines
   corroborate it actually happened.
 - Keep the dashboard tight: distill, condense, merge. Quality over quantity.
+- THE USER OUTRANKS YOU. A "THE USER'S OWN NOTES" block, and any bubble carrying
+  "userEdited": true, come from the user editing this board themselves (they told
+  their own Claude to fix it). Treat both as ground truth: never revert their
+  wording or facts, never remove a userEdited bubble unless the conversation
+  clearly resolves it, and propagate their correction everywhere else it applies
+  (a name they fixed, a concept they reclassified, a detail they struck). You may
+  still ADD genuinely new developments to a userEdited bubble.
+- Voice names the user pinned are final — do not re-map that tag, even if the
+  conversation makes another name look plausible.
 - A CONTEXT block may list known company people and the calendar meeting this
   recording belongs to. Ground identities in it: prefer its real names/emails
   for participants, action payloads (attendees, to:), and the speakers op.
@@ -105,8 +115,10 @@ function upcomingDays(now, n = 14) {
 
 function buildPrompt(state, lines, note, context) {
   const now = new Date();
+  // identity, not channel: a mic line can be someone else (speakerphone, the
+  // room), so the voice tag is what the model sees when there is one
   const transcript = lines
-    .map((l) => `[${l.source}${l.speaker ? `:${l.speaker}` : ""}] ${l.text}`)
+    .map((l) => `[${l.speaker || (l.source === "me" ? "me" : "them")}] ${l.text}`)
     .join("\n");
   return [
     `Current datetime: ${now.toString()}`,
@@ -116,7 +128,15 @@ function buildPrompt(state, lines, note, context) {
     ...(context ? [``, `CONTEXT:`, context] : []),
     ``,
     `CURRENT DASHBOARD STATE:`,
-    JSON.stringify({ bubbles: state.bubbles, knownSpeakerNames: state.speakers || {} }, null, 1),
+    JSON.stringify(
+      {
+        bubbles: state.bubbles,
+        knownSpeakerNames: state.speakers || {},
+        ...(state.speakerPins?.length ? { pinnedByTheUser: state.speakerPins } : {}),
+      },
+      null,
+      1
+    ),
     ...(note ? [``, note] : []),
     ``,
     `NEW TRANSCRIPT LINES:`,
@@ -190,6 +210,8 @@ export function applyOps(state, ops) {
     } else if (op.op === "speakers" && op.map && typeof op.map === "object") {
       state.speakers = state.speakers || {};
       for (const [tag, name] of Object.entries(op.map)) {
+        // a name the user pinned (through their own Claude) is not up for review
+        if (state.speakerPins?.includes(tag)) continue;
         if (/^them-\d+$/.test(tag) && typeof name === "string" && name.trim()) {
           state.speakers[tag] = name.trim();
           changed = true;
@@ -204,12 +226,14 @@ export function applyOps(state, ops) {
 // button (ran it, typed instructions for it) would be erased by the next
 // distill. Carry that across — but only onto an action that is still the same
 // action: ids are positional (a0, a1…), so label+type must match too.
-function carryActionHistory(prior, next) {
+export function carryActionHistory(prior, next) {
   for (const a of next) {
     const p = prior.find((x) => x.id === a.id && x.label === a.label && x.type === a.type);
     if (!p) continue;
     if (p.status && p.status !== "idle") a.status = p.status;
     if (p.userNotes) a.userNotes = p.userNotes;
+    if (p.threadId) a.threadId = p.threadId; // the Claude session behind the button
+
   }
 }
 

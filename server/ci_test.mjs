@@ -111,6 +111,24 @@ try {
   aliceDash.terminate(); bobDash.terminate(); cap.terminate();
   await fetch(`${BASE}/record/stop`, { method: "POST", headers: { cookie: alice } });
 
+  // ---- mic-side diarization: two people arriving on ONE channel ----
+  // A mic line carrying a voice tag is that PERSON (speakerphone call, someone
+  // in the room), not the owner; only an untagged mic line falls back to "Me".
+  await fetch(`${BASE}/record/start`, { method: "POST", headers: { cookie: alice } });
+  const cap2 = new WebSocket(`ws://127.0.0.1:${PORT}/ingest?key=key-alice`);
+  await new Promise((r) => cap2.on("open", r));
+  const t0 = Date.now() / 1000;
+  cap2.send(JSON.stringify({ type: "transcript", source: "me", speaker: "me", text: "owner talking here", ts: t0 }));
+  cap2.send(JSON.stringify({ type: "transcript", source: "me", speaker: "them-1", text: "coworker on speakerphone", ts: t0 + 1 }));
+  cap2.send(JSON.stringify({ type: "transcript", source: "me", text: "untagged mic line", ts: t0 + 2 }));
+  await sleep(7500); // "me" lines wait out the 6s layer-2 echo hold before landing
+  const dia = await (await fetch(`${BASE}/sessions/live/export?format=txt`, { headers: { cookie: alice } })).text();
+  check("mic line with a voice tag is that person, not the owner", dia.includes("[them-1] coworker on speakerphone"), dia);
+  check("owner's own mic line still reads as Me", dia.includes("[Me] owner talking here"), dia);
+  check("untagged mic line falls back to the channel (Me)", dia.includes("[Me] untagged mic line"), dia);
+  cap2.terminate();
+  await fetch(`${BASE}/record/stop`, { method: "POST", headers: { cookie: alice } });
+
   // ---- self-serve settings ----
   const meRes = await fetch(`${BASE}/me`, { headers: { cookie: alice } });
   const meData = await meRes.json();
@@ -490,7 +508,153 @@ try {
   const bobBoard = await (await fetch(`${BASE}/state`, { headers: { cookie: bob } })).json();
   check("the stored bubble keeps the model's original payload",
     bobBoard.bubbles.find((b) => b.id === "b-email-bob")?.actions[0].payload.body === "hello");
+  // ---- "✦ Ask Claude": free-form direction, and live edits to the notes ----
+  // The general-purpose channel: not one of the model's buttons, and able to
+  // rewrite the board through the earshot MCP write tools.
+  // (the previous section's agent goes first: whichever capable socket connected
+  // earliest receives the tasks, and this block needs to read them)
   aliceDashT.terminate(); taskCap.terminate();
+  await sleep(300);
+  const mcpCall = (name, args, headers = {}) =>
+    fetch(`${BASE}/mcp`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        accept: "application/json, text/event-stream",
+        authorization: "Bearer key-alice",
+        ...headers,
+      },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 90, method: "tools/call", params: { name, arguments: args } }),
+    })
+      .then((r) => r.json())
+      .then((r) => r.result?.content?.[0]?.text || "");
+
+  await fetch(`${BASE}/test/seed-bubble`, {
+    method: "POST", headers: { cookie: alice, "content-type": "application/json" },
+    body: JSON.stringify({
+      id: "b-ask", kind: "discussion", title: "Vendor pricing", summary: "they quoted something",
+      details: ["quote unclear"],
+      actions: [{ id: "a1", type: "note", label: "Save as note", status: "done", userNotes: "cc dana",
+        payload: { title: "n", markdown: "m" } }],
+    }),
+  });
+  check("ask is refused with nothing typed",
+    (await (await fetch(`${BASE}/ask`, {
+      method: "POST", headers: { cookie: alice, "content-type": "application/json" },
+      body: JSON.stringify({ text: "  " }),
+    })).json()).ok === false);
+  const askCap = new WebSocket(`ws://127.0.0.1:${PORT}/ingest?key=key-alice`);
+  const askDown = [];
+  askCap.on("message", (d) => askDown.push(JSON.parse(d)));
+  await new Promise((r) => askCap.on("open", r));
+  askCap.send(JSON.stringify({ type: "caps", claude: true, connectors: ["Gmail"] }));
+  await sleep(300);
+  const askDash = [];
+  const askDashWs = await new Promise((resolve) => {
+    const ws = new WebSocket(`ws://127.0.0.1:${PORT}`, { headers: { cookie: alice } });
+    ws.on("message", (d) => askDash.push(JSON.parse(d)));
+    ws.on("open", () => resolve(ws));
+  });
+  const askRes = await (await fetch(`${BASE}/ask`, {
+    method: "POST", headers: { cookie: alice, "content-type": "application/json" },
+    body: JSON.stringify({ bubbleId: "b-ask", text: "them-2 is Dave Ramirez, and retitle this to Dave's quote" }),
+  })).json();
+  await sleep(300);
+  const askTask = askDown.filter((m) => m.type === "task").at(-1);
+  check("ask dispatches a conversation to the user's own Claude",
+    askRes.ok === true && askRes.status === "running" && !!askRes.threadId && askTask?.threadId === askRes.threadId);
+  check("the ask prompt carries the user's words, the concept, and the board with ids",
+    askTask.prompt.includes("them-2 is Dave Ramirez") &&
+    askTask.prompt.includes('id "b-ask"') && askTask.prompt.includes('"id": "b-ask"'),
+    askTask.prompt.slice(0, 400));
+  check("the ask prompt tells the agent how to edit the notes, and that edits stick",
+    askTask.prompt.includes("edit_notes") && askTask.prompt.includes("name_speakers") &&
+    askTask.prompt.includes("AUTHORITATIVE"));
+  check("an ask thread is anchored to its concept and reopens",
+    (await (await fetch(`${BASE}/thread?bubbleId=b-ask&actionId=__ask`,
+      { headers: { cookie: alice } })).json()).thread?.messages?.[0]?.text.includes("Dave Ramirez"));
+  const askedBoard = await (await fetch(`${BASE}/state`, { headers: { cookie: alice } })).json();
+  check("the concept remembers its conversation (💬 on the button)",
+    !!askedBoard.bubbles.find((b) => b.id === "b-ask")?.askThreadId);
+  // board-wide ask: same machinery, no concept
+  await fetch(`${BASE}/ask`, {
+    method: "POST", headers: { cookie: alice, "content-type": "application/json" },
+    body: JSON.stringify({ text: "nobody named Sarah was here" }),
+  });
+  await sleep(300);
+  const boardAsk = askDown.filter((m) => m.type === "task").at(-1);
+  check("a board-wide ask carries the whole board and no single concept",
+    boardAsk.prompt.includes("nobody named Sarah") && !boardAsk.prompt.includes("They asked it from this concept"));
+  check("ask 404s for a concept that isn't on the board",
+    (await fetch(`${BASE}/ask`, {
+      method: "POST", headers: { cookie: alice, "content-type": "application/json" },
+      body: JSON.stringify({ bubbleId: "nope", text: "fix this" }),
+    })).status === 404);
+
+  // the write tools: what the agent calls, attributed to its thread
+  const askThread = askRes.threadId;
+  const edited = await mcpCall(
+    "edit_notes",
+    { ops: [{ op: "update", id: "b-ask", bubble: { title: "Dave's quote", summary: "Dave quoted $4k for the rebuild.", details: ["$4k", "two weeks"] } }] },
+    { "x-earshot-thread": askThread }
+  );
+  await sleep(300);
+  const afterEdit = await (await fetch(`${BASE}/state`, { headers: { cookie: alice } })).json();
+  const edb = afterEdit.bubbles.find((b) => b.id === "b-ask");
+  check("edit_notes rewrites the live card", edb?.title === "Dave's quote" && edb.details.length === 2, JSON.stringify(edb));
+  check("an edited card is flagged as the user's own", edb?.userEdited === true);
+  check("the edit keeps what the user did with the buttons",
+    edb?.actions[0].status === "done" && edb.actions[0].userNotes === "cc dana");
+  check("the tool tells the agent what changed and hands back the board",
+    edited.includes("updated “Dave's quote”") && edited.includes('"concepts"'), edited.slice(0, 200));
+  check("every open dashboard sees the edit immediately",
+    askDash.some((m) => m.type === "state" && m.state.bubbles.some((b) => b.title === "Dave's quote")));
+  check("the edit is narrated inside the conversation the user asked from",
+    askDash.some((m) => m.type === "thread" && m.threadId === askThread &&
+      m.messages.some((x) => x.role === "system" && x.text.startsWith("✎"))));
+  const named = await mcpCall("name_speakers", { map: { "them-2": "Dave Ramirez", me: "nope" } }, { "x-earshot-thread": askThread });
+  const afterName = await (await fetch(`${BASE}/state`, { headers: { cookie: alice } })).json();
+  check("name_speakers names and pins the voice",
+    afterName.speakers["them-2"] === "Dave Ramirez" && afterName.speakerPins.includes("them-2"));
+  check("naming refuses 'me' (the owner is elected by voice, not typed)",
+    !afterName.speakers.me && named.includes("isn't a nameable voice tag"));
+  const noted2 = await mcpCall("add_note", { text: "Dave is the vendor, not staff" }, { "x-earshot-thread": askThread });
+  const afterNote = await (await fetch(`${BASE}/state`, { headers: { cookie: alice } })).json();
+  check("add_note pins a standing correction",
+    afterNote.notes?.[0]?.text === "Dave is the vendor, not staff" && noted2.includes("pinned a note"));
+  check("pinned notes are part of the export",
+    (await (await fetch(`${BASE}/sessions/live/export?format=md`, { headers: { cookie: alice } })).text())
+      .includes("Dave is the vendor, not staff"));
+  const badEdit = await mcpCall("edit_notes", { ops: [{ op: "update", id: "ghost", bubble: { title: "x" } }] });
+  check("editing a concept that doesn't exist explains itself instead of failing",
+    badEdit.includes('no concept with id "ghost"'));
+  const addRes = await mcpCall("edit_notes", { ops: [{ op: "add", bubble: { kind: "task", title: "Chase the quote", summary: "Ask Dave for it in writing." } }] });
+  const afterAdd = await (await fetch(`${BASE}/state`, { headers: { cookie: alice } })).json();
+  check("edit_notes can add a card the distiller never made",
+    afterAdd.bubbles.some((b) => b.id === "chase-the-quote" && b.kind === "task"), addRes.slice(0, 120));
+  await mcpCall("edit_notes", { ops: [{ op: "remove", id: "chase-the-quote" }] });
+  check("...and remove one",
+    !(await (await fetch(`${BASE}/state`, { headers: { cookie: alice } })).json()).bubbles.some((b) => b.id === "chase-the-quote"));
+  // by hand, with no agent involved
+  const handNote = await (await fetch(`${BASE}/board/note`, {
+    method: "POST", headers: { cookie: alice, "content-type": "application/json" },
+    body: JSON.stringify({ text: "the Q4 launch is off" }),
+  })).json();
+  check("a note can be pinned by hand too", handNote.ok === true && handNote.notes.length === 2);
+  const unpinned = await (await fetch(`${BASE}/board/note`, {
+    method: "POST", headers: { cookie: alice, "content-type": "application/json" },
+    body: JSON.stringify({ index: 0 }),
+  })).json();
+  check("and unpinned", unpinned.ok === true && unpinned.notes.length === 1 &&
+    unpinned.notes[0].text === "the Q4 launch is off");
+  check("the write tools are tenant-scoped (bob's Claude can't touch alice's board)",
+    !(await fetch(`${BASE}/mcp`, {
+      method: "POST",
+      headers: { "content-type": "application/json", accept: "application/json, text/event-stream", authorization: "Bearer key-bob" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 91, method: "tools/call", params: { name: "edit_notes", arguments: { ops: [{ op: "remove", id: "b-ask" }] } } }),
+    }).then((r) => r.json()).then((r) => r.result?.content?.[0]?.text || "")).includes("removed") &&
+    (await (await fetch(`${BASE}/state`, { headers: { cookie: alice } })).json()).bubbles.some((b) => b.id === "b-ask"));
+  askDashWs.terminate(); askCap.terminate();
 
   // ---- MCP endpoint (the user's own Claude reads their Earshot data) ----
   const mcpReq = (body, headers = {}) =>
@@ -513,14 +677,20 @@ try {
     { authorization: "Bearer key-alice" }
   )).json();
   const toolNames = (mcpTools.result?.tools || []).map((t) => t.name);
-  check("mcp lists the earshot tools",
+  check("mcp lists the earshot read tools",
     ["list_sessions", "get_session", "get_transcript", "search_transcripts", "get_live_board"].every((n) => toolNames.includes(n)));
+  check("mcp lists the write tools that let a Claude edit the notes",
+    ["edit_notes", "name_speakers", "add_note", "remove_note"].every((n) => toolNames.includes(n)));
   const mcpBoard = await (await mcpReq(
     { jsonrpc: "2.0", id: 3, method: "tools/call", params: { name: "get_live_board", arguments: {} } },
     { authorization: "Bearer key-alice" }
   )).json();
+  const boardText = mcpBoard.result?.content?.[0]?.text || "";
   check("mcp get_live_board returns alice's board (with her seeded bubble)",
-    (mcpBoard.result?.content?.[0]?.text || "").includes("John Smith support"));
+    boardText.includes("John Smith support"));
+  // an agent that can't name a concept can't edit one
+  check("get_live_board reports concept ids and the user's pinned notes",
+    boardText.includes('"id": "b-task"') && boardText.includes("yourNotes"), boardText.slice(0, 160));
   const mcpBoardBob = await (await mcpReq(
     { jsonrpc: "2.0", id: 4, method: "tools/call", params: { name: "get_live_board", arguments: {} } },
     { authorization: "Bearer key-bob" }
@@ -688,6 +858,43 @@ try {
   check("a distill update keeps the user's instructions on the same action",
     a0.userNotes === "cc dana" && a0.status === "done");
   check("history is not carried onto a replaced action", !a1.userNotes && a1.status === "idle");
+}
+
+// pure-function checks: the user's own edits outrank the distiller
+{
+  const { applyOps } = await import("./distill.js");
+  const { applyEditOps, notesBlock } = await import("./boardedit.js");
+
+  // a voice the user named cannot be renamed by a later automatic pass
+  const pinned = { bubbles: [], speakers: {}, speakerPins: [], notes: [] };
+  applyEditOps(pinned, [{ op: "speakers", map: { "them-2": "Dave Ramirez" } }]);
+  applyOps(pinned, [{ op: "speakers", map: { "them-2": "Doug?", "them-3": "Sarah" } }]);
+  check("a distill cannot rename a voice the user pinned",
+    pinned.speakers["them-2"] === "Dave Ramirez" && pinned.speakers["them-3"] === "Sarah");
+
+  // an edit only writes the fields it was given, and only writable ones
+  const state = {
+    bubbles: [{ id: "b1", kind: "task", title: "old", summary: "s", details: ["a"], createdAt: 1, actions: [] }],
+    speakers: {}, speakerPins: [], notes: [],
+  };
+  const res = applyEditOps(state, [
+    { op: "update", id: "b1", bubble: { title: "new title", removed: true, id: "hijacked", kind: "nonsense" } },
+  ]);
+  const b = state.bubbles[0];
+  check("an edit replaces only the fields it was handed",
+    b.title === "new title" && b.summary === "s" && b.details[0] === "a");
+  check("an edit cannot write the hub's own bookkeeping",
+    b.id === "b1" && b.removed === undefined && b.kind === "discussion" && b.userEdited === true);
+  check("the edit reports itself in words the user can read",
+    res.summary[0] === "updated “new title” (kind, title)", res.summary.join("|"));
+
+  // an unknown op is reported, not silently swallowed
+  const bad = applyEditOps({ bubbles: [], speakers: {}, speakerPins: [], notes: [] }, [{ op: "drop-table" }]);
+  check("an unknown op comes back as an error", bad.changed === false && bad.errors.length === 1);
+
+  check("the notes block tells the distiller who is in charge",
+    notesBlock([{ text: "Dave is the vendor" }]).includes("AUTHORITATIVE"));
+  check("no notes = no block (nothing wasted in the prompt)", notesBlock([]) === "");
 }
 
 if (failures) {

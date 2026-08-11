@@ -2,20 +2,26 @@
 // can be tested without live audio. Run the server first, then: npm run inject
 import WebSocket from "ws";
 
-// [source, text, speaker?] — speaker mimics capture's voice clustering tags
+// [source, text, speaker?] — source is the CHANNEL ("me" = mic, "them" =
+// loopback), speaker is the VOICE tag capture's clustering assigns. Note
+// them-2: a third person arriving on the MIC, the way a coworker in the room or
+// a phone call on speakerphone does — mic audio is not automatically the user.
 const LINES = [
   ["them", "Hey, so a couple things today. First, the homepage redesign.", "them-1"],
-  ["me", "Yeah, I think the hero section is too cluttered, we should drop the carousel."],
+  ["me", "Yeah, I think the hero section is too cluttered, we should drop the carousel.", "me"],
   ["them", "Agreed. And the pricing table needs a third column for the enterprise tier, 199 a month.", "them-1"],
-  ["me", "Okay, I can have Claude take a pass at that this week."],
+  ["me", "I've got Ollie here with me, he's been in that template all week.", "me"],
+  ["me", "The enterprise column is easy, but the mobile breakpoint is going to fight us.", "them-2"],
+  ["me", "Okay, I can have Claude take a pass at that this week.", "me"],
   ["them", "Second thing, when are you free next week to review the membership numbers?", "them-1"],
-  ["me", "When are you free?"],
+  ["me", "When are you free?", "me"],
   ["them", "Thursday or Friday, before 3.", "them-1"],
-  ["me", "Let's do Thursday at 2pm then."],
+  ["me", "Thursday's better for me, I'm on site Friday.", "them-2"],
+  ["me", "Let's do Thursday at 2pm then.", "me"],
   ["them", "Great, works for me.", "them-1"],
-  ["me", "Can you give me the regional membership counts real quick?"],
+  ["me", "Can you give me the regional membership counts real quick?", "me"],
   ["them", "Sure. Northeast is 412, Southeast 388, Midwest 291, and West is 502.", "them-1"],
-  ["me", "Got it, thanks. I'll put that in a sheet."],
+  ["me", "Got it, thanks. I'll put that in a sheet.", "me"],
 ];
 
 const HUB = "http://127.0.0.1:7071";
@@ -31,7 +37,11 @@ try {
 
 // stable fake voice profile so back-to-back inject runs voice-match as the
 // same person during the closeout relatedness check
-const SPEAKERS = [{ id: "them-1", centroid: [0.6, 0.8, 0, 0, 0, 0, 0, 0], seconds: 30 }];
+const SPEAKERS = [
+  { id: "me", centroid: [0, 0, 1, 0, 0, 0, 0, 0], seconds: 40 },
+  { id: "them-1", centroid: [0.6, 0.8, 0, 0, 0, 0, 0, 0], seconds: 30 },
+  { id: "them-2", centroid: [0, 0.6, 0, 0.8, 0, 0, 0, 0], seconds: 12 },
+];
 
 const ws = new WebSocket("ws://127.0.0.1:7071/ingest");
 ws.on("open", async () => {

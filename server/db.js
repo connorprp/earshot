@@ -169,6 +169,8 @@ export async function resumeSession(userId) {
     bubbles,
     startedAt: recent.startedAt,
     speakerNames: recent.speakerNames || {},
+    speakerPins: recent.speakerPins || [],
+    boardNotes: recent.boardNotes || [],
   };
 }
 
@@ -295,10 +297,15 @@ export function persistSpeakers(sessionId, speakers, activeIds) {
   );
 }
 
-// voice tag -> inferred display name (distill "speakers" ops), for the ticker
-export function persistSpeakerNames(sessionId, speakerNames) {
-  if (!db || !sessionId) return;
-  guarded(db.collection("sessions").updateOne({ _id: sessionId }, { $set: { speakerNames } }));
+// voice tag -> inferred display name (distill "speakers" ops), for the ticker.
+// pins = tags the USER named through their Claude; a later distill can't rename
+// them (see boardedit.js).
+export function persistSpeakerNames(sessionId, speakerNames, speakerPins) {
+  const _id = oid(sessionId);
+  if (!db || !_id) return;
+  const set = { speakerNames };
+  if (speakerPins) set.speakerPins = speakerPins;
+  guarded(db.collection("sessions").updateOne({ _id }, { $set: set }));
 }
 
 // most recent ENDED session for this user other than excludeId, with its live
@@ -313,10 +320,11 @@ export async function getPreviousSession(userId, excludeId) {
 }
 
 export async function saveSessionReport(sessionId, fields) {
-  if (!db || !sessionId) return;
+  const _id = oid(sessionId); // archived writes arrive as strings, live ones as ObjectIds
+  if (!db || !_id) return;
   await db
     .collection("sessions")
-    .updateOne({ _id: sessionId }, { $set: fields })
+    .updateOne({ _id }, { $set: fields })
     .catch((e) => console.error("[db] saveSessionReport failed:", e.message));
 }
 

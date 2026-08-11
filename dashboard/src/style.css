@@ -160,6 +160,15 @@ body {
 @keyframes agent-glow {
   50% { box-shadow: 0 0 8px 0 var(--accent-decision); }
 }
+/* "✦ Ask Claude" — always on the card, and deliberately quieter than the
+   model's suggested actions until you hover it */
+.action.ask {
+  border-color: var(--border); color: var(--dim);
+  border-style: dashed;
+}
+.action.ask:hover { background: var(--panel-2); border-color: var(--accent-decision); color: var(--accent-decision); }
+.kind.edited { color: var(--accent-data); border-color: var(--accent-data); }
+
 /* instructions the user typed when they ran an action — kept on the bubble */
 .asked { list-style: none; display: flex; flex-direction: column; gap: 3px; margin-top: 2px; }
 .asked li { font-size: 11px; color: var(--dim); line-height: 1.5; font-style: italic; }
@@ -235,6 +244,36 @@ body {
 }
 .export-menu .mini { text-align: left; border-color: transparent; }
 .export-menu .mini:hover { border-color: var(--accent-scheduling); }
+
+/* ---- your own notes: standing corrections pinned above the board ---- */
+.notes-card {
+  margin: 20px 20px 0;
+  background: var(--panel);
+  border: 1px solid var(--border); border-left: 3px solid var(--accent-data);
+  border-radius: 12px; padding: 12px 14px;
+  display: flex; flex-direction: column; gap: 7px;
+}
+.notes-card h4 {
+  font-size: 10px; text-transform: uppercase; letter-spacing: 1px; color: var(--dim);
+  display: flex; align-items: center; gap: 8px;
+}
+.notes-card h4 span { text-transform: none; letter-spacing: 0; font-weight: 400; }
+.note-row { display: flex; align-items: baseline; gap: 8px; font-size: 12.5px; line-height: 1.5; }
+.note-row .dismiss { font-size: 13px; margin-left: auto; }
+.note-add { display: flex; gap: 6px; }
+.note-add input {
+  flex: 1; min-width: 0; background: var(--bg); border: 1px solid var(--border);
+  color: var(--text); padding: 5px 9px; border-radius: 7px; font-size: 12px;
+}
+.note-add input:focus { outline: none; border-color: var(--accent-data); }
+
+/* the topbar's board-wide "ask" button */
+.ask-btn {
+  font-size: 11px; font-weight: 600; cursor: pointer;
+  color: var(--accent-decision); background: var(--panel-2);
+  border: 1px solid var(--accent-decision); border-radius: 99px; padding: 5px 12px;
+}
+.ask-btn:hover { background: var(--accent-decision); color: #0d1117; }
 
 /* ---- session report card (archive view) ---- */
 .report-card {

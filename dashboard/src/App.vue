@@ -2,6 +2,7 @@
 import { ref, computed, onMounted, nextTick, watch } from "vue";
 import Bubble from "./components/Bubble.vue";
 import ActionSheet from "./components/ActionSheet.vue";
+import AskSheet from "./components/AskSheet.vue";
 
 // vite dev (:5173) talks to a local hub; a built dashboard is served BY the
 // hub, so everything is same-origin (and wss behind https)
@@ -117,6 +118,7 @@ const agentAvailable = ref(false); // a capture agent with Claude Code is connec
 const agentConnectors = ref([]);   // apps connected to the user's own Claude
 const bubbles = ref([]);
 const stateSpeakers = ref({});
+const boardNotes = ref([]); // standing corrections the user (or their Claude) pinned
 const lines = ref([]);
 const toast = ref("");
 const flashIds = ref(new Set());
@@ -263,11 +265,64 @@ const viewSpeakerNames = computed(() =>
   viewing.value ? viewing.value.session?.speakerNames || {} : speakerNames.value
 );
 const viewReport = computed(() => (viewing.value ? viewing.value.session?.report || null : null));
+const viewNotes = computed(() => (viewing.value ? viewing.value.session?.boardNotes || [] : boardNotes.value));
 
+// ---- your own notes: corrections that outrank the distiller ----
+// Same list the agent writes with add_note; pinning one by hand is the no-agent
+// path to the same authority.
+const noteDraft = ref("");
+const notesOpen = ref(false); // the add row (the card itself shows whenever notes exist)
+const noteBox = ref(null);
+
+function openNotes() {
+  notesOpen.value = true;
+  nextTick(() => noteBox.value?.focus());
+}
+
+async function noteEdit(body) {
+  const r = await (
+    await fetch(`${HTTP_BASE}/board/note`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ ...body, sessionId: viewing.value?.id }),
+    })
+  ).json();
+  if (!r.ok) return showToast(r.message || "Couldn't update your notes.");
+  if (viewing.value) reloadViewed(); // archived: Mongo holds it, re-read
+  else if (r.notes) boardNotes.value = r.notes;
+}
+
+async function pinNote() {
+  const text = noteDraft.value.trim();
+  if (!text) return;
+  noteDraft.value = "";
+  await noteEdit({ text });
+}
+
+// the board a reopened session shows lives in Mongo, so an edit to it comes back
+// by re-reading rather than through the live state broadcast
+async function reloadViewed() {
+  if (!viewing.value) return;
+  try {
+    const res = await fetch(`${HTTP_BASE}/sessions/${viewing.value.id}`);
+    if (!res.ok) return;
+    const data = await res.json();
+    viewing.value = { ...viewing.value, ...data };
+  } catch {
+    /* keep what we have */
+  }
+}
+
+// The voice tag decides who spoke, not the audio channel: "me" is you, any
+// them-N is someone else even when they arrived through your mic (a
+// speakerphone call, someone in the room). No tag = fall back to the channel.
 function whoLabel(line) {
-  if (line.source === "me") return "You";
-  if (!line.speaker) return "Them";
+  if (!line.speaker) return line.source === "me" ? "You" : "Them";
+  if (line.speaker === "me") return "You";
   return viewSpeakerNames.value[line.speaker] || `Them ${line.speaker.replace("them-", "")}`;
+}
+function whoClass(line) {
+  return line.speaker ? (line.speaker === "me" ? "me" : "them") : line.source;
 }
 
 let toastTimer;
@@ -286,6 +341,7 @@ function applyState(state) {
   flashIds.value = flashed;
   bubbles.value = state.bubbles;
   stateSpeakers.value = state.speakers || {};
+  boardNotes.value = state.notes || [];
   setTimeout(() => (flashIds.value = new Set()), 1300);
 }
 
@@ -363,8 +419,13 @@ function connect() {
       }
     } else if (msg.type === "closeout") closingOut.value = msg.value;
     else if (msg.type === "tasks") tasks.value = msg.tasks;
-    // the user's Claude, talking: streamed into the open action sheet
+    // the user's Claude, talking: streamed into the open sheet
     else if (msg.type === "thread") threadFeed.value = msg;
+    // their Claude edited an ARCHIVED session's board (the live one arrives as a
+    // normal state update) — re-read it if that's what we're looking at
+    else if (msg.type === "session_patch") {
+      if (msg.sessionId === viewing.value?.id) reloadViewed();
+    }
     else if (msg.type === "task_done") {
       // an archived bubble isn't in the broadcast state — patch the open
       // session's copy so its button flips to done/error like a live one
@@ -455,6 +516,15 @@ const threadFeed = ref(null);    // latest {type:"thread"} ws message
 
 function openActionSheet(bubble, action) {
   pendingAction.value = { bubble, action, sessionId: viewing.value?.id };
+}
+
+// ✦ Ask Claude: the same conversation machinery, but free-form — one concept
+// (bubble) or the whole board (null). Its edits arrive as ordinary state
+// updates, which is why a correction made here lands on every card at once.
+const askTarget = ref(null); // { bubble, sessionId } while the sheet is open
+
+function openAsk(bubble = null) {
+  askTarget.value = { bubble, sessionId: viewing.value?.id };
 }
 
 // the sheet ran something: reflect it on the button and handle the non-agent
@@ -561,6 +631,14 @@ onMounted(async () => {
     >
       ⚠ transcription offline
     </button>
+    <!-- board-wide ask: corrections and requests that aren't about one card -->
+    <button
+      class="ask-btn"
+      title="Ask your Claude to fix, add to, or work from these notes"
+      @click="openAsk(null)"
+    >
+      ✦ Ask Claude
+    </button>
     <button
       class="rec-btn"
       :class="{ on: recording }"
@@ -652,6 +730,9 @@ onMounted(async () => {
             {{ tickerTall ? "shrink transcript" : "expand transcript" }}
           </button>
         </template>
+        <button class="mini" title="Pin a correction or piece of context for the distiller" @click="openNotes">
+          ＋ note
+        </button>
         <div class="export-wrap">
           <button class="mini" @click="showExport = !showExport">⬇ Export</button>
           <div v-if="showExport" class="export-menu">
@@ -687,6 +768,26 @@ onMounted(async () => {
           </div>
         </div>
 
+        <!-- what you've told it yourself: pinned into every distill from here on -->
+        <div v-if="viewNotes.length || notesOpen" class="notes-card">
+          <h4>Your notes <span>— these outrank anything the transcript says</span></h4>
+          <div v-for="(n, i) in viewNotes" :key="i" class="note-row">
+            <span>{{ n.text }}</span>
+            <button class="dismiss" title="Unpin this note" @click="noteEdit({ index: i })">✕</button>
+          </div>
+          <div v-if="notesOpen" class="note-add">
+            <input
+              ref="noteBox"
+              v-model="noteDraft"
+              placeholder="e.g. Dave is the vendor, not staff — everything he asks for is a quote"
+              @keyup.enter="pinNote"
+              @keyup.esc="notesOpen = false"
+            />
+            <button class="mini" :disabled="!noteDraft.trim()" @click="pinNote">pin</button>
+            <button class="mini" @click="notesOpen = false">done</button>
+          </div>
+        </div>
+
         <TransitionGroup tag="div" name="bubbles" class="grid">
           <Bubble
             v-for="b in viewBubbles"
@@ -695,6 +796,7 @@ onMounted(async () => {
             :flash="!viewing && flashIds.has(b.id)"
             :archived="Boolean(viewing)"
             @action="openActionSheet(b, $event)"
+            @ask="openAsk(b)"
             @dismiss="dismiss(b)"
           />
           <div v-if="viewBubbles.length === 0" key="__empty" class="empty">
@@ -711,7 +813,7 @@ onMounted(async () => {
 
       <div class="ticker" :class="{ tall: tickerTall }" ref="tickerEl">
         <div v-for="(l, i) in viewLines" :key="i" class="line">
-          <span class="who" :class="l.source">{{ whoLabel(l) }}</span>{{ l.text }}
+          <span class="who" :class="whoClass(l)">{{ whoLabel(l) }}</span>{{ l.text }}
         </div>
         <div v-if="!viewLines.length" class="line">(no transcript)</div>
       </div>
@@ -781,6 +883,18 @@ onMounted(async () => {
       </template>
     </div>
   </div>
+
+  <AskSheet
+    v-if="askTarget"
+    :key="`ask:${askTarget.sessionId || 'live'}:${askTarget.bubble?.id || 'board'}`"
+    :http-base="HTTP_BASE"
+    :bubble="askTarget.bubble"
+    :session-id="askTarget.sessionId"
+    :feed="threadFeed"
+    :agent-available="agentAvailable"
+    @toast="showToast"
+    @close="askTarget = null"
+  />
 
   <ActionSheet
     v-if="pendingAction"
@@ -887,7 +1001,12 @@ onMounted(async () => {
           Working through your Claude:
           <b>{{ (agentConnectors.length ? agentConnectors : me.agentConnectors).join(", ") }}</b>
         </p>
-        <label>Let any Claude of yours search your Earshot conversations (paste in a terminal):</label>
+        <p>
+          The <b>✦ Ask Claude</b> button on every concept (and in the topbar) is the same
+          agent: ask it for anything, including corrections — it edits these notes directly
+          and what it changes sticks, even when the automatic pass disagrees.
+        </p>
+        <label>Let any Claude of yours search and edit your Earshot conversations (paste in a terminal):</label>
         <div class="keyrow">
           <code class="code-wrap">{{ mcpCommand }}</code>
           <button class="mini" @click="copyMcp">copy</button>

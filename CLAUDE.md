@@ -35,11 +35,13 @@ unset in local mode, which rides the machine's Claude login), `GROQ_API_KEY`
 ```
 capture/    Python 3.12 (.venv here) — WASAPI loopback + mic → RMS segmentation
             → faster-whisper on GPU → {type:"transcript", source:"me"|"them",
-            text, ts, speaker?} over ws to hub /ingest. speakers.py labels
-            "them" voices (sherpa-onnx TitaNet embeddings on CPU + online
-            cosine clustering → them-1, them-2…; labels stable for the
-            capture process lifetime; model at models/*.onnx, missing model
-            = no-op) and ships {type:"speakers"} centroid snapshots.
+            text, ts, speaker?} over ws to hub /ingest. `source` is the
+            CHANNEL (mic vs loopback — both echo layers key off it),
+            `speaker` is WHO. speakers.py labels voices on BOTH channels
+            (sherpa-onnx TitaNet embeddings on CPU + online cosine clustering;
+            labels stable for the capture process lifetime; model at
+            models/*.onnx, missing model = no-op) and ships {type:"speakers"}
+            centroid snapshots — see "Speaker identity" below.
             echo_gate.py — echo suppression layer 1 (primary): tracks when
             loopback speech is playing; once text-level echo evidence exists
             (a mic line fuzzy-matching a recent loopback line, ≥2 hits/2min)
@@ -79,9 +81,13 @@ server/     Node ESM — ws hub (fan-in capture, fan-out dashboards), distill
             marked restored:true + a distill note; an update confirms a
             bubble (clears the flag), and bubbles still unconfirmed after 4
             distills are auto-archived (removedReason "stale-restore").
+            boardedit.js — the board as edited by the USER (see "Ask Claude"
+            below): the distiller's own patch vocabulary, applied on their
+            behalf and therefore authoritative.
 dashboard/  Vue 3 + Vite — bubble grid (TransitionGroup morphing), transcript
             ticker, action buttons POST /action, ✕ POSTs /dismiss, plus the
-            session sidebar (search + click-to-reopen) and Export menu.
+            session sidebar (search + click-to-reopen), Export menu, and the
+            "✦ Ask Claude" sheet (per concept + board-wide).
 out/        action artifacts (.ics, .eml, .csv, *-brief.md, notes.md)
 scripts/    inject.js — fake-conversation replayer
 ```
@@ -126,6 +132,116 @@ that never recv are fine: their local transcripts are accepted regardless of
 asrMode (a user picking cloud with an old agent silently stays local).
 Settings surface: GET /me (asrMode/asrModel/asrModels/groqConfigured),
 POST /me/asr, "⚠ transcription offline" chip when groq mode lacks a key.
+
+## Speaker identity (who said it, not which channel)
+
+Added 2026-08-07 because a phone call on speakerphone read as one long "You":
+the mic is NOT one person. Anyone in the room, or on a phone held near the
+desk, arrives on the same stream as the owner, and the old code labeled every
+mic line "You" by construction (only loopback was clustered).
+
+The rule now: **`source` is the acoustic channel, `speaker` is the identity,
+and `speaker` wins everywhere.** `source` stays the channel because both echo
+layers key off it (a mic line reclassified as "them" would become an echo
+*reference* and start suppressing real lines). One shared renderer,
+`speakerLabel()` in server/export.js, is used by exports, task prompts and
+MCP; the dashboard's `whoLabel`/`whoClass` and distill/closeout prompts follow
+the same rule. `"me"` = the device owner, `them-N` = anyone else on EITHER
+channel, no tag = fall back to `source` (short segments, no embedding model,
+older capture agents — so old agents keep working unchanged).
+
+- **Owner election (capture/speakers.py).** Nothing in the audio says which
+  mic voice is you, so: the first voice heard on the mic is *provisionally*
+  the owner (with one person at the mic that is exactly the old "mic = you"
+  assumption, so a solo user sees no change), and the election can correct
+  that while evidence is thin — the owner is the mic-dominant voice
+  (`mic_s >= loop_s * 2`, so loopback bleed can never win) with the most mic
+  talk-time, needing 12s and a 1.5x margin over the runner-up. At 90s of mic
+  speech ownership LOCKS for the process (renumbering people mid-conversation
+  is worse than a label that stays put) and the centroid is written to
+  `<app-data>/voice-me.json` (`EARSHOT_VOICE_STORE` overrides; a print from a
+  different embedding model is ignored) — but ONLY when the winner is clear
+  (2x the runner-up). A session two people split is never memorized: better to
+  elect again next run than to inherit a coin flip. When it does save, "me" is
+  right from line one on every later run and a machine pays the bootstrap once. There is deliberately no
+  auto-unlock: a rule like "the stored owner has been quiet, re-elect" would
+  hand "me" to a coworker during a long speakerphone monologue. **Recovery is
+  deleting `voice-me.json`** (capture logs its full path on load) — a new mic,
+  or a machine that learned the wrong voice, re-elects from scratch.
+- **Cost of a flip:** lines already sent keep the label they went out with,
+  and the new owner's old `them-N` tag is retired (the numbering can have a
+  gap). There is deliberately no relabel-the-past message — it would mean
+  rewriting stored transcripts, the live ticker, and speaker names for a
+  once-per-machine event. `labeler.rev` bumps on any label-set change so a
+  fresh centroid snapshot ships immediately instead of up to 20s later.
+- **Participants:** the hub adds any voice tag except "me" to
+  `activeSpeakers` regardless of channel, so in-room people count as real
+  participants in the closeout report and session-continuation voice match.
+  closeout's `voiceMatch` explicitly skips "me" — the owner is in every
+  session, so counting them would make every pair of sessions look related.
+- **Echo, layer 3 (evidence only):** a mic segment whose voice we know mostly
+  from loopback, arriving while loopback plays, calls
+  `echo_gate.record_hit()`. It arms the existing timing gate sooner but never
+  drops anything on its own, so a real interjection can't be suppressed by
+  voice match alone.
+- Known gap: segments under `MIN_EMBED_S` (2s) can't create or update a
+  cluster, so a coworker's short "yeah" on the mic still falls back to "You".
+- Tests: capture/test_speakers.py (election, flip, persistence, ambiguous
+  sessions, corrupt-store fallback — fake extractor, no model needed; win +
+  mac CI),
+  ci_test_mac.py adds the same two real TTS voices sharing the MIC, and
+  server/ci_test.mjs asserts a tagged mic line is that person while an
+  untagged one is still "Me". `npm run inject` now includes a mic-side third
+  voice; verified live end-to-end — distill named it ("Ollie", from the
+  owner's "I've got Ollie here with me"), export attributed its lines to
+  Ollie, and the closeout report listed three participants.
+
+## "✦ Ask Claude" — the general-purpose channel (+ authoritative user edits)
+
+Added 2026-08-11. Every concept card carries a `✦ Ask Claude` button and the
+topbar carries a board-wide one; both open `dashboard/src/components/AskSheet.vue`
+and start a normal thread (`POST /ask` → `dispatchTask`, follow-ups through the
+existing `/thread/reply`). It is deliberately NOT one of the model's hedged
+actions: the user types anything — a correction ("them-2 is Dave Ramirez"), a
+restructure ("split this card"), or work that no button offered ("find three
+alternatives and write it up") — and their own Claude both does it and, when the
+ask is about the notes themselves, **rewrites the board live**.
+
+- **Write tools on the MCP endpoint** (server/mcp.js): `edit_notes` (add/update/
+  remove concepts, same op vocabulary as a distill patch), `name_speakers`,
+  `add_note`, `remove_note`; `get_live_board` now returns concept **ids** (an
+  agent that can't name a card can't edit one), pinned notes, and optional
+  recent transcript lines. Applied by server/boardedit.js → `bumpAndBroadcast`,
+  so a change lands on every open dashboard within a second.
+- **Which board an edit hits:** capture writes `X-Earshot-Thread` into each
+  task's mcp.json, so the hub knows which conversation is calling and routes the
+  edit to the live board or to the archived session that chat was opened from
+  (`applyArchivedEdit` → Mongo → `{type:"session_patch"}` → the open archive view
+  re-reads). No header (Claude Desktop, an old capture agent) = the live board.
+  Every applied edit also appends a `✎ updated “…”` system line to the thread, so
+  the chat shows what changed.
+- **Authority (the point of the feature).** A user edit outranks the distiller,
+  three ways: (1) touched bubbles carry `userEdited: true` and the distill system
+  prompt is told never to revert them (only to add new developments); (2) a voice
+  the user names is PINNED — `applyOps` drops any later `speakers` op for that
+  tag; (3) `state.notes` (pinned via `add_note` or the board's ＋ note row) ride
+  in every later distill prompt AND the closeout as an explicit AUTHORITATIVE
+  block. Plus an in-flight guard: a distill that started before an edit has its
+  `update`/`remove` ops for that bubble dropped, since it was reasoning about a
+  card the user has since fixed. Only kind/title/summary/details/actions are
+  writable from a tool call, and `carryActionHistory` keeps button status +
+  userNotes + threadId across an edit.
+- Notes/pins persist on the session doc (`boardNotes`, `speakerPins`), are
+  restored on hub-restart resume, carry through the 45-min provisional restore
+  (same conversation resuming = same corrections), reset on Record, and appear in
+  md + json exports.
+- Verified live end-to-end, not just in CI: the real `claude` CLI against a real
+  hub + Atlas drove `name_speakers` / `edit_notes` / `add_note`, then a REAL
+  distill of contradicting new speech kept the user's title and pinned name while
+  correctly updating the price it heard ($4k → $3k); and a stand-in capture agent
+  took a real `/ask` task off the ws, ran it through `claude -p` with the thread
+  header, and the edit came back narrated in the right thread. CI: +35 checks
+  (158 total).
 
 ## Session archive (searchable sidebar + export)
 
@@ -302,18 +418,24 @@ auth — see Claude auth notes).
   mission prompt says "search before deciding it isn't connected"; (2) MCP
   permission rules need SERVER-LEVEL names (mcp__claude_ai_Gmail) — wildcard
   tool patterns (mcp__claude_ai_*) silently deny.
-- **MCP endpoint (read side):** POST /mcp (server/mcp.js — stateless
+- **MCP endpoint (read + write):** POST /mcp (server/mcp.js — stateless
   Streamable HTTP, @modelcontextprotocol/sdk). Auth: `Authorization: Bearer
-  <captureKey>` or the browser cookie; local mode needs none. Tools (all
+  <captureKey>` or the browser cookie; local mode needs none. Read tools (all
   tenant-scoped): list_sessions, get_session, get_transcript,
-  search_transcripts, get_live_board. Settings → "Your Claude" shows a
+  search_transcripts, get_live_board. Write tools (edit_notes, name_speakers,
+  add_note, remove_note) — see "✦ Ask Claude" above. Settings → "Your Claude" shows a
   copyable `claude mcp add --transport http …` one-liner so ANY of the
   user's Claudes can search their conversations; device task agents get it
   automatically (mcp.json written per task).
 - Accepted v1 tradeoff: transcript text reaches a web-enabled agent on the
   user's machine, so a hostile meeting participant is a prompt-injection
   vector. Mitigations: tasks fire only on the user's own click, no Bash,
-  writes jailed to the task dir, work is visible in the topbar chip.
+  writes jailed to the task dir, work is visible in the topbar chip. Since
+  2026-08-11 that agent can also edit the board — the blast radius of a bad
+  edit is the user's own notes (nothing external), every edit is narrated in
+  the thread the user opened, and only kind/title/summary/details/actions are
+  writable, but an injected instruction CAN reword a card. Judged acceptable
+  for a personal tool; revisit before productizing.
 - Tests: ci_test.mjs covers caps→dispatch→progress→done, calendar/email
   routing preference, no-agent fallbacks (brief + .eml), MCP auth + tenant
   scoping (EARSHOT_TEST_SEED=1 enables POST /test/seed-bubble — bubbles
@@ -553,6 +675,10 @@ resolves), spreadsheet action fired successfully.
 Persistence: DONE via MongoDB (see db.js above) — full transcripts, bubbles,
 ops, sessions; resume-on-restart verified.
 
+Ask Claude / authoritative user edits: DONE (2026-08-11) — per-concept + global
+button, MCP write tools, pinned notes and voices, in-flight distill guard. See
+the section above; verified against the real CLI + a real distill.
+
 Session archive: DONE (2026-08-06) — searchable sidebar, click-to-reopen,
 md/txt/json export (see "Session archive" above). Verified against the real
 dev cluster + CI.
@@ -571,7 +697,10 @@ Speaker ID: DONE capture-side (speakers.py); voice tags flow into the
 distill prompt, which maintains a hedged "Participants" contact bubble
 (names inferred from context only — them-2 "likely Dave"). Constants tuned
 against a played-back YouTube meeting (0.45 / 2.0s — the old 0.50/1.0s split
-5 voices into 7); re-check on a live Teams call.
+5 voices into 7); re-check on a live Teams call. Extended 2026-08-07 to the
+MIC channel with an elected + persisted owner voiceprint — see "Speaker
+identity" above. ⚠ Not yet verified on a real two-people-one-mic recording
+(a speakerphone call); CI covers the logic and real TTS voices only.
 
 Simulated-meeting audit (2026-08-04, YouTube "Weekly Meeting Example"
 played over open speakers): all topics correctly bubbled + reported, but

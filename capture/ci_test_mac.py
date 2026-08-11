@@ -70,7 +70,7 @@ ok("faster-whisper transcribes Apple TTS speech on macOS CPU")
 if not os.path.exists(os.path.join(os.path.dirname(__file__), "models", "nemo_en_titanet_small.onnx")):
     print("  SKIP  speaker model not downloaded")
 else:
-    lab = SpeakerLabeler()
+    lab = SpeakerLabeler(store="")  # store="" : never touch the real app-data voiceprint
     # two genuinely different Apple voices saying the same thing
     clips = {}
     for name, voice in [("a", "Samantha"), ("b", "Daniel")]:
@@ -88,6 +88,24 @@ else:
     assert a1 == a2, "same voice must keep its label"
     assert a1 != b1, "different voices must get different labels"
     ok("speaker clustering separates two real synthesized voices")
+
+    # ...and the same two voices sharing the MIC (speakerphone, someone in the
+    # room): the one the mic hears most becomes the owner, the other a
+    # participant. Same real embeddings, mic side. test_speakers.py covers the
+    # election's edges with a fake extractor.
+    import speakers as sp
+    clip_s = len(clips["a"]) / 16000
+    if clip_s < sp.MIN_EMBED_S:
+        print(f"  SKIP  TTS clip too short ({clip_s:.1f}s) to accumulate cluster time")
+    else:
+        mic = SpeakerLabeler(store="")
+        for _ in range(int(sp.OWNER_MIN_S / clip_s) + 2):
+            me = mic.label(clips["a"], "me")
+        other = mic.label(clips["b"], "me")
+        print(f"mic owner -> {me}, other mic voice -> {other}")
+        assert me == "me", f"the dominant mic voice must be the owner, got {me}"
+        assert other and other.startswith("them-"), f"a second mic voice must be a participant, got {other}"
+        ok("two people on one mic are told apart (owner + participant)")
 
 # ---- 5. segmenter mechanics ----
 seg = Segmenter("them")

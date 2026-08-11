@@ -51,7 +51,10 @@ function cosine(a, b) {
 
 // how many of this session's active voices also spoke in the previous session
 function voiceMatch(cur, prev) {
-  const active = (s) => (s.speakers || []).filter((sp) => (s.activeSpeakers || []).includes(sp.id));
+  // "me" (the device owner) is in every session by definition — counting it
+  // would make every pair of sessions look related, so it is never a signal
+  const active = (s) =>
+    (s.speakers || []).filter((sp) => sp.id !== "me" && (s.activeSpeakers || []).includes(sp.id));
   const curV = active(cur);
   const prevV = active(prev);
   if (!curV.length || !prevV.length) return null;
@@ -74,7 +77,9 @@ function buildPrompt({ bubbles, tailLines, startedAt, lineCount, speakerNames, c
     JSON.stringify(speakerNames || {}),
     ``,
     `TRANSCRIPT TAIL (up to last 60 lines):`,
-    tailLines.map((l) => `[${l.source}${l.speaker ? `:${l.speaker}` : ""}] ${l.text}`).join("\n") || "(none)",
+    // voice identity, not audio channel ("me" = the user; them-N may be remote
+    // OR in the room, since the mic carries speakerphone calls and the room too)
+    tailLines.map((l) => `[${l.speaker || (l.source === "me" ? "me" : "them")}] ${l.text}`).join("\n") || "(none)",
   ];
   if (prev) {
     const gapMin = Math.round((new Date(startedAt) - new Date(prev.session.endedAt)) / 60000);

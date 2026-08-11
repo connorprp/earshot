@@ -11,10 +11,11 @@ import zlib from "node:zlib";
 import { fileURLToPath } from "node:url";
 import { WebSocketServer } from "ws";
 import { distill, applyOps } from "./distill.js";
+import { applyEditOps, applyArchivedEdit, boardSnapshot, notesBlock, EDIT_DOC } from "./boardedit.js";
 import { executeAction, withUserNotes } from "./actions.js";
 import { closeoutSession } from "./closeout.js";
 import { handleMcp } from "./mcp.js";
-import { renderExport } from "./export.js";
+import { renderExport, speakerLabel } from "./export.js";
 import {
   authEnabled,
   publicConfig,
@@ -79,6 +80,11 @@ const ECHO_OVERLAP = 0.62;       // fraction of "me" tokens fuzzy-found in one "
 const TASK_TIMEOUT_MS = 15 * 60 * 1000; // device-agent task with no task_done by then = error
 const PRIMARY_IDLE_MS = 15_000;  // stream ownership can pass to another agent after this much silence
 const TASK_PRUNE_MS = 60_000;    // finished tasks linger this long in the dashboard task list
+// "✦ Ask Claude" threads reuse the (session, bubble, action) thread key: the
+// action is always ASK_ACTION, and a board-wide chat hangs off BOARD_BUBBLE
+// instead of a concept. Both are reserved ids no distill can produce.
+const ASK_ACTION = "__ask";
+const BOARD_BUBBLE = "__board";
 
 // Shared server-side API key (sk-ant-api03-…): when set, EVERY tenant's
 // distills run on it (billed to this API account, not any coworker's
@@ -104,7 +110,11 @@ const OUT_ROOT = path.join(ROOT, "..", "out");
 class Tenant {
   constructor(userId) {
     this.userId = userId;
-    this.state = { bubbles: [], speakers: {}, rev: 0 };
+    // notes + speakerPins are the USER's own edits (see boardedit.js): standing
+    // corrections that ride in every distill prompt, and voice names a later
+    // distill may not overwrite.
+    this.state = { bubbles: [], speakers: {}, speakerPins: [], notes: [], rev: 0 };
+    this.userEdits = new Map(); // bubbleId -> when the user last edited it
     this.transcript = [];       // full session log, in memory
     this.pending = [];          // lines not yet distilled
     this.distilling = false;
@@ -279,7 +289,7 @@ class Tenant {
   buildTaskPrompt(bubble, action, ctx = null, notes = "") {
     const p = action.payload || {};
     const names = ctx ? ctx.speakerNames || {} : this.state.speakers || {};
-    const who = (l) => (l.source === "me" ? "Me" : names[l.speaker] || l.speaker || "Them");
+    const who = (l) => speakerLabel(l, names);
     const lines = ctx ? ctx.lines || [] : this.transcript.slice(-150);
     const transcript = lines.map((l) => `[${who(l)}] ${l.text}`).join("\n");
     const past = ctx
@@ -327,6 +337,74 @@ class Tenant {
       `[{"label": "Open the proposal", "file": "proposal.docx"}, {"label": "Open the Gmail draft", "url": "https://mail.google.com/mail/u/0/#drafts?compose=..."}]`,
       "```",
       `  Use "file" for something you wrote in the working directory (name only, no path) and "url" for anything that lives on the web — the real link to the draft, event, doc, sheet or page you created, never a guessed one. Label them the way a person would say it out loud.`,
+    ].join("\n");
+  }
+
+  // ---- "✦ Ask Claude": the general-purpose channel to the user's own agent ----
+  // Not a hedged button the model offered — the user's own words, either about
+  // one concept or about the whole board. The agent can do anything a task agent
+  // can (research, drafts, real objects through their connected apps) AND edit
+  // the notes live through the earshot MCP write tools, which is what makes
+  // "actually, them-2 is Dave" land on every screen a second later.
+  buildAskPrompt(text, { bubble = null, ctx = null } = {}) {
+    const names = ctx ? ctx.speakerNames || {} : this.state.speakers || {};
+    const who = (l) => speakerLabel(l, names);
+    const lines = ctx ? ctx.lines || [] : this.transcript.slice(-150);
+    const transcript = lines.map((l) => `[${who(l)}] ${l.text}`).join("\n");
+    const board = ctx
+      ? boardSnapshot({ bubbles: ctx.bubbles || [], speakers: names, notes: ctx.notes || [] })
+      : boardSnapshot(this.state);
+    return [
+      `You are the user's own Claude, working inside Earshot — an ambient dashboard that listens to their ${ctx ? "recorded" : "live"} conversation and distills it into "concept" cards with action buttons. The user just asked you something directly. Work autonomously: nobody is available to answer questions.`,
+      ...(ctx
+        ? [
+            ``,
+            `This conversation is NOT happening right now: it was recorded${ctx.title ? ` as "${ctx.title}"` : ""}` +
+              `${ctx.startedAt ? ` on ${new Date(ctx.startedAt).toDateString()}` : ""} and the user reopened it from their archive. ` +
+              `Resolve anything relative said in it ("Thursday", "next week") against that date.`,
+          ]
+        : []),
+      ``,
+      `# What the user asked`,
+      text,
+      ...(bubble
+        ? [
+            ``,
+            `# They asked it from this concept card (id "${bubble.id}")`,
+            JSON.stringify(
+              { id: bubble.id, kind: bubble.kind, title: bubble.title, summary: bubble.summary, details: bubble.details || [] },
+              null,
+              1
+            ),
+            `Unless they say otherwise, this card is what they mean by "this", "that" and "it".`,
+          ]
+        : []),
+      ``,
+      `# Their notes board right now`,
+      JSON.stringify(board, null, 1),
+      ...(this.sessionContext ? [``, `# Context`, this.sessionContext] : []),
+      ...(transcript ? [``, `# ${ctx ? "Transcript of that session" : "Recent conversation transcript"}`, transcript] : []),
+      ``,
+      `Current datetime: ${new Date().toString()}`,
+      ``,
+      `# What you can do`,
+      `1. EDIT THE NOTES. The "earshot" MCP server has write tools — edit_notes, name_speakers, add_note, remove_note — and what they change appears on the user's screen within a second. Use them whenever the ask is about the notes themselves: naming a speaker, fixing a wrong fact, re-titling or re-classifying a card, splitting or merging cards, adding context, deleting something that never mattered. Reference concepts by the exact ids above.`,
+      `   ${EDIT_DOC.split("\n").join("\n   ")}`,
+      `   Your edits are AUTHORITATIVE: the automatic distiller is told never to revert them. So edit precisely, keep the cards short and glanceable (a title of 3-6 words, a 1-2 sentence summary, a few load-bearing bullets), and change NOTHING the user didn't ask about.`,
+      `   add_note is for a standing correction or piece of context that should shape everything the distiller does from now on ("Dave is the vendor, not staff", "we decided against the Q4 launch") — use it when the fix belongs to the whole conversation rather than one card.`,
+      `2. DO THE WORK. This is also just a general-purpose request: research it, draft it, look things up, produce files. The user's own connected apps are available as mcp__claude_ai_* tools${this.agentConnectors().length ? ` — verified connected: ${this.agentConnectors().join(", ")}` : " (Gmail, Google Calendar, Google Drive, ...)"}. They are DEFERRED — run ToolSearch before concluding one isn't connected. Never authenticate or connect a new service, and never SEND email (drafts only). Files go in the current working directory.`,
+      `3. LOOK THINGS UP. The same earshot MCP server holds every conversation they've ever recorded (list_sessions, get_session, get_transcript, search_transcripts, get_live_board) — use it when the ask reaches past this conversation, and to re-read the board after you edit it.`,
+      ``,
+      `# Instructions`,
+      `- Do what they asked, then say what you did in 2-3 sentences. If you edited the notes, name what changed; the cards themselves are already on their screen, so don't paste them back.`,
+      `- The transcript is speech-to-text: words get garbled and tense/agency can flip. Prefer the user's correction over what the transcript says, and hedge uncertain facts instead of inventing specifics.`,
+      `- If the ask is ambiguous, take the most useful reasonable reading and say which one you took.`,
+      // same convention as action tasks: a finished turn hands over openable things
+      `- If you produced a file or created something on the web, end with a fenced block exactly like this (omit it if you produced nothing openable):`,
+      "```earshot-links",
+      `[{"label": "Open the comparison", "file": "vendors.md"}, {"label": "Open the Gmail draft", "url": "https://mail.google.com/mail/u/0/#drafts?compose=..."}]`,
+      "```",
+      `  "file" = a name in the working directory, "url" = the real link to what you made. Never a guessed one.`,
     ].join("\n");
   }
 
@@ -433,6 +511,62 @@ class Tenant {
     return th;
   }
 
+  // An "✦ Ask Claude" conversation: same thread machinery, anchored either to a
+  // concept or to the board itself (bubbleId BOARD_BUBBLE), so reopening the
+  // button finds it exactly like an action's session.
+  newAskThread(sessionKey, bubble, text) {
+    const th = this.newThread(sessionKey, bubble || { id: BOARD_BUBBLE, title: "the whole board" }, {
+      id: ASK_ACTION,
+      label: "Ask Claude",
+      type: "ask",
+      payload: {},
+    });
+    th.title = text.split("\n")[0].slice(0, 70) || "Ask Claude";
+    th.concept = bubble ? bubble.title : "the whole board";
+    saveThread(th);
+    return th;
+  }
+
+  // ---- the user's own edits to the board ----
+  // Called from the MCP write tools (mcp.js). threadId, when the device agent
+  // sent one, says WHICH conversation the edit belongs to — that decides whether
+  // it lands on the live board or on an archived session, and lets the user see
+  // "✎ updated …" inside the chat they asked from.
+  async applyUserEdit(ops, threadId = "") {
+    const th = threadId ? await this.threadById(threadId).catch(() => null) : null;
+    const board = this.boardSessionId() ? String(this.boardSessionId()) : null;
+    const key = th?.sessionId || null;
+    const archivedId = key && key !== "live" && key !== board ? key : null;
+    const res = archivedId
+      ? await applyArchivedEdit(this.userId, archivedId, ops)
+      : this.applyLiveEdit(ops);
+    if (archivedId && res.changed) this.broadcast({ type: "session_patch", sessionId: archivedId });
+    if (th && res.summary.length) this.appendThread(th, [{ role: "system", text: `✎ ${res.summary.join("; ")}` }]);
+    if (res.summary.length) this.log(`user edit${archivedId ? ` (archived ${archivedId})` : ""}: ${res.summary.join("; ")}`);
+    return res;
+  }
+
+  applyLiveEdit(ops) {
+    const res = applyEditOps(this.state, ops);
+    res.board = boardSnapshot(this.state);
+    if (!res.changed) return res;
+    const sid = this.boardSessionId();
+    for (const b of res.touched) persistBubble(this.userId, sid, b);
+    for (const id of res.removedIds) persistRemoval(sid, id, "user-edit");
+    if (res.speakersChanged) persistSpeakerNames(sid, this.state.speakers, this.state.speakerPins);
+    if (res.notesChanged) saveSessionReport(sid, { boardNotes: this.state.notes });
+    persistOps(this.userId, sid, ops); // same audit trail as a distill batch
+    // a distill that started before this edit must not undo it (runDistill)
+    for (const id of res.editedIds) this.userEdits.set(id, Date.now());
+    this.bumpAndBroadcast();
+    return res;
+  }
+
+  // the user's standing notes, as the distiller and the closeout see them
+  notesForPrompt() {
+    return notesBlock(this.state.notes);
+  }
+
   // append + persist + push to open dashboards, all in one place so a live
   // viewer and the stored record can never disagree
   appendThread(th, messages, head = {}) {
@@ -503,7 +637,11 @@ class Tenant {
     task.endedAt = Date.now();
     // a stopped task leaves the button clickable again — nothing was finished
     const buttonStatus = task.status === "cancelled" ? "idle" : task.status;
-    if (task.sessionId) {
+    // an "✦ Ask Claude" turn has no button to flip (it isn't one of the bubble's
+    // actions), so skip straight to the thread and the broadcast
+    if (task.actionId === ASK_ACTION) {
+      /* nothing to write on the bubble */
+    } else if (task.sessionId) {
       // archived bubble: the board doesn't hold it, so the status goes straight
       // to its stored doc and the dashboard patches the session it's viewing
       setBubbleActionStatus(this.userId, task.sessionId, task.bubbleId, task.actionId, buttonStatus);
@@ -661,6 +799,8 @@ class Tenant {
     this.sessionStartedAt = r.startedAt ? new Date(r.startedAt).getTime() : Date.now();
     this.state.bubbles = r.bubbles;
     this.state.speakers = r.speakerNames || {};
+    this.state.speakerPins = r.speakerPins || [];
+    this.state.notes = r.boardNotes || [];
     this.state.rev++;
   }
 
@@ -731,8 +871,10 @@ class Tenant {
     }
     if (ev.type === "audio") return this.handleAudioSegment(ev, ws);
     if (ev.type !== "transcript" || !ev.text) return;
+    // a voice tag is a participant whichever channel carried it (the mic hears
+    // speakerphone calls and the room); "me" is the owner, never a participant
+    if (ev.speaker && ev.speaker !== "me") this.activeSpeakers.add(ev.speaker);
     if (ev.source === "them") {
-      if (ev.speaker) this.activeSpeakers.add(ev.speaker);
       const now = Date.now();
       const tok = tokenize(ev.text);
       const entry = { set: new Set(tok), list: tok, at: now };
@@ -813,9 +955,21 @@ class Tenant {
     const lines = this.pending;
     this.pending = [];
     this.distilling = true;
+    const startedAt = Date.now();
     this.broadcast({ type: "distilling", value: true });
     try {
-      const ops = await distill(this.state, lines, this.distillNote, this.claudeEnv, this.sessionContext + this.connectorContext());
+      const note = [this.distillNote, this.notesForPrompt()].filter(Boolean).join("\n\n");
+      const raw = await distill(this.state, lines, note, this.claudeEnv, this.sessionContext + this.connectorContext());
+      // a user edit that landed WHILE this pass was thinking wins: the model was
+      // reasoning about a bubble the user has since corrected by hand
+      const ops = raw.filter((op) => {
+        const id = op.op === "update" || op.op === "remove" ? op.id : null;
+        if (id && (this.userEdits.get(id) || 0) > startedAt) {
+          this.log(`distill ${op.op} on "${id}" dropped — the user edited it mid-pass`);
+          return false;
+        }
+        return true;
+      });
       this.log(`distill: ${lines.length} lines -> ${ops.length} ops`);
       let changed = applyOps(this.state, ops);
       if (changed) {
@@ -823,7 +977,7 @@ class Tenant {
         for (const b of this.state.bubbles) persistBubble(this.userId, this.sessionId, b);
         for (const op of ops) if (op.op === "remove" && op.id) persistRemoval(this.sessionId, op.id, "distill");
       }
-      if (ops.some((o) => o.op === "speakers")) persistSpeakerNames(this.sessionId, this.state.speakers);
+      if (ops.some((o) => o.op === "speakers")) persistSpeakerNames(this.sessionId, this.state.speakers, this.state.speakerPins);
       // restored bubbles must earn their place: an update clears the flag (in
       // applyOps); whatever is still flagged after a few distills gets dropped
       if (this.restoreState) {
@@ -857,6 +1011,9 @@ class Tenant {
     if (this.recording) return;
     this.state.bubbles = [];
     this.state.speakers = {}; // voice tags persist per capture process, but names re-earn their place
+    this.state.speakerPins = [];
+    this.state.notes = [];
+    this.userEdits.clear();
     this.transcript.length = 0;
     this.pending = [];
     this.activeSpeakers = new Set();
@@ -881,6 +1038,17 @@ class Tenant {
         b.restored = true; // cleared the moment a distill updates the bubble
         persistBubble(this.userId, this.sessionId, b);
       }
+      // the user's own corrections come back with the board they belong to —
+      // if this is the same conversation resuming, so is what they fixed about it
+      this.state.notes = prev.session.boardNotes || [];
+      for (const tag of prev.session.speakerPins || []) {
+        if (prev.session.speakerNames?.[tag]) {
+          this.state.speakers[tag] = prev.session.speakerNames[tag];
+          this.state.speakerPins.push(tag);
+        }
+      }
+      if (this.state.speakerPins.length) persistSpeakerNames(this.sessionId, this.state.speakers, this.state.speakerPins);
+      if (this.state.notes.length) saveSessionReport(this.sessionId, { boardNotes: this.state.notes });
       this.restoreState = { distills: 0 };
       this.distillNote =
         `NOTE: bubbles marked "restored": true were provisionally carried over from the previous ` +
@@ -928,7 +1096,8 @@ class Tenant {
         userId: this.userId,
         outDir: this.outDir,
         env: this.claudeEnv,
-        context: this.sessionContext,
+        // the user's own corrections outrank the transcript in the report too
+        context: [this.sessionContext, this.notesForPrompt()].filter(Boolean).join("\n"),
         bubbles: this.state.bubbles,
         speakerNames: this.state.speakers,
         tailLines: this.transcript.slice(-60),
@@ -1074,6 +1243,22 @@ async function resolveActionTarget(t, userId, { bubbleId, actionId, sessionId })
   return { bubble, action, ctx, archivedId, agentRoutable };
 }
 
+// Everything an "✦ Ask Claude" agent needs about a session read back out of the
+// archive: its OWN board, names, notes and transcript tail — never the live
+// conversation, which is a different day.
+async function askContext(userId, sessionId) {
+  const data = await getSession(userId, sessionId).catch(() => null);
+  if (!data) return null;
+  return {
+    lines: data.transcript.slice(-150),
+    bubbles: data.bubbles.filter((b) => !b.removed),
+    speakerNames: data.session.speakerNames || {},
+    notes: data.session.boardNotes || [],
+    startedAt: data.session.startedAt,
+    title: data.session.report?.title || data.session.calendarEvent?.title || "",
+  };
+}
+
 // user-typed instructions are free text from the browser: trim + cap so a
 // paste can't balloon the prompt sent to the device agent
 function cleanNotes(raw) {
@@ -1095,7 +1280,7 @@ const server = http.createServer(async (req, res) => {
   if (!authEnabled) {
     // local mode: vite dev server (5173) talks to us cross-origin
     res.setHeader("Access-Control-Allow-Origin", "*");
-    res.setHeader("Access-Control-Allow-Headers", "content-type, authorization, mcp-protocol-version");
+    res.setHeader("Access-Control-Allow-Headers", "content-type, authorization, mcp-protocol-version, x-earshot-thread");
   }
   if (req.method === "OPTIONS") return res.end();
   const urlPath = req.url?.split("?")[0] || "/";
@@ -1422,6 +1607,8 @@ const server = http.createServer(async (req, res) => {
           startedAt: t.sessionStartedAt ? new Date(t.sessionStartedAt) : null,
           endedAt: null,
           speakerNames: t.state.speakers || {},
+          speakerPins: t.state.speakerPins || [],
+          boardNotes: t.state.notes || [],
           live: true,
         },
         transcript: t.transcript,
@@ -1474,6 +1661,83 @@ const server = http.createServer(async (req, res) => {
         ok: true,
         thread: thread ? t.threadView(thread) : null,
         running: thread ? Boolean(t.runningTaskForThread(thread.id)) : false,
+      })
+    );
+  }
+
+  // ---- "✦ Ask Claude": free-form direction, per concept or board-wide ----
+  // The first turn of a conversation. It is deliberately NOT one of the model's
+  // hedged buttons: the user types anything ("them-2 is Dave", "split this card",
+  // "find me three vendors"), and the agent can both answer and rewrite the
+  // notes. Follow-ups go through /thread/reply like any other thread.
+  if (req.method === "POST" && urlPath === "/ask") {
+    let body = "";
+    for await (const chunk of req) body += chunk;
+    const { text, bubbleId, sessionId } = JSON.parse(body || "{}");
+    res.setHeader("content-type", "application/json");
+    const message = cleanNotes(text);
+    if (!message) return res.end(JSON.stringify({ ok: false, message: "Type something first." }));
+    if (!t.agentSocket())
+      return res.end(
+        JSON.stringify({
+          ok: false,
+          message: "Your Claude agent isn't connected on this computer — open the Earshot app and sign in to Claude Code.",
+        })
+      );
+    const board = t.boardSessionId() ? String(t.boardSessionId()) : null;
+    const archivedId = sessionId && sessionId !== "live" && sessionId !== board ? String(sessionId) : null;
+    const ctx = archivedId ? await askContext(userId, archivedId) : null;
+    if (archivedId && !ctx) {
+      res.statusCode = 404;
+      return res.end(JSON.stringify({ ok: false, message: "That session isn't in the archive." }));
+    }
+    const bubble = bubbleId
+      ? (ctx ? (ctx.bubbles || []).find((b) => b.id === bubbleId) : t.state.bubbles.find((b) => b.id === bubbleId))
+      : null;
+    if (bubbleId && !bubble) {
+      res.statusCode = 404;
+      return res.end(JSON.stringify({ ok: false, message: "That concept is no longer on the board." }));
+    }
+    const thread = t.newAskThread(threadSessionKey(t, archivedId), bubble, message);
+    const task = t.dispatchTask(
+      bubble || { id: BOARD_BUBBLE, title: "the whole board" },
+      { id: ASK_ACTION, label: "Ask Claude", type: "ask", payload: { title: thread.title } },
+      { thread, prompt: t.buildAskPrompt(message, { bubble, ctx }), ...(archivedId ? { sessionId: archivedId } : {}) }
+    );
+    if (!task) return res.end(JSON.stringify({ ok: false, message: "Your Claude agent isn't connected on this computer." }));
+    t.appendThread(thread, [{ role: "user", text: message }], { status: "running", lastTaskId: task.id });
+    // the concept remembers its chat, so the ✦ button reopens it (and shows 💬).
+    // Archived bubbles skip the marker — the sheet still finds the thread by
+    // (session, bubble, __ask); only the 💬 dot is missing there.
+    if (bubble && !archivedId) {
+      bubble.askThreadId = thread.id;
+      persistBubble(userId, t.boardSessionId(), bubble);
+      t.bumpAndBroadcast();
+    }
+    return res.end(JSON.stringify({ ok: true, status: "running", threadId: thread.id }));
+  }
+
+  // Standing notes, by hand: the same list the agent writes with add_note, so a
+  // correction can be pinned (or dropped) without asking anyone.
+  if (req.method === "POST" && urlPath === "/board/note") {
+    let body = "";
+    for await (const chunk of req) body += chunk;
+    const { text, index, sessionId } = JSON.parse(body || "{}");
+    res.setHeader("content-type", "application/json");
+    const ops = [
+      index === undefined || index === null
+        ? { op: "note", text: cleanNotes(text) }
+        : { op: "unnote", index: Number(index) },
+    ];
+    const board = t.boardSessionId() ? String(t.boardSessionId()) : null;
+    const archivedId = sessionId && sessionId !== "live" && sessionId !== board ? String(sessionId) : null;
+    const result = archivedId ? await applyArchivedEdit(userId, archivedId, ops) : t.applyLiveEdit(ops);
+    if (archivedId && result.changed) t.broadcast({ type: "session_patch", sessionId: archivedId });
+    return res.end(
+      JSON.stringify({
+        ok: result.changed,
+        notes: archivedId ? undefined : t.state.notes,
+        message: result.changed ? "" : result.errors[0] || "Nothing changed.",
       })
     );
   }
