@@ -726,6 +726,20 @@ Tier-1 calendar CONTEXT (the record-start fetch runs hub-side).
   exclusive lock file (the mutex was Windows-only — macOS had NO guard at all)
   plus it opens the dashboard when it exits as a second instance, so a click
   that "does nothing" doesn't invite three more.
+- **WASAPI streams die silently — and stay dead.** Sleep/resume, a USB
+  interface re-enumerating, a monitor's HDMI audio endpoint vanishing: PortAudio
+  raises nothing, the callback just stops firing, and the agent looks perfectly
+  healthy (ws connected, model loaded). 2026-08-25: Connor's desktop transcribed
+  NOTHING for 12h after an overnight sleep; py-spy showed every stream thread
+  idle on its queue. Fix: `start_audio()` in main.py runs all streams under a
+  supervisor that rebuilds them (fresh PyAudio, so devices re-enumerate) when
+  the MIC goes 30s without a frame (shared-mode capture delivers silence frames
+  continuously, so that is a dead stream, not a quiet room — loopback is NOT
+  judged this way, it legitimately idles when nothing renders), a stream reports
+  inactive, a worker thread exits, or the supervisor's sleep overruns by >60s
+  (the machine slept). `audio_trouble()` is pure; capture/test_audio_watchdog.py
+  pins every branch. When "connected but no transcripts", `py-spy dump --pid`
+  on the agent is the 10-second diagnosis.
 - **Audio interfaces can idle above SPEECH_RMS** (Focusrite floor ~0.0135 vs
   0.010 threshold) → segmenter saw never-ending speech. Segmenter now tracks
   a per-stream noise floor (fast fall, slow rise) and requires

@@ -26,6 +26,8 @@ jobs:
       - run: python capture/test_speakers.py
       # deliverable links + the guardrails on opening them (posix branch)
       - run: python capture/test_links.py
+      # audio-stream supervisor decisions (dead mic / stopped stream / nothing opened)
+      - run: python capture/test_audio_watchdog.py
       # the BlackHole pin: hash guardrails + "the url still serves those bytes"
       - run: python capture/test_blackhole.py
 
@@ -145,6 +147,8 @@ jobs:
       # deliverable links + the guardrails on opening them (windows branch:
       # os.startfile, and the executable extensions that matter most here)
       - run: python capture/test_links.py
+      # audio-stream supervisor decisions (dead mic / stopped stream / nothing opened)
+      - run: python capture/test_audio_watchdog.py
       # owner election + voiceprint persistence (windows app-data store path)
       - run: python capture/test_speakers.py
       - name: Build

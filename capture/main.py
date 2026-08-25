@@ -192,14 +192,40 @@ class Segmenter:
             asr_queue.put((self.source, audio, self.start_ts))
 
 
-def stream_worker(source: str, device_info: dict, p: pyaudio.PyAudio):
-    """Opens one input stream and feeds its segmenter forever."""
+# ---- audio streams (Windows) ----
+# Streams DIE SILENTLY. Sleep/resume, a USB interface re-enumerating, a monitor
+# (its HDMI audio endpoint) unplugged: PortAudio never raises, the callback just
+# stops being called, and the process looks perfectly healthy — connected to
+# the hub, model loaded, threads idle on their queues. 2026-08-25: Connor's
+# desktop captured nothing for 12 hours after an overnight sleep for exactly
+# this reason (py-spy showed all four stream threads waiting on empty queues).
+# So streams run under a supervisor: any sign of trouble tears down EVERY
+# stream plus the PyAudio instance (PortAudio enumerates devices once, at
+# init — only a fresh instance sees a changed default mic or a new output) and
+# opens them all again.
+AUDIO_CHECK_S = 5.0    # supervisor poll interval
+MIC_STALL_S = 30.0     # WASAPI capture delivers frames continuously, silence included —
+                       # a mic this long without ONE frame is a dead stream, not a quiet room.
+                       # (Loopback is NOT judged this way: with nothing rendering it can
+                       # legitimately go quiet for hours.)
+CLOCK_JUMP_S = 60.0    # the supervisor's sleep overran by this much = the machine slept
+
+
+def stream_worker(source: str, device_info: dict, p: pyaudio.PyAudio, stop: threading.Event | None = None, health: dict | None = None):
+    """Opens one input stream and feeds its segmenter until `stop` is set.
+
+    `health` (shared with the supervisor) gets: opened (bool), last (wall-clock
+    of the newest frame, written from the PortAudio callback so it measures the
+    DEVICE, not this thread), stream (for is_active())."""
     rate = int(device_info["defaultSampleRate"])
     channels = max(1, int(device_info["maxInputChannels"]))
     seg = Segmenter(source)
     raw_q: "queue.Queue[bytes]" = queue.Queue()
+    health = health if health is not None else {}
+    stop = stop or threading.Event()
 
     def cb(in_data, frame_count, time_info, status):
+        health["last"] = time.time()
         raw_q.put(in_data)
         return (None, pyaudio.paContinue)
 
@@ -217,16 +243,117 @@ def stream_worker(source: str, device_info: dict, p: pyaudio.PyAudio):
     except Exception as e:
         print(f"[capture] SKIP '{device_info['name']}': {e}")
         return
+    health.update(opened=True, last=time.time(), stream=stream)
     print(f"[capture] {source}: '{device_info['name']}' @ {rate}Hz x{channels}")
 
+    try:
+        while not stop.is_set():
+            try:
+                data = raw_q.get(timeout=1.0)
+            except queue.Empty:
+                continue
+            pcm = np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
+            if channels > 1:
+                pcm = pcm.reshape(-1, channels).mean(axis=1)
+            if rate != TARGET_RATE:
+                pcm = soxr.resample(pcm, rate, TARGET_RATE)
+            seg.feed(pcm)
+    finally:
+        # a loopback segment cut off mid-speech must not stay "open" in the echo
+        # gate, or every later mic segment reads as buried in loopback speech
+        if seg.speaking and source == "them":
+            echo_gate.note_speech_end(id(seg), seg.start_ts, time.time())
+        for step in (stream.stop_stream, stream.close):
+            try:
+                step()
+            except Exception:  # noqa: BLE001 — the device may already be gone
+                pass
+
+
+def audio_trouble(workers: list, now: float, started: float) -> str | None:
+    """Why the current set of streams should be rebuilt, or None while healthy.
+
+    `workers` = [(health dict, thread)] as start_audio builds them; pure so the
+    test suite can exercise every branch without a sound card."""
+    opened = [(h, t) for h, t in workers if h.get("opened")]
+    if not opened:
+        # nothing opened at all (headset unplugged, no default input yet): keep
+        # trying — the old code raised once at startup and never looked again
+        return "no audio stream could be opened" if now - started > MIC_STALL_S else None
+    for h, t in opened:
+        if not t.is_alive():
+            return f"{h.get('source')} stream thread exited ('{h.get('name')}')"
+        s = h.get("stream")
+        try:
+            active = s.is_active() if s is not None else True
+        except Exception:  # noqa: BLE001 — a vanished device can make this throw
+            active = False
+        if not active:
+            return f"'{h.get('name')}' stream stopped"
+        if h.get("source") == "me" and now - h.get("last", started) > MIC_STALL_S:
+            return f"microphone '{h.get('name')}' silent for {int(now - h['last'])}s"
+    return None
+
+
+def _open_all_streams(p: pyaudio.PyAudio, stop: threading.Event) -> list:
+    mic, loopbacks = find_devices(p)
+    workers = []
+    for source, dev in [("me", mic), *(("them", lb) for lb in loopbacks)]:
+        health = {"source": source, "name": dev["name"], "opened": False, "last": time.time(), "stream": None}
+        t = threading.Thread(target=stream_worker, args=(source, dev, p), kwargs={"stop": stop, "health": health}, daemon=True)
+        t.start()
+        workers.append((health, t))
+    return workers
+
+
+def _audio_supervisor():
+    generation = 0
     while True:
-        data = raw_q.get()
-        pcm = np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
-        if channels > 1:
-            pcm = pcm.reshape(-1, channels).mean(axis=1)
-        if rate != TARGET_RATE:
-            pcm = soxr.resample(pcm, rate, TARGET_RATE)
-        seg.feed(pcm)
+        generation += 1
+        p = pyaudio.PyAudio()
+        stop = threading.Event()
+        started = time.time()
+        try:
+            workers = _open_all_streams(p, stop)
+        except Exception as e:  # noqa: BLE001 — no default mic / no render device right now
+            print(f"[capture] no audio devices ({e}); retrying in 30s")
+            try:
+                p.terminate()
+            except Exception:  # noqa: BLE001
+                pass
+            time.sleep(30)
+            continue
+        if generation > 1:
+            print(f"[capture] audio streams reopened (rebuild #{generation - 1})")
+        while True:
+            before = time.time()
+            time.sleep(AUDIO_CHECK_S)
+            now = time.time()
+            if now - before > AUDIO_CHECK_S + CLOCK_JUMP_S:
+                # WASAPI streams rarely survive a sleep, and the ones that do can
+                # be attached to endpoints that no longer exist — rebuild on
+                # principle rather than wait for the mic stall to prove it
+                reason = f"clock jumped {int(now - before)}s (sleep/resume?)"
+                break
+            reason = audio_trouble(workers, now, started)
+            if reason:
+                break
+        print(f"[capture] {reason} — reopening all audio streams")
+        stop.set()
+        for _, t in workers:
+            t.join(timeout=5)
+        try:
+            p.terminate()
+        except Exception:  # noqa: BLE001
+            pass
+        time.sleep(2)  # let the device stack settle (a re-enumerating USB interface takes a moment)
+
+
+def start_audio():
+    """Open the mic + every loopback device and keep them alive for the life
+    of the process (see the note above AUDIO_CHECK_S). Windows only; macOS
+    uses mac_audio.start_streams."""
+    threading.Thread(target=_audio_supervisor, name="audio-supervisor", daemon=True).start()
 
 
 _model = None
@@ -863,11 +990,7 @@ def main():
         import mac_audio
         streams = mac_audio.start_streams(Segmenter)  # noqa: F841 (keep streams alive)
     else:
-        p = pyaudio.PyAudio()
-        mic, loopbacks = find_devices(p)
-        threading.Thread(target=stream_worker, args=("me", mic, p), daemon=True).start()
-        for lb in loopbacks:
-            threading.Thread(target=stream_worker, args=("them", lb, p), daemon=True).start()
+        start_audio()
 
     print("[earshot] capturing. Ctrl+C to stop.")
     try:

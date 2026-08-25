@@ -255,12 +255,7 @@ def start_pipeline(cfg):
         import mac_audio
         streams = mac_audio.start_streams(main.Segmenter)  # noqa: F841
     else:
-        import pyaudiowpatch as pyaudio
-        p = pyaudio.PyAudio()
-        mic, loopbacks = main.find_devices(p)
-        threading.Thread(target=main.stream_worker, args=("me", mic, p), daemon=True).start()
-        for lb in loopbacks:
-            threading.Thread(target=main.stream_worker, args=("them", lb, p), daemon=True).start()
+        main.start_audio()  # supervised: dead streams (sleep, device change) get reopened
     return main
 
 
