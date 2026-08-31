@@ -37,7 +37,9 @@ if [ -z "$UV" ]; then
   [ -x "$HOME/.local/bin/uv" ] && UV="$HOME/.local/bin/uv"
 fi
 if [ -n "$UV" ]; then
-  "$UV" venv --python 3.12 "$VENV" >/dev/null
+  # --clear: uv exits 2 rather than reuse an existing venv (e.g. one left by the
+  # old packaged app), which used to abort the whole install.
+  "$UV" venv --clear --python 3.12 "$VENV" >/dev/null
   PY="$VENV/bin/python"
   PIP_INSTALL=("$UV" pip install --python "$PY" --quiet)
 elif /usr/bin/python3 -c "import venv" >/dev/null 2>&1; then

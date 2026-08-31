@@ -58,7 +58,10 @@ if (-not $uv) {
   } catch { }
 }
 if ($uv) {
-  Native $uv @('venv', '--python', '3.12', $Venv) 'Creating the Python environment'
+  # --clear: a machine that ran the old packaged app already has a venv here, and
+  # uv refuses to write into an existing one (exit 2). Reuse is not worth the
+  # branch — the deps get reinstalled below either way.
+  Native $uv @('venv', '--clear', '--python', '3.12', $Venv) 'Creating the Python environment'
   $py = Join-Path $Venv 'Scripts\python.exe'
   $pipExe = $uv
   $pipArgs = @('pip', 'install', '--python', $py, '--quiet')
