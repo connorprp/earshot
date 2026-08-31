@@ -1327,7 +1327,7 @@ function serveFile(res, file, download) {
 // The hub knows each user's server address and capture key, so the installer
 // it serves needs zero questions: download, double-click, done.
 const CAPTURE_FILES = [
-  "main.py", "tray.py", "updater.py", "speakers.py", "echo_gate.py", "cuda_paths.py",
+  "main.py", "tray.py", "updater.py", "speakers.py", "echo_gate.py", "echo_signal.py", "cuda_paths.py",
   "mac_audio.py", "mac_blackhole.py", "list_devices.py",
   "requirements-mac.txt", "requirements-win-cpu.txt", "requirements-agent.txt",
 ];

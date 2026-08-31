@@ -42,12 +42,28 @@ capture/    Python 3.12 (.venv here) — WASAPI loopback + mic → RMS segmentat
             labels stable for the capture process lifetime; model at
             models/*.onnx, missing model = no-op) and ships {type:"speakers"}
             centroid snapshots — see "Speaker identity" below.
-            echo_gate.py — echo suppression layer 1 (primary): tracks when
+            echo_signal.py — echo suppression layer 0 (signal, 2026-08-31,
+            strongest layer): the loopback stream IS the reference for what
+            the speakers are playing, so keep ~30s of raw loopback audio per
+            render stream and score every mic segment against the loopback
+            from the same wall-clock window (banded log-envelope correlation,
+            8 bands 150-6500Hz, lag search ±0.75s — pure numpy). corr ≥ 0.72
+            = echo, dropped PRE-ASR from the FIRST sentence (no evidence
+            warm-up; in groq mode it never even uploads); ≥ 0.55 = arms the
+            timing gate below. An excess-energy check (mic speech where the
+            aligned loopback is quiet) keeps double-talk from being dropped
+            outright, and headphones never correlate, so it is inert for
+            them. EARSHOT_ECHO_CORR retunes the drop bar; every verdict is
+            logged. Synthetic margins (test_echo_signal.py): echoes score
+            0.90+, quiet-speaker echoes 0.76+, unrelated speech ≤ 0.46,
+            0/40 double-talk drops; ~11ms per 6s segment.
+            echo_gate.py — echo suppression layer 1: tracks when
             loopback speech is playing; once text-level echo evidence exists
             (a mic line fuzzy-matching a recent loopback line, ≥2 hits/2min)
             mic segments ≥60% inside loopback speech are dropped PRE-ASR.
             Auto-engagement keeps headphone interjections safe (no echoes →
-            gate stays off). EARSHOT_MIC_GATE = auto|on|off.
+            gate stays off). EARSHOT_MIC_GATE = auto|on|off (off disables
+            layer 0 too).
 server/     Node ESM — ws hub (fan-in capture, fan-out dashboards), distill
             scheduler, action executor. State = {bubbles:[], rev}.
             db.js — MongoDB Atlas persistence (Connor's "rusty" cluster, db

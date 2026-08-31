@@ -28,6 +28,8 @@ jobs:
       - run: python capture/test_links.py
       # audio-stream supervisor decisions (dead mic / stopped stream / nothing opened)
       - run: python capture/test_audio_watchdog.py
+      # echo layer 0: raw-audio correlation (echo drops, real speech passes)
+      - run: python capture/test_echo_signal.py
       # the BlackHole pin: hash guardrails + "the url still serves those bytes"
       - run: python capture/test_blackhole.py
 
@@ -149,13 +151,15 @@ jobs:
       - run: python capture/test_links.py
       # audio-stream supervisor decisions (dead mic / stopped stream / nothing opened)
       - run: python capture/test_audio_watchdog.py
+      # echo layer 0: raw-audio correlation (echo drops, real speech passes)
+      - run: python capture/test_echo_signal.py
       # owner election + voiceprint persistence (windows app-data store path)
       - run: python capture/test_speakers.py
       - name: Build
         run: >
           pyinstaller --noconfirm --onefile --windowed --name EarshotCapture
           --paths capture
-          --hidden-import main --hidden-import speakers --hidden-import echo_gate
+          --hidden-import main --hidden-import speakers --hidden-import echo_gate --hidden-import echo_signal
           --hidden-import cuda_paths --hidden-import pyaudiowpatch --hidden-import pystray._win32
           --collect-all ctranslate2 --collect-all sherpa_onnx --collect-all tokenizers
           --collect-all faster_whisper
@@ -182,7 +186,7 @@ jobs:
         run: >
           pyinstaller --noconfirm --windowed --name "Earshot Capture"
           --paths capture
-          --hidden-import main --hidden-import speakers --hidden-import echo_gate
+          --hidden-import main --hidden-import speakers --hidden-import echo_gate --hidden-import echo_signal
           --hidden-import mac_audio --hidden-import mac_blackhole
           --hidden-import pystray._darwin
           --collect-all ctranslate2 --collect-all sherpa_onnx --collect-all tokenizers

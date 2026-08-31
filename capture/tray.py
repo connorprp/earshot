@@ -372,6 +372,7 @@ def smoke():
     elif sys.platform == "win32":
         import pyaudiowpatch  # noqa: F401
     import echo_gate  # noqa: F401
+    import echo_signal  # noqa: F401
     import speakers  # noqa: F401
     print("config dir:", app_dir())
     print("SMOKE-OK")

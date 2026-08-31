@@ -66,6 +66,7 @@ if sys.platform == "win32":
     import pyaudiowpatch as pyaudio  # WASAPI loopback (Windows only)
 
 import echo_gate
+import echo_signal
 from speakers import SpeakerLabeler
 
 IS_MAC = sys.platform == "darwin"
@@ -146,6 +147,11 @@ class Segmenter:
         self.floor = 0.0  # tracked noise floor; audio interfaces can idle above SPEECH_RMS
 
     def feed(self, chunk: np.ndarray):
+        if self.source == "them":
+            # raw-audio tap for echo layer 0: the loopback stream is the exact
+            # reference for what the speakers are playing (both platforms come
+            # through here — mac_audio feeds the same Segmenter)
+            echo_signal.feed(id(self), chunk)
         dur = len(chunk) / TARGET_RATE
         rms = float(np.sqrt(np.mean(chunk**2))) if len(chunk) else 0.0
 
@@ -420,6 +426,18 @@ def asr_worker():
             if overlap >= echo_gate.GATE_OVERLAP and echo_gate.gate_engaged():
                 print(f"[echo] mic segment dropped ({overlap:.0%} inside loopback speech)")
                 continue
+            # layer 0 (signal): compare the mic segment against the raw
+            # loopback audio from the same moment — a correlated segment is an
+            # echo no matter how it would transcribe, needs no warm-up, and in
+            # groq mode never even uploads. Either verdict arms the timing
+            # gate, which covers the short segments this layer can't judge.
+            verdict, corr = echo_signal.judge(audio, start_ts, seg_end)
+            if verdict:
+                echo_gate.record_hit()
+                if verdict == "drop":
+                    print(f"[echo] mic segment dropped (matches loopback audio, corr {corr:.2f})")
+                    continue
+                print(f"[echo] mic segment correlates with loopback audio (corr {corr:.2f}, evidence)")
         # Voice identity for BOTH channels: the mic is not one person (a
         # speakerphone call or a coworker at the desk lands there too), so who
         # spoke comes from the embedding, not from which stream it arrived on.
