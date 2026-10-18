@@ -41,3 +41,9 @@ work call through the pipeline.
   through the Agent SDK.
 - All audio is processed locally; only distilled transcript text goes to the
   LLM.
+
+## About this repo
+
+This is the public copy of a private working repo. Deployment internals (hosts, env files,
+the update loop for friends' capture agents) are intentionally absent; everything else,
+including the full commit history, is here. MIT licensed.
